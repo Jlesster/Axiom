@@ -1,12 +1,10 @@
-// handlers.rs — Smithay protocol delegate implementations
-
-use std::{process::Command, sync::atomic::Ordering};
+// handlers.rs — Smithay protocol delegate implementations.
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
     delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
     delegate_xdg_decoration, delegate_xdg_shell,
-    desktop::{layer_map_for_output, LayerSurface, PopupKind, Window},
+    desktop::{layer_map_for_output, PopupKind, PopupManager, Window},
     input::{Seat, SeatHandler, SeatState},
     reexports::{
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1,
@@ -36,7 +34,7 @@ use smithay::{
             SelectionHandler,
         },
         shell::{
-            wlr_layer::{Layer, WlrLayerShellHandler, WlrLayerShellState},
+            wlr_layer::{Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState},
             xdg::{
                 decoration::XdgDecorationHandler, PopupSurface, PositionerState, ToplevelSurface,
                 XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
@@ -49,14 +47,11 @@ use smithay::{
 use smithay::backend::renderer::{utils::on_commit_buffer_handler, ImportDma};
 use smithay::input::pointer::CursorImageStatus;
 
-use crate::{
-    render::{ensure_initial_configure, try_apply_pending_rule},
-    state::{ClientState, KittyCompositor},
-};
+use crate::state::{ClientState, Trixie};
 
 // ── dmabuf ────────────────────────────────────────────────────────────────────
 
-impl DmabufHandler for KittyCompositor {
+impl DmabufHandler for Trixie {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
     }
@@ -72,30 +67,29 @@ impl DmabufHandler for KittyCompositor {
             .map(|b| b.renderer.import_dmabuf(&dmabuf, None).is_ok())
             .unwrap_or(false);
         if ok {
-            let _ = notifier.successful::<KittyCompositor>();
+            let _ = notifier.successful::<Trixie>();
         } else {
             notifier.failed();
         }
     }
 }
-delegate_dmabuf!(KittyCompositor);
+delegate_dmabuf!(Trixie);
 
 // ── shm / buffer ──────────────────────────────────────────────────────────────
 
-impl BufferHandler for KittyCompositor {
+impl BufferHandler for Trixie {
     fn buffer_destroyed(&mut self, _: &WlBuffer) {}
 }
-
-impl ShmHandler for KittyCompositor {
+impl ShmHandler for Trixie {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
     }
 }
-delegate_shm!(KittyCompositor);
+delegate_shm!(Trixie);
 
 // ── compositor ────────────────────────────────────────────────────────────────
 
-impl CompositorHandler for KittyCompositor {
+impl CompositorHandler for Trixie {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
     }
@@ -106,12 +100,9 @@ impl CompositorHandler for KittyCompositor {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        // ── Retry deferred app_id claim ───────────────────────────────────────
-        // Many apps (including Firefox) only set their app_id after the first
-        // commit. new_toplevel parks them in unclaimed_toplevels and we retry
-        // the claim here once the id is readable from XdgToplevelSurfaceData.
+        // Claim surfaces that arrived without app_id at new_toplevel time.
         let obj_id = surface.id();
-        if self.unclaimed_toplevels.contains_key(&obj_id) {
+        if self.unclaimed.contains_key(&obj_id) {
             let app_id = with_states(surface, |states| {
                 states
                     .data_map
@@ -121,47 +112,64 @@ impl CompositorHandler for KittyCompositor {
             })
             .unwrap_or_default();
 
-            tracing::debug!("commit: unclaimed surface app_id={:?}", app_id);
-
             if !app_id.is_empty() {
-                if self.embedded.has_pending(&app_id) {
-                    // Unmap the temporary Space entry created in new_toplevel.
-                    // We need to find the window first, then drop the borrow on
-                    // self.space before we can call try_claim.
-                    let window_to_unmap = self
+                tracing::info!("commit: claiming unclaimed surface app_id={app_id:?}");
+                self.unclaimed.remove(&obj_id);
+                let pane_id = self.twm.open_shell(&app_id);
+                self.surface_to_pane.insert(obj_id.clone(), pane_id);
+
+                if let Some(pane) = self.twm.panes.get(&pane_id) {
+                    let bw = self.twm.border_w;
+                    let inner = if bw == 0 {
+                        pane.rect
+                    } else {
+                        pane.rect.inset(bw)
+                    };
+                    let loc = smithay::utils::Point::from((inner.x as i32, inner.y as i32));
+                    let new_size = smithay::utils::Size::from((inner.w as i32, inner.h as i32));
+
+                    let window = self
                         .space
                         .elements()
-                        .find(|w| w.wl_surface().as_deref() == Some(surface))
+                        .find(|w| {
+                            w.wl_surface()
+                                .map(|s| s.as_ref().id() == obj_id)
+                                .unwrap_or(false)
+                        })
                         .cloned();
 
-                    if let Some(window) = window_to_unmap {
-                        self.space.unmap_elem(&window);
-                    }
+                    if let Some(window) = window {
+                        // activate=true so the window gets wl_surface.enter and
+                        // knows it is the focused output surface.
+                        self.space.map_element(window.clone(), loc, true);
 
-                    let toplevel = self.unclaimed_toplevels.remove(&obj_id).unwrap();
-                    let wl = toplevel.wl_surface().clone();
-                    if self.embedded.try_claim(&app_id, wl, toplevel) {
-                        tracing::info!("commit: deferred claim succeeded for '{}'", app_id);
-                        let statuses = self.embedded.window_statuses();
-                        self.embed_ipc.update_windows(statuses);
-                        // Fall through to the embedded commit path below.
+                        if let Some(toplevel) = window.toplevel() {
+                            let already_pending =
+                                toplevel.with_pending_state(|s| s.size == Some(new_size));
+                            if !already_pending {
+                                toplevel.with_pending_state(|s| s.size = Some(new_size));
+                                toplevel.send_configure();
+                            }
+                        }
+
+                        // Set keyboard focus now that the surface is properly
+                        // mapped and has a valid pane rect. Doing this here
+                        // (post-configure) rather than in new_toplevel avoids
+                        // focusing a surface that hasn't ack'd its configure yet.
+                        if let Some(surf) = window.wl_surface().map(|s| s.into_owned()) {
+                            let serial = SCOUNTER.next_serial();
+                            if let Some(kbd) = self.seat.get_keyboard() {
+                                kbd.set_focus(self, Some(surf), serial);
+                            }
+                        }
                     }
-                } else {
-                    // Not an embedded app — promote to normal, stop retrying.
-                    self.unclaimed_toplevels.remove(&obj_id);
                 }
+                // sync_focus handles the general case; explicit focus above
+                // covers the unclaimed path specifically.
+                self.sync_focus();
             }
         }
 
-        // ── Embedded commit path ──────────────────────────────────────────────
-        if self.embedded.is_embedded_surface(surface) {
-            if let Some(b) = self.backends.get_mut(&self.primary_gpu) {
-                self.embedded.on_commit(&mut b.renderer, surface);
-            }
-            return;
-        }
-
-        // ── Normal path ───────────────────────────────────────────────────────
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(p) = get_parent(&root) {
@@ -179,41 +187,39 @@ impl CompositorHandler for KittyCompositor {
 
         self.popups.commit(surface);
         ensure_initial_configure(surface, &self.space, &mut self.popups);
-        try_apply_pending_rule(self, surface);
     }
 }
-delegate_compositor!(KittyCompositor);
+delegate_compositor!(Trixie);
 
-// ── selection / data device ───────────────────────────────────────────────────
+// ── selection ─────────────────────────────────────────────────────────────────
 
-impl SelectionHandler for KittyCompositor {
+impl SelectionHandler for Trixie {
     type SelectionUserData = ();
 }
-impl ClientDndGrabHandler for KittyCompositor {}
-impl ServerDndGrabHandler for KittyCompositor {}
-
-impl DataDeviceHandler for KittyCompositor {
+impl ClientDndGrabHandler for Trixie {}
+impl ServerDndGrabHandler for Trixie {}
+impl DataDeviceHandler for Trixie {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
     }
 }
-delegate_data_device!(KittyCompositor);
+delegate_data_device!(Trixie);
 
-impl PrimarySelectionHandler for KittyCompositor {
+impl PrimarySelectionHandler for Trixie {
     fn primary_selection_state(&self) -> &PrimarySelectionState {
         &self.primary_selection_state
     }
 }
-delegate_primary_selection!(KittyCompositor);
+delegate_primary_selection!(Trixie);
 
 // ── output ────────────────────────────────────────────────────────────────────
 
-impl OutputHandler for KittyCompositor {}
-delegate_output!(KittyCompositor);
+impl OutputHandler for Trixie {}
+delegate_output!(Trixie);
 
 // ── seat ──────────────────────────────────────────────────────────────────────
 
-impl SeatHandler for KittyCompositor {
+impl SeatHandler for Trixie {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
@@ -221,6 +227,7 @@ impl SeatHandler for KittyCompositor {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
+
     fn focus_changed(&mut self, seat: &Seat<Self>, target: Option<&WlSurface>) {
         let dh = &self.display_handle;
         let focus = target.and_then(|s| dh.get_client(s.id()).ok());
@@ -231,38 +238,69 @@ impl SeatHandler for KittyCompositor {
         self.cursor_status = image;
     }
 }
-delegate_seat!(KittyCompositor);
+delegate_seat!(Trixie);
 
-// ── layer shell ───────────────────────────────────────────────────────────────
+// ── wlr layer shell ───────────────────────────────────────────────────────────
 
-impl WlrLayerShellHandler for KittyCompositor {
+impl WlrLayerShellHandler for Trixie {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
     }
+
     fn new_layer_surface(
         &mut self,
-        surface: smithay::wayland::shell::wlr_layer::LayerSurface,
-        _output: Option<wl_output::WlOutput>,
+        surface: LayerSurface,
+        output: Option<wl_output::WlOutput>,
         _layer: Layer,
-        _namespace: String,
+        namespace: String,
     ) {
-        if let Some(output) = self.space.outputs().next().cloned() {
+        let output = output
+            .as_ref()
+            .and_then(|o| self.space.outputs().find(|op| op.owns(o)).cloned())
+            .or_else(|| self.space.outputs().next().cloned());
+        if let Some(output) = output {
             let mut map = layer_map_for_output(&output);
-            let _ = map.map_layer(&LayerSurface::new(surface, String::new()));
+            map.map_layer(&smithay::desktop::LayerSurface::new(surface, namespace))
+                .ok();
         }
     }
-    fn layer_destroyed(&mut self, _: smithay::wayland::shell::wlr_layer::LayerSurface) {}
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        let wl = surface.wl_surface().clone();
+        let output = self
+            .space
+            .outputs()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layers()
+                    .any(|l| l.wl_surface() == &wl)
+            })
+            .cloned();
+        if let Some(output) = output {
+            let mut map = layer_map_for_output(&output);
+            let to_rm: Vec<_> = map
+                .layers()
+                .filter(|l| l.wl_surface() == &wl)
+                .cloned()
+                .collect();
+            for l in to_rm {
+                map.unmap_layer(&l);
+            }
+        }
+    }
 }
-delegate_layer_shell!(KittyCompositor);
+delegate_layer_shell!(Trixie);
 
 // ── xdg shell ─────────────────────────────────────────────────────────────────
 
-impl XdgShellHandler for KittyCompositor {
+impl XdgShellHandler for Trixie {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        let surf_id = surface.wl_surface().id();
+
         let app_id = with_states(surface.wl_surface(), |states| {
             states
                 .data_map
@@ -272,109 +310,137 @@ impl XdgShellHandler for KittyCompositor {
         })
         .unwrap_or_default();
 
-        tracing::info!("new_toplevel: app_id={:?}", app_id);
+        tracing::info!("new_toplevel: app_id={app_id:?}");
 
-        let wl = surface.wl_surface().clone();
-
-        // Fast path: app_id known and we have a pending reservation.
-        if !app_id.is_empty() && self.embedded.has_pending(&app_id) {
-            if self.embedded.try_claim(&app_id, wl, surface.clone()) {
-                tracing::info!("new_toplevel: immediately claimed '{}'", app_id);
-                let statuses = self.embedded.window_statuses();
-                self.embed_ipc.update_windows(statuses);
-                return;
+        // Apply window rules.
+        let rules = self.config.window_rules.clone();
+        let mut float = false;
+        let mut forced_size: Option<(u32, u32)> = None;
+        for rule in &rules {
+            if rule.matcher.matches(&app_id, "") {
+                use crate::config::RuleEffect::*;
+                for effect in &rule.effects {
+                    match effect {
+                        Float => float = true,
+                        Size(w, h) => forced_size = Some((*w, *h)),
+                        _ => {}
+                    }
+                }
             }
         }
 
-        // Slow path: park for retry on first commit when app_id is available.
-        let obj_id = surface.wl_surface().id();
-        self.unclaimed_toplevels.insert(obj_id, surface.clone());
+        // Register with TWM first so reflow() produces a valid rect before
+        // we send the initial configure with the correct size.
+        let pane_id = if !app_id.is_empty() {
+            let id = self.twm.open_shell(&app_id);
+            self.surface_to_pane.insert(surf_id.clone(), id);
+            if float {
+                if let Some(pane) = self.twm.panes.get_mut(&id) {
+                    pane.floating = true;
+                }
+            }
+            Some(id)
+        } else {
+            // app_id not yet available — park in unclaimed. commit() will
+            // finish the registration once app_id arrives.
+            tracing::info!("new_toplevel: app_id empty, parking as unclaimed");
+            self.unclaimed.insert(surf_id, surface.clone());
+            None
+        };
 
-        let window = Window::new_wayland_window(surface);
-
-        // FIX 3: send a configure with the real output size before mapping,
-        // so the client (trixterm, etc.) knows its initial dimensions.
-        // Without this the compositor sends Configure{0,0} and many terminals
-        // render nothing or pick an arbitrary fallback size.
-        let output_size = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|o| self.space.output_geometry(o))
-            .map(|g| g.size)
-            .unwrap_or_else(|| smithay::utils::Size::from((1920, 1080)));
-
-        if let Some(toplevel) = window.toplevel() {
-            toplevel.with_pending_state(|s| {
-                s.size = Some(output_size);
+        // Compute the configure size: forced_size > TWM pane rect > output size.
+        let configure_size = forced_size
+            .map(|(w, h)| smithay::utils::Size::from((w as i32, h as i32)))
+            .or_else(|| {
+                pane_id.and_then(|id| self.twm.panes.get(&id)).map(|pane| {
+                    let inner = if self.twm.border_w == 0 {
+                        pane.rect
+                    } else {
+                        pane.rect.inset(self.twm.border_w)
+                    };
+                    smithay::utils::Size::from((inner.w as i32, inner.h as i32))
+                })
+            })
+            .unwrap_or_else(|| {
+                self.space
+                    .outputs()
+                    .next()
+                    .and_then(|o| self.space.output_geometry(o))
+                    .map(|g| g.size)
+                    .unwrap_or_else(|| smithay::utils::Size::from((1920, 1080)))
             });
-            toplevel.send_configure();
-        }
 
-        self.space.map_element(window.clone(), (0, 0), false);
+        surface.with_pending_state(|s| {
+            s.size = Some(configure_size);
+            s.decoration_mode = Some(
+                smithay::reexports::wayland_protocols::xdg::decoration::zv1::server
+                    ::zxdg_toplevel_decoration_v1::Mode::ServerSide,
+            );
+        });
+        surface.send_configure();
 
-        // FIX 5: give the new window keyboard focus immediately on map.
-        // Without this, trixterm receives no input until the user clicks.
-        // The input.rs fix moved focus recovery outside the closure, but focus
-        // is still never *set* proactively when a window first appears.
-        let wl_surface = window.wl_surface().map(|s| s.into_owned());
+        let window = Window::new_wayland_window(surface.clone());
+        let loc = pane_id
+            .and_then(|id| self.twm.panes.get(&id))
+            .map(|pane| {
+                let inner = if self.twm.border_w == 0 {
+                    pane.rect
+                } else {
+                    pane.rect.inset(self.twm.border_w)
+                };
+                (inner.x as i32, inner.y as i32)
+            })
+            .unwrap_or((0, 0));
 
-        if let Some(surface) = wl_surface {
-            let serial = SCOUNTER.next_serial();
-            if let Some(kbd) = self.seat.get_keyboard() {
-                kbd.set_focus(self, Some(surface), serial);
+        // activate=true so Smithay marks this window as the active element.
+        // This is needed for wl_surface.enter to fire and for the space's
+        // own focus tracking to stay consistent with ours.
+        self.space.map_element(window.clone(), loc, true);
+
+        // Only set keyboard focus for surfaces that already have a known
+        // pane. Unclaimed surfaces are focused in commit() after their
+        // app_id arrives and configure has been sent.
+        if pane_id.is_some() {
+            if let Some(surf) = window.wl_surface().map(|s| s.into_owned()) {
+                let serial = SCOUNTER.next_serial();
+                if let Some(kbd) = self.seat.get_keyboard() {
+                    kbd.set_focus(self, Some(surf), serial);
+                }
             }
         }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        // Always clean up the staging map.
-        let obj_id = surface.wl_surface().id();
-        self.unclaimed_toplevels.remove(&obj_id);
+        let surf_id = surface.wl_surface().id();
 
-        let wl = surface.wl_surface();
-        if self.embedded.is_embedded_surface(wl) {
-            let app_id = self
-                .embedded
-                .entries
-                .iter()
-                .find(|(_, e)| &e.surface == wl)
-                .map(|(id, _)| id.clone());
-            if let Some(id) = app_id {
-                tracing::info!("Embedded surface '{}' destroyed", id);
-                self.embedded.remove(&id);
-                let statuses = self.embedded.window_statuses();
-                self.embed_ipc.update_windows(statuses);
+        self.unclaimed.remove(&surf_id);
+
+        if let Some(pane_id) = self.surface_to_pane.remove(&surf_id) {
+            self.twm.close_pane(pane_id);
+        } else {
+            let app_id = with_states(surface.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().ok())
+                    .and_then(|l| l.app_id.clone())
+            })
+            .unwrap_or_default();
+            if !app_id.is_empty() {
+                self.twm.close_by_app_id(&app_id);
             }
-            return;
         }
 
-        // Normal tiled window destroyed.
-        if self.space.elements().count() == 0 {
-            let (bin, args) = self.config.terminal_cmd();
-            tracing::info!("Terminal closed — relaunching {bin}");
-            match Command::new(&bin)
-                .args(&args)
-                .env("WAYLAND_DISPLAY", &self.wayland_socket)
-                .spawn()
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("Failed to relaunch {bin}: {e} — quitting");
-                    self.running.store(false, Ordering::SeqCst);
-                }
-            }
-        } else {
-            let next = self
-                .space
-                .elements()
-                .next()
-                .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
-            if let Some(s) = next {
-                let serial = SCOUNTER.next_serial();
-                if let Some(kbd) = self.seat.get_keyboard() {
-                    kbd.set_focus(self, Some(s), serial);
-                }
+        // Hand focus to the next available window.
+        let next_surf: Option<WlSurface> = self
+            .space
+            .elements()
+            .next()
+            .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
+        if let Some(next) = next_surf {
+            let serial = SCOUNTER.next_serial();
+            if let Some(kbd) = self.seat.get_keyboard() {
+                kbd.set_focus(self, Some(next), serial);
             }
         }
     }
@@ -398,15 +464,16 @@ impl XdgShellHandler for KittyCompositor {
 
     fn grab(&mut self, _: PopupSurface, _: wl_seat::WlSeat, _: smithay::utils::Serial) {}
 }
-delegate_xdg_shell!(KittyCompositor);
+delegate_xdg_shell!(Trixie);
 
 // ── xdg decoration ────────────────────────────────────────────────────────────
 
-impl XdgDecorationHandler for KittyCompositor {
+impl XdgDecorationHandler for Trixie {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|s| {
             s.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
         });
+        toplevel.send_configure();
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, _: zxdg_toplevel_decoration_v1::Mode) {
         toplevel.with_pending_state(|s| {
@@ -425,4 +492,35 @@ impl XdgDecorationHandler for KittyCompositor {
         }
     }
 }
-delegate_xdg_decoration!(KittyCompositor);
+delegate_xdg_decoration!(Trixie);
+
+// ── ensure_initial_configure ──────────────────────────────────────────────────
+
+fn ensure_initial_configure(
+    surface: &WlSurface,
+    space: &smithay::desktop::Space<Window>,
+    popups: &mut PopupManager,
+) {
+    if let Some(window) = space
+        .elements()
+        .find(|w| w.wl_surface().as_deref() == Some(surface))
+    {
+        if let Some(toplevel) = window.toplevel() {
+            if !toplevel.is_initial_configure_sent() {
+                toplevel.send_configure();
+            }
+        }
+        return;
+    }
+
+    if let Some(popup) = popups.find_popup(surface) {
+        match popup {
+            PopupKind::Xdg(ref xdg) => {
+                if !xdg.is_initial_configure_sent() {
+                    let _ = xdg.send_configure();
+                }
+            }
+            PopupKind::InputMethod(_) => {}
+        }
+    }
+}

@@ -1,161 +1,355 @@
-// render.rs — window rule application, surface helpers
+// render.rs — per-frame render logic.
+//
+// Called from state.rs::render_surface() for each CRTC each frame.
+//
+// KEY DESIGN PRINCIPLE:
+//   Window render positions come EXCLUSIVELY from TWM pane rects.
+//   We never trust space.element_location() for positioning — it can return
+//   None or stale values before/after the first configure ack cycle.
+//   map_element() is still called (so Smithay's input/focus hit-testing works)
+//   but we pass the TWM-derived location directly to render_elements().
 
+use std::time::Duration;
+
+use smithay::utils::Physical;
 use smithay::{
-    desktop::{PopupKind, PopupManager, Space, Window, WindowSurfaceType},
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER},
-    wayland::{compositor::with_states, seat::WaylandFocus, shell::xdg::XdgToplevelSurfaceData},
+    backend::{
+        drm::DrmNode,
+        renderer::{
+            element::{
+                solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+                AsRenderElements,
+            },
+            gles::GlesRenderer,
+        },
+    },
+    desktop::{utils::send_frames_surface_tree, Window},
+    reexports::{drm::control::crtc, wayland_server::Resource},
+    utils::Scale,
+    wayland::seat::WaylandFocus,
 };
 
-use crate::config::FloatingMarker;
-use crate::state::{KittyCompositor, RulesApplied};
+use crate::{
+    state::{Trixie, TrixieElement},
+    twm::{PaneId, Rect as TwmRect},
+};
 
-// ── window rules ──────────────────────────────────────────────────────────────
+// ── Public entry ──────────────────────────────────────────────────────────────
 
-pub fn apply_window_rules(state: &mut KittyCompositor, window: &Window, app_id: &str, title: &str) {
-    let rule = state
-        .config
-        .window_rules
-        .iter()
-        .find(|r| r.matches(app_id, title))
-        .cloned();
+pub fn render(
+    state: &mut Trixie,
+    node: DrmNode,
+    crtc: crtc::Handle,
+    chrome_cmds: Vec<trixui::DrawCmd>,
+) -> bool {
+    sync_window_positions(state);
 
-    let Some(rule) = rule else { return };
-    if !rule.floating {
-        return;
-    }
+    let elements = build_elements(state, node);
 
-    let output_geo = state
-        .space
-        .outputs()
-        .next()
-        .and_then(|o| state.space.output_geometry(o))
-        .unwrap_or_default();
-
-    let sz: smithay::utils::Size<i32, Logical> = rule
-        .size
-        .map(|s| (s[0], s[1]).into())
-        .unwrap_or_else(|| (640, 480).into());
-
-    let pos: Point<i32, Logical> =
-        rule.position
-            .map(|p| (p[0], p[1]).into())
-            .unwrap_or_else(|| {
-                let cx = output_geo.loc.x + (output_geo.size.w - sz.w) / 2;
-                let cy = output_geo.loc.y + (output_geo.size.h - sz.h) / 2;
-                (cx, cy).into()
-            });
-
-    window.user_data().insert_if_missing(|| FloatingMarker {
-        size: Some((sz.w, sz.h)),
-        position: Some((pos.x, pos.y)),
-    });
-
-    if let Some(toplevel) = window.toplevel() {
-        toplevel.with_pending_state(|s| s.size = Some(sz));
-        if toplevel.is_initial_configure_sent() {
-            toplevel.send_pending_configure();
-        }
-    }
-
-    state.space.map_element(window.clone(), pos, true);
-    state.space.raise_element(window, true);
-
-    if let Some(surface) = window.wl_surface().map(|s| s.into_owned()) {
-        let serial = SCOUNTER.next_serial();
-        if let Some(kbd) = state.seat.get_keyboard() {
-            kbd.set_focus(state, Some(surface), serial);
-        }
-    }
-
-    tracing::info!(
-        "Applied floating rule to app_id={:?} title={:?} size={:?} pos={:?}",
-        app_id,
-        title,
-        sz,
-        pos
-    );
-}
-
-// ── surface helpers ───────────────────────────────────────────────────────────
-
-pub fn surface_under(
-    space: &Space<Window>,
-    pos: Point<f64, Logical>,
-) -> Option<(WlSurface, Point<f64, Logical>)> {
-    space.element_under(pos).and_then(|(w, loc)| {
-        w.surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
-            .map(|(s, sloc)| (s, (sloc + loc).to_f64()))
-    })
-}
-
-pub fn ensure_initial_configure(
-    surface: &WlSurface,
-    space: &Space<Window>,
-    popups: &mut PopupManager,
-) {
-    if let Some(window) = space
-        .elements()
-        .find(|w| w.wl_surface().as_deref() == Some(surface))
-        .cloned()
-    {
-        if let Some(toplevel) = window.toplevel() {
-            let sent = with_states(surface, |s| {
-                s.data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .map(|d| d.lock().unwrap().initial_configure_sent)
-                    .unwrap_or(false)
-            });
-            if !sent {
-                toplevel.send_configure();
-            }
-        }
-        return;
-    }
-    if let Some(PopupKind::Xdg(ref p)) = popups.find_popup(surface) {
-        if !p.is_initial_configure_sent() {
-            let _ = p.send_configure();
-        }
-    }
-}
-
-// ── commit helper (called from handlers.rs) ───────────────────────────────────
-
-pub fn try_apply_pending_rule(state: &mut KittyCompositor, surface: &WlSurface) {
-    let pending: Option<(Window, String, String)> = {
-        let window = state
-            .space
-            .elements()
-            .find(|w| w.wl_surface().as_deref() == Some(surface))
-            .cloned();
-
-        window.and_then(|w| {
-            if w.user_data().get::<RulesApplied>().is_some() {
-                return None;
-            }
-            let (app_id, title) = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .and_then(|d| d.lock().ok())
-                    .map(|lock| {
-                        (
-                            lock.app_id.clone().unwrap_or_default(),
-                            lock.title.clone().unwrap_or_default(),
-                        )
-                    })
-            })
-            .unwrap_or_default();
-
-            if app_id.is_empty() {
-                return None;
-            }
-            Some((w, app_id, title))
-        })
+    let backend = match state.backends.get_mut(&node) {
+        Some(b) => b,
+        None => return false,
+    };
+    let surface = match backend.surfaces.get_mut(&crtc) {
+        Some(s) => s,
+        None => return false,
     };
 
-    if let Some((window, app_id, title)) = pending {
-        apply_window_rules(state, &window, &app_id, &title);
-        window.user_data().insert_if_missing(|| RulesApplied);
+    let clear = clear_color(&state.config.colors.pane_bg);
+    let flags = smithay::backend::drm::compositor::FrameFlags::empty();
+
+    match surface.compositor.render_frame::<_, TrixieElement>(
+        &mut backend.renderer,
+        &elements,
+        clear,
+        flags,
+    ) {
+        Ok(frame) => {
+            if !frame.is_empty || !chrome_cmds.is_empty() {
+                if let Some(ui) = &mut state.ui {
+                    ui.flush(&chrome_cmds);
+                }
+            }
+
+            // Always queue a frame even when the DRM compositor considers it
+            // "empty" (no damage on the DRM plane). An empty frame from the
+            // damage-tracking perspective still needs to be queued so that
+            // wl_surface frame callbacks can be fired. Clients use frame
+            // callbacks to pace their rendering — if the callback never fires,
+            // the client submits its first frame, waits forever for the
+            // callback, and appears completely frozen. Opening a new window
+            // forced a full redraw which re-triggered the callbacks, which is
+            // exactly the symptom we were seeing.
+            match surface.compositor.queue_frame(()) {
+                Ok(()) => {
+                    // Fire wl_surface frame callbacks for every mapped window.
+                    // This is what tells clients "the frame you submitted is
+                    // now on screen, you may render the next one". Without
+                    // this call clients render exactly once and stop.
+                    let output = surface.output.clone();
+                    let time = state.clock.now();
+                    let windows: Vec<Window> = state.space.elements().cloned().collect();
+                    for window in &windows {
+                        if let Some(surf) = window.wl_surface() {
+                            send_frames_surface_tree(
+                                surf.as_ref(),
+                                &output,
+                                time,
+                                Some(Duration::ZERO),
+                                |_, _| Some(output.clone()),
+                            );
+                        }
+                    }
+
+                    surface.pending_frame = true;
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("queue_frame: {e}");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("render_frame: {e}");
+            false
+        }
     }
+}
+
+// ── Window → pane resolution ──────────────────────────────────────────────────
+
+fn resolve_pane_inner_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
+    let surf = window.wl_surface()?;
+    let surf_id = surf.as_ref().id();
+
+    let pane_id = state.surface_to_pane.get(&surf_id).copied().or_else(|| {
+        let app_id = smithay::wayland::compositor::with_states(surf.as_ref(), |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok())
+                .and_then(|l| l.app_id.clone())
+        })
+        .unwrap_or_default();
+
+        if app_id.is_empty() {
+            return None;
+        }
+
+        let ws = &state.twm.workspaces[state.twm.active_ws];
+        ws.panes.iter().find_map(|&id| {
+            let pane = state.twm.panes.get(&id)?;
+            if pane.content.app_id() == app_id {
+                Some(id)
+            } else {
+                None
+            }
+        })
+    })?;
+
+    let pane = state.twm.panes.get(&pane_id)?;
+    let bw = state.twm.border_w;
+    let inner = if pane.fullscreen || bw == 0 {
+        pane.rect
+    } else {
+        pane.rect.inset(bw)
+    };
+
+    Some(inner)
+}
+
+// ── Window position sync ──────────────────────────────────────────────────────
+
+/// Keep Smithay's Space in sync with TWM pane rects so that input hit-testing,
+/// focus, and popup positioning all work correctly.
+///
+/// Only calls map_element when the location actually changed to avoid
+/// continuously resetting window activation state on every frame.
+///
+/// Only sends a configure when neither the committed size nor the pending size
+/// already matches — prevents configure storms that starve clients.
+fn sync_window_positions(state: &mut Trixie) {
+    let windows: Vec<Window> = state.space.elements().cloned().collect();
+
+    for window in windows {
+        let Some(inner) = resolve_pane_inner_rect(state, &window) else {
+            continue;
+        };
+
+        let loc = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
+            inner.x as i32,
+            inner.y as i32,
+        ));
+        let new_size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((
+            inner.w as i32,
+            inner.h as i32,
+        ));
+
+        // Only call map_element when the location actually changed.
+        // Calling it every frame with activate=false was continuously
+        // clearing the window's activated state, preventing input.
+        let current_loc = state.space.element_location(&window);
+        if current_loc != Some(loc) {
+            // activate=false here: focus is managed explicitly by the
+            // keyboard handler and new_toplevel/commit, not by position sync.
+            state.space.map_element(window.clone(), loc, false);
+        }
+
+        let Some(toplevel) = window.toplevel() else {
+            continue;
+        };
+
+        // Guard against configure storms: only send a new configure if:
+        //   1. there is no pending configure already requesting this size, AND
+        //   2. the client's last committed size is not already correct.
+        // Without both checks, every frame triggered a configure→ack cycle,
+        // which starved clients and made windows appear frozen or unresponsive.
+        let already_pending = toplevel.with_pending_state(|s| s.size == Some(new_size));
+        let already_committed = window.geometry().size == new_size;
+
+        if !already_pending && !already_committed {
+            toplevel.with_pending_state(|s| s.size = Some(new_size));
+            toplevel.send_configure();
+        }
+    }
+}
+
+// ── Element list ──────────────────────────────────────────────────────────────
+
+fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
+    struct WinLoc {
+        window: Window,
+        loc: smithay::utils::Point<i32, Physical>,
+    }
+
+    let scale = Scale::from(1.0_f64);
+
+    let win_locs: Vec<WinLoc> = state
+        .space
+        .elements()
+        .filter_map(|w| {
+            let inner = resolve_pane_inner_rect(state, w)?;
+            let loc = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
+                inner.x as i32,
+                inner.y as i32,
+            ))
+            .to_physical_precise_round(scale);
+            Some(WinLoc {
+                window: w.clone(),
+                loc,
+            })
+        })
+        .collect();
+
+    let backend = match state.backends.get_mut(&node) {
+        Some(b) => b,
+        None => return vec![],
+    };
+
+    let mut elements: Vec<TrixieElement> = win_locs
+        .iter()
+        .flat_map(|wl| {
+            wl.window
+                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                    &mut backend.renderer,
+                    wl.loc,
+                    scale,
+                    1.0,
+                )
+        })
+        .map(TrixieElement::Space)
+        .collect();
+
+    elements.extend(border_elements(state, scale));
+    elements
+}
+
+// ── Border elements ───────────────────────────────────────────────────────────
+
+fn border_elements(state: &Trixie, scale: Scale<f64>) -> Vec<TrixieElement> {
+    let border_w = state.twm.border_w;
+    if border_w == 0 {
+        return vec![];
+    }
+
+    let ws = &state.twm.workspaces[state.twm.active_ws];
+    let focused_id = ws.focused;
+    let active_col = srgb(state.config.colors.active_border);
+    let inactive_col = srgb(state.config.colors.inactive_border);
+
+    ws.panes
+        .iter()
+        .filter_map(|&id| {
+            let pane = state.twm.panes.get(&id)?;
+            if pane.fullscreen {
+                return None;
+            }
+            let color = if Some(id) == focused_id {
+                active_col
+            } else {
+                inactive_col
+            };
+            Some(border_rects(pane.rect, border_w, color, scale))
+        })
+        .flatten()
+        .collect()
+}
+
+fn border_rects(rect: TwmRect, bw: u32, color: [f32; 4], scale: Scale<f64>) -> Vec<TrixieElement> {
+    let strips: [(i32, i32, i32, i32); 4] = [
+        (rect.x as i32, rect.y as i32, rect.w as i32, bw as i32),
+        (
+            rect.x as i32,
+            (rect.y + rect.h - bw) as i32,
+            rect.w as i32,
+            bw as i32,
+        ),
+        (rect.x as i32, rect.y as i32, bw as i32, rect.h as i32),
+        (
+            (rect.x + rect.w - bw) as i32,
+            rect.y as i32,
+            bw as i32,
+            rect.h as i32,
+        ),
+    ];
+
+    strips
+        .into_iter()
+        .map(|(x, y, w, h)| {
+            let buf =
+                smithay::backend::renderer::element::solid::SolidColorBuffer::new((w, h), color);
+            let loc = smithay::utils::Point::<i32, Physical>::from((
+                (x as f64 * scale.x) as i32,
+                (y as f64 * scale.y) as i32,
+            ));
+            TrixieElement::Cursor(SolidColorRenderElement::from_buffer(
+                &buf,
+                loc,
+                scale,
+                1.0,
+                smithay::backend::renderer::element::Kind::Unspecified,
+            ))
+        })
+        .collect()
+}
+
+// ── Colour helpers ────────────────────────────────────────────────────────────
+
+fn clear_color(c: &crate::config::Color) -> [f32; 4] {
+    [
+        c.r as f32 / 255.0,
+        c.g as f32 / 255.0,
+        c.b as f32 / 255.0,
+        1.0,
+    ]
+}
+
+fn srgb(c: crate::config::Color) -> [f32; 4] {
+    [
+        (c.r as f32 / 255.0).powf(2.2),
+        (c.g as f32 / 255.0).powf(2.2),
+        (c.b as f32 / 255.0).powf(2.2),
+        1.0,
+    ]
 }

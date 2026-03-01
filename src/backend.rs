@@ -1,8 +1,8 @@
-// backend.rs — GPU and output initialisation
+// backend.rs — GPU initialisation and output setup.
 
 use std::{
     os::unix::io::{FromRawFd, IntoRawFd},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use smithay::{
@@ -16,23 +16,27 @@ use smithay::{
             DrmDeviceFd, DrmEvent, DrmNode,
         },
         egl::{EGLContext, EGLDisplay},
-        renderer::{damage::OutputDamageTracker, gles::GlesRenderer, Bind, ImportMemWl},
+        renderer::{damage::OutputDamageTracker, gles::GlesRenderer},
         session::Session,
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        calloop::timer::{TimeoutAction, Timer},
         drm::control::{connector, crtc, Device as DrmControlDevice, ModeTypeFlags},
         wayland_server::DisplayHandle,
     },
     utils::{DeviceFd, Size, Transform},
-    wayland::output::OutputManagerState,
 };
 
-use crate::state::{BackendData, KittyCompositor, SurfaceData};
+use crate::{
+    chrome::ChromeApp,
+    config::BarPosition,
+    state::{BackendData, SurfaceData, Trixie},
+};
+
+// ── add_gpu ───────────────────────────────────────────────────────────────────
 
 pub fn add_gpu(
-    state: &mut KittyCompositor,
+    state: &mut Trixie,
     dh: &DisplayHandle,
     node: DrmNode,
     path: &std::path::Path,
@@ -49,10 +53,21 @@ pub fn add_gpu(
     let ctx = EGLContext::new(&egl)?;
     let renderer = unsafe { GlesRenderer::new(ctx)? };
 
-    if let Err(e) = egl.bind_wl_display(dh) {
-        tracing::warn!("EGL bind_wl_display failed (hw-accel unavailable): {e}");
+    gl::load_with(|s| {
+        let sym = std::ffi::CString::new(s).unwrap();
+        unsafe { smithay::backend::egl::ffi::egl::GetProcAddress(sym.as_ptr()) as *const _ }
+    });
+
+    if state.ui.is_none() {
+        if let Err(e) = unsafe { renderer.egl_context().make_current() } {
+            tracing::warn!("make_current for trixui init: {e}");
+        } else {
+            init_chrome(state);
+        }
     }
 
+    // VBlank events are the sole render driver. Each vblank calls frame_finish,
+    // which clears pending_frame and schedules the next render via insert_idle.
     state
         .handle
         .insert_source(drm_notifier, move |event, _, state| {
@@ -70,38 +85,30 @@ pub fn add_gpu(
         drm_node: node,
     };
 
-    let res_handles = backend.drm.resource_handles()?;
-    let connectors: Vec<_> = res_handles
+    let res = backend.drm.resource_handles()?;
+    let connectors: Vec<_> = res
         .connectors()
         .iter()
         .filter_map(|&h| backend.drm.get_connector(h, false).ok())
         .filter(|c| c.state() == connector::State::Connected)
         .collect();
 
-    for connector in connectors {
-        let mode = connector
+    for conn in connectors {
+        let mode = conn
             .modes()
             .iter()
             .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| connector.modes().first())
+            .or_else(|| conn.modes().first())
             .copied();
         let Some(mode) = mode else { continue };
-        let crtc = res_handles
+        let crtc = res
             .crtcs()
             .iter()
             .copied()
             .find(|&c| !backend.surfaces.contains_key(&c));
         let Some(crtc) = crtc else { continue };
-        if let Err(e) = add_output(
-            state,
-            dh,
-            &mut backend,
-            node,
-            connector.handle(),
-            crtc,
-            mode,
-        ) {
-            tracing::warn!("Failed to set up connector: {e}");
+        if let Err(e) = add_output(state, dh, &mut backend, node, conn.handle(), crtc, mode) {
+            tracing::warn!("Output setup failed: {e}");
         }
     }
 
@@ -109,8 +116,36 @@ pub fn add_gpu(
     Ok(())
 }
 
+// ── init_chrome ───────────────────────────────────────────────────────────────
+
+fn init_chrome(state: &mut Trixie) {
+    tracing::info!("init_chrome: loading font {:?}", state.config.font_path);
+
+    let font_bytes: &'static [u8] = match std::fs::read(&state.config.font_path) {
+        Ok(b) => Box::leak(b.into_boxed_slice()),
+        Err(e) => {
+            tracing::warn!("Could not load font: {e} — chrome disabled");
+            return;
+        }
+    };
+
+    let chrome_app = ChromeApp::new(std::sync::Arc::clone(&state.config));
+
+    match trixui::smithay::SmithayApp::new(font_bytes, 14.0, 0, 0, chrome_app) {
+        Ok(ui) => {
+            state.ui = Some(ui);
+            tracing::info!("Chrome init OK");
+        }
+        Err(e) => {
+            tracing::warn!("SmithayApp::new failed: {e}");
+        }
+    }
+}
+
+// ── add_output ────────────────────────────────────────────────────────────────
+
 pub fn add_output(
-    state: &mut KittyCompositor,
+    state: &mut Trixie,
     dh: &DisplayHandle,
     backend: &mut BackendData,
     node: DrmNode,
@@ -118,24 +153,25 @@ pub fn add_output(
     crtc: crtc::Handle,
     drm_mode: smithay::reexports::drm::control::Mode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let wl_mode = Mode {
-        size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
-        refresh: drm_mode.vrefresh() as i32 * 1000,
-    };
+    let (w, h) = drm_mode.size();
+    let (pw, ph) = (w as u32, h as u32);
+    let hz = drm_mode.vrefresh() as u64;
 
-    let connector_hz = drm_mode.vrefresh() as u64;
-    let frame_duration = state.config.frame_duration_for(connector_hz);
+    let wl_mode = Mode {
+        size: (w as i32, h as i32).into(),
+        refresh: hz as i32 * 1000,
+    };
 
     let output = Output::new(
         format!("{node}-{crtc:?}"),
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "KittyWM".into(),
+            make: "Trixie".into(),
             model: "DRM".into(),
         },
     );
-    let _global = output.create_global::<KittyCompositor>(dh);
+    output.create_global::<Trixie>(dh);
     output.change_current_state(
         Some(wl_mode),
         Some(Transform::Normal),
@@ -144,6 +180,43 @@ pub fn add_output(
     );
     output.set_preferred(wl_mode);
     state.space.map_output(&output, (0, 0));
+
+    // Resize trixui first so cell_h is valid, then read back the actual
+    // rounded bar height trixui will use. This is the ONLY value the TWM
+    // should ever see — using the raw config px causes a content_rect mismatch
+    // because trixui rounds up to whole cells (e.g. 28px → 2×17px = 34px).
+    let config_bar_h = state.config.bar.height;
+    let at_bottom = state.config.bar.position == BarPosition::Bottom;
+
+    let actual_bar_h = if let Some(ui) = &mut state.ui {
+        ui.resize(pw, ph);
+        ui.set_bar_height_px(config_bar_h);
+
+        // Mirror trixui's own rounding: ceil(bar_h_px / cell_h) * cell_h
+        let cell_h = ui.cell_h();
+        let rounded = if cell_h == 0 {
+            config_bar_h
+        } else {
+            ((config_bar_h + cell_h - 1) / cell_h) * cell_h
+        };
+        tracing::info!(
+            "trixui resized to {pw}×{ph}, config bar={config_bar_h}px, \
+             cell_h={cell_h}px, actual bar={rounded}px"
+        );
+        rounded
+    } else {
+        config_bar_h
+    };
+
+    // TWM gets the rounded value so its content_rect matches trixui exactly.
+    state.twm.resize(pw, ph);
+    state.twm.set_bar_height(actual_bar_h, at_bottom);
+
+    tracing::info!(
+        "Output {node}/{crtc:?}: {pw}×{ph}@{hz}Hz, bar={actual_bar_h}px (config={config_bar_h}px)"
+    );
+
+    let frame_duration = Duration::from_nanos(1_000_000_000 / hz.max(1));
 
     let compositor = DrmCompositor::new(
         &output,
@@ -164,34 +237,25 @@ pub fn add_output(
         None::<GbmDevice<DrmDeviceFd>>,
     )?;
 
-    tracing::info!(
-        "Output {node}-{crtc:?}: {}x{}@{}Hz → frame duration {:.2}ms (target_hz={:?})",
-        drm_mode.size().0,
-        drm_mode.size().1,
-        connector_hz,
-        frame_duration.as_secs_f64() * 1000.0,
-        state.config.target_hz,
-    );
-
     backend.surfaces.insert(
         crtc,
         SurfaceData {
             output: output.clone(),
             compositor,
             damage_tracker: OutputDamageTracker::from_output(&output),
-            next_frame_time: Instant::now() + frame_duration,
+            // next_frame_time is no longer used as a gate — pending_frame is
+            // the sole guard. Set to now so the first render fires immediately.
+            next_frame_time: Instant::now(),
             pending_frame: false,
             frame_duration,
         },
     );
 
+    // Kick the first render. After that, vblank → frame_finish → insert_idle
+    // forms the self-sustaining render loop with no repeating timer needed.
     state
         .handle
-        .insert_source(Timer::from_duration(frame_duration), move |_, _, state| {
-            state.render_surface(node, crtc);
-            TimeoutAction::ToDuration(frame_duration)
-        })
-        .ok();
+        .insert_idle(move |s| s.render_surface(node, crtc));
 
     Ok(())
 }

@@ -8,33 +8,34 @@ name = "trixie"
 path = "src/main.rs"
 
 [dependencies]
-smithay = { version = "0.7.0", features = [
-    "backend_drm",
-    "backend_gbm",
-    "backend_udev",
-    "backend_libinput",
-    "backend_egl",
-    "backend_session_libseat",
-    "renderer_gl",
-    "wayland_frontend",
+# Your local trixui — enable the smithay backend feature
+trixui = { path = "../libs/trixui", features = ["backend-smithay"] }
+
+smithay = { version = "0.7", default-features = false, features = [
     "desktop",
-    "use_system_lib",
+    "wayland_frontend",       # wl_surface, wl_seat, etc.
+    "backend_drm",            # DrmDevice, DrmNode, DrmCompositor
+    "backend_gbm",            # GbmDevice, GbmAllocator
+    "backend_egl",            # EGLDisplay, EGLContext
+    "backend_session_libseat",# LibSeatSession
+    "backend_udev",           # UdevBackend
+    "backend_libinput",       # LibinputInputBackend
+    "renderer_gl",            # GlesRenderer  (NOT renderer_gles)
 ] }
-rustix = { version = "1.0", features = ["fs"] }
-tracing = "0.1"
+
+# Smithay's GlesRenderer needs the glow feature too in 0.7
+# (renderer_gl pulls it but list it explicitly to be safe)
+# renderer_glow is separate — only needed if you use GlowRenderer
+
+bitflags          = "2"
+chrono            = "0.4"   # `clock` feature (Local::now) is on by default
+gl                = "0.14"
+# smithay 0.7 vendors its own rustix (version 1.x), but your session::open
+# call uses rustix directly — match smithay's version:
+rustix            = { version = "1", features = ["fs"] }
+notify            = "6"
+tracing           = "0.1"
 tracing-subscriber = "0.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-xkb = "0.3.0"
-xkbcommon = "0.7.0"
-notify = "6"
-calloop = "0.14.4"
-ratatui = "0.26"
-crossterm = "0.27"
+calloop = { version = "0.14.4", features = ["signals"] }
 libc = "0.2.182"
-gl = "0.14.0"
-
-[[bin]]
-name = "cheatsheet"
-path = "src/bin/cheatsheet.rs"
-
+serde_json = "1.0.149"

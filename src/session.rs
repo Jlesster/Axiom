@@ -1,96 +1,128 @@
-// session.rs — VT pause/resume handling
+// session.rs — TTY acquisition, VT switching, and session pause/resume.
+//
+// Smithay's libseat session gives us:
+//   - seat device open/close (DRM, evdev)
+//   - VT switch notifications (pause/resume)
+//
+// Flow:
+//   1. `Session::new()` opens the seat via libseat (no root needed if user is in `seat` group)
+//   2. calloop source drives the session — it fires `SessionEvent::PauseDevice` on VT-away
+//      and `SessionEvent::ActivateDevice` on VT-return
+//   3. When paused: disable all DRM surfaces, drop GPU device lease
+//   4. When resumed: re-open devices, re-enable surfaces
+//   5. `Ctrl+Alt+Fn` keys are intercepted in input.rs and routed here via `TwmAction::SwitchVt`
 
-use smithay::backend::session::{libseat::LibSeatSession, Event as SessionEvent, Session};
+use smithay::backend::{
+    drm::DrmNode,
+    session::{
+        libseat::{LibSeatSession, LibSeatSessionNotifier},
+        Event as SessionEvent, Session,
+    },
+};
 use smithay::reexports::calloop::LoopHandle;
 
-use crate::state::KittyCompositor;
+use crate::state::Trixie;
 
-pub fn register_session_handler(
-    handle: &LoopHandle<'static, KittyCompositor>,
-    notifier: smithay::backend::session::libseat::LibSeatSessionNotifier,
-) {
-    handle
-        .insert_source(notifier, |event, _, state| match event {
-            SessionEvent::PauseSession => on_pause(state),
-            SessionEvent::ActivateSession => on_resume(state),
-        })
-        .unwrap();
+// ── Session init ──────────────────────────────────────────────────────────────
+
+/// Open a libseat session and register its notifier with calloop.
+///
+/// Returns the `(session, notifier)` pair. The session is stored in
+/// `Trixie::session`; the notifier is inserted into the event loop here.
+pub fn init_session(
+    handle: &LoopHandle<'static, Trixie>,
+) -> Result<LibSeatSession, Box<dyn std::error::Error>> {
+    let (session, notifier) = LibSeatSession::new()?;
+
+    handle.insert_source(notifier, |event, _, state| {
+        handle_session_event(event, state);
+    })?;
+
+    tracing::info!("Session opened: seat={}", session.seat());
+
+    Ok(session)
 }
 
-// ── pause ─────────────────────────────────────────────────────────────────────
+// ── VT switch request ─────────────────────────────────────────────────────────
 
-fn on_pause(state: &mut KittyCompositor) {
-    tracing::info!("Session paused — suspending input and DRM");
+/// Called from input.rs when Ctrl+Alt+Fn is pressed.
+/// Asks the session layer to switch to VT `n`.
+pub fn switch_vt(state: &mut Trixie, vt: i32) {
+    tracing::info!("Switching to VT {vt}");
+    if let Err(e) = state.session.change_vt(vt) {
+        tracing::warn!("VT switch to {vt} failed: {e}");
+    }
+}
 
-    // Suspend input first so no events arrive while DRM is paused.
-    state.libinput.suspend();
+// ── Session event handler ─────────────────────────────────────────────────────
 
-    for (node, backend) in &mut state.backends {
-        tracing::debug!("Pausing DRM node {node}");
+fn handle_session_event(event: SessionEvent, state: &mut Trixie) {
+    match event {
+        SessionEvent::PauseSession => {
+            tracing::info!("Session paused — suspending all DRM surfaces");
+            pause_all_outputs(state);
+        }
+        SessionEvent::ActivateSession => {
+            tracing::info!("Session resumed — re-activating DRM surfaces");
+            resume_all_outputs(state);
+        }
+    }
+}
+
+// ── Pause: called when we leave our VT ───────────────────────────────────────
+
+fn pause_all_outputs(state: &mut Trixie) {
+    // Mark every surface as not pending a frame so the timer doesn't
+    // try to render into a paused device.
+    for backend in state.backends.values_mut() {
         backend.drm.pause();
-
-        // Mark every surface as not having a pending frame so the render
-        // timer doesn't try to submit to a paused device on the next tick.
-        for sd in backend.surfaces.values_mut() {
-            sd.pending_frame = false;
+        for surface in backend.surfaces.values_mut() {
+            surface.pending_frame = false;
         }
     }
+
+    tracing::debug!("All outputs paused");
 }
 
-// ── resume ────────────────────────────────────────────────────────────────────
+// ── Resume: called when we return to our VT ──────────────────────────────────
 
-fn on_resume(state: &mut KittyCompositor) {
-    tracing::info!("Session resumed — reactivating DRM and input");
+fn resume_all_outputs(state: &mut Trixie) {
+    // Collect nodes first to avoid borrow issues.
+    let nodes: Vec<DrmNode> = state.backends.keys().copied().collect();
 
-    // 1. Reactivate every DRM device first, collecting which nodes succeeded.
-    //    We must do this before re-enabling input so libinput events don't
-    //    race an unready DRM surface.
-    let mut ready_nodes = Vec::new();
-    for (node, backend) in &mut state.backends {
-        match backend.drm.activate(false) {
-            Ok(()) => {
-                tracing::debug!("DRM node {node} reactivated");
-                ready_nodes.push(*node);
-            }
-            Err(e) => {
-                tracing::error!("Failed to reactivate DRM node {node}: {e}");
+    for node in nodes {
+        let backend = state.backends.get_mut(&node).unwrap();
+
+        if let Err(e) = backend.drm.activate(false) {
+            tracing::warn!("DRM activate failed for {node}: {e}");
+            continue;
+        }
+
+        // Re-enable every surface (the render timer will pick them up).
+        let crtcs: Vec<_> = backend.surfaces.keys().copied().collect();
+        for crtc in crtcs {
+            if let Some(surface) = backend.surfaces.get_mut(&crtc) {
+                // Reset the compositor surface state so it does a full redraw.
+                surface.pending_frame = false;
+                // next_frame_time is already in the past so the timer fires immediately.
+                surface.next_frame_time =
+                    std::time::Instant::now() + std::time::Duration::from_millis(16);
             }
         }
     }
 
-    // 2. Phase-lock the next_frame_time for every surface on ready nodes so
-    //    the per-output timers don't fire a burst of catch-up frames.
-    //    Without this the timers can fire immediately because next_frame_time
-    //    is in the past after a long VT switch.
-    let now = std::time::Instant::now();
-    for node in &ready_nodes {
-        if let Some(backend) = state.backends.get_mut(node) {
-            for sd in backend.surfaces.values_mut() {
-                // Push next_frame_time forward so the first frame fires one
-                // full interval from now, giving the display pipeline time
-                // to settle after reactivation.
-                sd.next_frame_time = now + sd.frame_duration;
-            }
+    // Kick a render on all surfaces so we repaint straight away.
+    let nodes: Vec<DrmNode> = state.backends.keys().copied().collect();
+    for node in nodes {
+        let crtcs: Vec<_> = state
+            .backends
+            .get(&node)
+            .map(|b| b.surfaces.keys().copied().collect())
+            .unwrap_or_default();
+        for crtc in crtcs {
+            state.render_surface(node, crtc);
         }
     }
 
-    // 3. Re-enable input only after DRM is ready.
-    if let Err(e) = state
-        .libinput
-        .udev_assign_seat(state.session.seat().as_str())
-    {
-        tracing::error!("Failed to reassign libinput seat on resume: {e:?}");
-    }
-
-    // 4. Queue a single render pass to redraw all ready surfaces.
-    //    insert_idle runs after the current event-loop tick completes, so
-    //    it will see the updated next_frame_time values above.
-    if !ready_nodes.is_empty() {
-        state.handle.insert_idle(|state| state.render_all());
-    }
-
-    tracing::info!(
-        "Session resume complete ({} node(s) ready)",
-        ready_nodes.len()
-    );
+    tracing::debug!("All outputs resumed");
 }
