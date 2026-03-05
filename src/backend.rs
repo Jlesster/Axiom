@@ -94,21 +94,86 @@ pub fn add_gpu(
         .collect();
 
     for conn in connectors {
-        let mode = conn
-            .modes()
+        let conn_name = format!("{}-{}", conn.interface().as_str(), conn.interface_id());
+
+        // Look up this connector in the config.
+        let mon_cfg = state
+            .config
+            .monitors
             .iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| conn.modes().first())
-            .copied();
-        let Some(mode) = mode else { continue };
+            .find(|m| m.name == conn_name)
+            .cloned();
+
+        let mode = if let Some(ref mc) = mon_cfg {
+            // 1. Exact match: resolution + refresh.
+            conn.modes()
+                .iter()
+                .find(|m| {
+                    let (mw, mh) = m.size();
+                    mw as u32 == mc.width
+                        && mh as u32 == mc.height
+                        && m.vrefresh() as u32 == mc.refresh
+                })
+                // 2. Resolution match, any refresh — pick highest refresh.
+                .or_else(|| {
+                    conn.modes()
+                        .iter()
+                        .filter(|m| {
+                            let (mw, mh) = m.size();
+                            mw as u32 == mc.width && mh as u32 == mc.height
+                        })
+                        .max_by_key(|m| m.vrefresh())
+                })
+                // 3. Kernel preferred.
+                .or_else(|| {
+                    conn.modes()
+                        .iter()
+                        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+                })
+                // 4. Whatever is first.
+                .or_else(|| conn.modes().first())
+                .copied()
+        } else {
+            tracing::warn!(
+                "No monitor config found for connector '{conn_name}' — using kernel preferred mode. \
+                 Add a `monitor {conn_name} {{ }}` block to monitors.conf to configure it."
+            );
+            conn.modes()
+                .iter()
+                .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+                .or_else(|| conn.modes().first())
+                .copied()
+        };
+
+        let Some(mode) = mode else {
+            tracing::warn!("Connector '{conn_name}' has no usable modes, skipping");
+            continue;
+        };
+
+        tracing::info!(
+            "Connector '{conn_name}': selected mode {}x{}@{}Hz{}",
+            mode.size().0,
+            mode.size().1,
+            mode.vrefresh(),
+            if mon_cfg.is_some() {
+                " (from config)"
+            } else {
+                " (kernel preferred)"
+            },
+        );
+
         let crtc = res
             .crtcs()
             .iter()
             .copied()
             .find(|&c| !backend.surfaces.contains_key(&c));
-        let Some(crtc) = crtc else { continue };
+        let Some(crtc) = crtc else {
+            tracing::warn!("No free CRTC available for connector '{conn_name}'");
+            continue;
+        };
+
         if let Err(e) = add_output(state, dh, &mut backend, node, conn.handle(), crtc, mode) {
-            tracing::warn!("Output setup failed: {e}");
+            tracing::warn!("Output setup failed for '{conn_name}': {e}");
         }
     }
 
@@ -124,20 +189,36 @@ fn init_chrome(state: &mut Trixie) {
     let font_bytes: &'static [u8] = match std::fs::read(&state.config.font_path) {
         Ok(b) => Box::leak(b.into_boxed_slice()),
         Err(e) => {
-            tracing::warn!("Could not load font: {e} — chrome disabled");
-            return;
+            tracing::warn!("Could not load font: {e} — using embedded fallback font");
+            // Fall through with no font_bytes — SmithayApp uses its own
+            // embedded Iosevka when constructed via the builder with no
+            // explicit .font() call.
+            &[]
         }
     };
 
     let chrome_app = ChromeApp::new(std::sync::Arc::clone(&state.config));
 
-    match trixui::smithay::SmithayApp::new(font_bytes, 14.0, 0, 0, chrome_app) {
+    // SmithayApp::new(app, vp_w, vp_h) — viewport is 0×0 here;
+    // add_output calls ui.resize(pw, ph) with the real DRM dimensions
+    // immediately after, before any rendering occurs.
+    let result = if font_bytes.is_empty() {
+        // No font on disk — use the embedded fallback.
+        trixui::smithay::SmithayApp::new(chrome_app, 0, 0)
+    } else {
+        trixui::smithay::SmithayApp::builder(chrome_app)
+            .viewport(0, 0)
+            .font(font_bytes, state.config.font_size)
+            .build()
+    };
+
+    match result {
         Ok(ui) => {
             state.ui = Some(ui);
             tracing::info!("Chrome init OK");
         }
         Err(e) => {
-            tracing::warn!("SmithayApp::new failed: {e}");
+            tracing::warn!("SmithayApp init failed: {e}");
         }
     }
 }
@@ -181,10 +262,6 @@ pub fn add_output(
     output.set_preferred(wl_mode);
     state.space.map_output(&output, (0, 0));
 
-    // Resize trixui first so cell_h is valid, then read back the actual
-    // rounded bar height trixui will use. This is the ONLY value the TWM
-    // should ever see — using the raw config px causes a content_rect mismatch
-    // because trixui rounds up to whole cells (e.g. 28px → 2×17px = 34px).
     let config_bar_h = state.config.bar.height;
     let at_bottom = state.config.bar.position == BarPosition::Bottom;
 
@@ -193,7 +270,7 @@ pub fn add_output(
         ui.set_bar_height_px(config_bar_h);
 
         // Mirror trixui's own rounding: ceil(bar_h_px / cell_h) * cell_h
-        let cell_h = ui.cell_h();
+        let cell_h = ui.line_h();
         let rounded = if cell_h == 0 {
             config_bar_h
         } else {

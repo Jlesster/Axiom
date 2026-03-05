@@ -209,7 +209,7 @@ impl Trixie {
         let snap = self.twm.snapshot();
         let chrome_cmds = if let Some(ui) = &mut self.ui {
             ui.send(ChromeMsg::Snapshot(snap));
-            ui.collect_frame()
+            ui.collect() // collect() is the correct method name
         } else {
             vec![]
         };
@@ -349,7 +349,7 @@ impl Trixie {
         // what trixui actually draws. Raw config px must never go to the TWM.
         let actual_bar_h = if let Some(ui) = &mut self.ui {
             ui.set_bar_height_px(config_bar_h);
-            let cell_h = ui.cell_h();
+            let cell_h = ui.line_h(); // line_h() == cell_h from the atlas
             if cell_h == 0 {
                 config_bar_h
             } else {

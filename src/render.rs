@@ -1,13 +1,4 @@
 // render.rs — per-frame render logic.
-//
-// Called from state.rs::render_surface() for each CRTC each frame.
-//
-// KEY DESIGN PRINCIPLE:
-//   Window render positions come EXCLUSIVELY from TWM pane rects.
-//   We never trust space.element_location() for positioning — it can return
-//   None or stale values before/after the first configure ack cycle.
-//   map_element() is still called (so Smithay's input/focus hit-testing works)
-//   but we pass the TWM-derived location directly to render_elements().
 
 use std::time::Duration;
 
@@ -67,25 +58,12 @@ pub fn render(
         Ok(frame) => {
             if !frame.is_empty || !chrome_cmds.is_empty() {
                 if let Some(ui) = &mut state.ui {
-                    ui.flush(&chrome_cmds);
+                    ui.flush_collected(chrome_cmds);
                 }
             }
 
-            // Always queue a frame even when the DRM compositor considers it
-            // "empty" (no damage on the DRM plane). An empty frame from the
-            // damage-tracking perspective still needs to be queued so that
-            // wl_surface frame callbacks can be fired. Clients use frame
-            // callbacks to pace their rendering — if the callback never fires,
-            // the client submits its first frame, waits forever for the
-            // callback, and appears completely frozen. Opening a new window
-            // forced a full redraw which re-triggered the callbacks, which is
-            // exactly the symptom we were seeing.
             match surface.compositor.queue_frame(()) {
                 Ok(()) => {
-                    // Fire wl_surface frame callbacks for every mapped window.
-                    // This is what tells clients "the frame you submitted is
-                    // now on screen, you may render the next one". Without
-                    // this call clients render exactly once and stop.
                     let output = surface.output.clone();
                     let time = state.clock.now();
                     let windows: Vec<Window> = state.space.elements().cloned().collect();
@@ -161,14 +139,6 @@ fn resolve_pane_inner_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
 
 // ── Window position sync ──────────────────────────────────────────────────────
 
-/// Keep Smithay's Space in sync with TWM pane rects so that input hit-testing,
-/// focus, and popup positioning all work correctly.
-///
-/// Only calls map_element when the location actually changed to avoid
-/// continuously resetting window activation state on every frame.
-///
-/// Only sends a configure when neither the committed size nor the pending size
-/// already matches — prevents configure storms that starve clients.
 fn sync_window_positions(state: &mut Trixie) {
     let windows: Vec<Window> = state.space.elements().cloned().collect();
 
@@ -186,13 +156,8 @@ fn sync_window_positions(state: &mut Trixie) {
             inner.h as i32,
         ));
 
-        // Only call map_element when the location actually changed.
-        // Calling it every frame with activate=false was continuously
-        // clearing the window's activated state, preventing input.
         let current_loc = state.space.element_location(&window);
         if current_loc != Some(loc) {
-            // activate=false here: focus is managed explicitly by the
-            // keyboard handler and new_toplevel/commit, not by position sync.
             state.space.map_element(window.clone(), loc, false);
         }
 
@@ -200,11 +165,6 @@ fn sync_window_positions(state: &mut Trixie) {
             continue;
         };
 
-        // Guard against configure storms: only send a new configure if:
-        //   1. there is no pending configure already requesting this size, AND
-        //   2. the client's last committed size is not already correct.
-        // Without both checks, every frame triggered a configure→ack cycle,
-        // which starved clients and made windows appear frozen or unresponsive.
         let already_pending = toplevel.with_pending_state(|s| s.size == Some(new_size));
         let already_committed = window.geometry().size == new_size;
 
@@ -266,6 +226,11 @@ fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
 }
 
 // ── Border elements ───────────────────────────────────────────────────────────
+//
+// Draws colored border strips as DRM SolidColorRenderElements.
+// Colors come from config.colors.active_border / inactive_border.
+// trixui's draw_pane() draws the title notch on top of these strips.
+// If border_width = 0 in config, both are skipped.
 
 fn border_elements(state: &Trixie, scale: Scale<f64>) -> Vec<TrixieElement> {
     let border_w = state.twm.border_w;
@@ -345,6 +310,8 @@ fn clear_color(c: &crate::config::Color) -> [f32; 4] {
     ]
 }
 
+/// Linear sRGB for DRM compositor color elements.
+/// DRM/GPU expects linear light values, not gamma-encoded.
 fn srgb(c: crate::config::Color) -> [f32; 4] {
     [
         (c.r as f32 / 255.0).powf(2.2),

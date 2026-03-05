@@ -94,7 +94,11 @@ where
 
 fn keysym_to_combo(mods: &ModifiersState, keysym: &KeysymHandle<'_>) -> Option<KeyCombo> {
     use smithay::input::keyboard::xkb;
-    let sym = keysym.modified_sym();
+    let sym = keysym
+        .raw_syms()
+        .first()
+        .copied()
+        .unwrap_or_else(|| keysym.modified_sym());
     let key = xkb::keysym_get_name(sym).to_lowercase();
     if key == "nosymbol" || key.is_empty() {
         return None;

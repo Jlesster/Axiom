@@ -93,23 +93,44 @@ bitflags::bitflags! {
 }
 
 impl KeyCombo {
+    /// Parses both formats:
+    ///   - `SUPER+SHIFT:Return`  (trixie.conf colon-separated key)
+    ///   - `Super+Shift+Return`  (legacy plus-only format, last token is key)
     pub fn parse(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split('+').collect();
-        if parts.is_empty() {
+        // Colon format: everything before the last ':' is mods, after is key.
+        // Plus-only format (no ':'): everything before the last '+' is mods.
+        let (mods_part, key_part) = if let Some(colon) = s.rfind(':') {
+            (&s[..colon], &s[colon + 1..])
+        } else if let Some(plus) = s.rfind('+') {
+            (&s[..plus], &s[plus + 1..])
+        } else {
+            // No separator — bare key with no mods.
+            return Some(Self {
+                mods: Modifiers::empty(),
+                key: s.to_lowercase(),
+            });
+        };
+
+        if key_part.is_empty() {
             return None;
         }
-        let key = parts.last()?.to_lowercase();
+
         let mut mods = Modifiers::empty();
-        for m in &parts[..parts.len() - 1] {
+        for m in mods_part.split('+') {
             match m.to_lowercase().as_str() {
                 "super" | "mod4" | "logo" => mods |= Modifiers::SUPER,
                 "ctrl" | "control" => mods |= Modifiers::CTRL,
                 "alt" | "mod1" => mods |= Modifiers::ALT,
                 "shift" => mods |= Modifiers::SHIFT,
-                _ => {}
+                "" => {} // leading/trailing '+' — ignore
+                other => tracing::warn!("unknown modifier '{}' in keybind '{}'", other, s),
             }
         }
-        Some(Self { mods, key })
+
+        Some(Self {
+            mods,
+            key: key_part.to_lowercase(),
+        })
     }
 }
 
@@ -137,10 +158,9 @@ pub enum KeyAction {
     PrevWorkspace,
     Quit,
     Reload,
-    Custom(String, Vec<String>),
-
     SwitchVt(i32),
     EmergencyQuit,
+    Custom(String, Vec<String>),
 }
 
 impl KeyAction {
@@ -181,6 +201,7 @@ impl KeyAction {
             "prev_workspace" => Some(Self::PrevWorkspace),
             "quit" => Some(Self::Quit),
             "reload" => Some(Self::Reload),
+            "switch_vt" => args.first()?.parse().ok().map(Self::SwitchVt),
             other => Some(Self::Custom(
                 other.to_string(),
                 args.iter().map(|s| s.to_string()).collect(),
@@ -297,16 +318,34 @@ impl BarModuleKind {
 
 // ── Bar config ────────────────────────────────────────────────────────────────
 
+/// All fields that bar.conf can set inside the `bar { }` block.
 #[derive(Debug, Clone)]
 pub struct BarConfig {
     pub position: BarPosition,
     pub height: u32,
+    pub padding: u32,
+    pub item_spacing: u32,
+    pub font_size: Option<f32>, // overrides global font_size for bar
+    pub glyph_y_offset: i32,
     pub modules_left: Vec<String>,
     pub modules_center: Vec<String>,
     pub modules_right: Vec<String>,
+    // Colors
     pub bg: Color,
     pub fg: Color,
-    pub padding: u32,
+    pub accent: Color,
+    pub dim: Color,
+    // Separator
+    pub separator: bool,
+    pub separator_top: bool,
+    pub separator_color: Color,
+    // Workspace pills
+    pub active_ws_fg: Color,
+    pub active_ws_bg: Color,
+    pub occupied_ws_fg: Color,
+    pub inactive_ws_fg: Color,
+    // Pill geometry
+    pub pill_radius: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,12 +359,25 @@ impl Default for BarConfig {
         Self {
             position: BarPosition::Bottom,
             height: 28,
+            padding: 10,
+            item_spacing: 4,
+            font_size: None,
+            glyph_y_offset: 0,
             modules_left: vec!["workspaces".into()],
             modules_center: vec!["clock".into()],
             modules_right: vec!["layout".into()],
             bg: Color::hex(0x181825),
             fg: Color::hex(0xa6adc8),
-            padding: 8,
+            accent: Color::hex(0xb4befe),
+            dim: Color::hex(0x585b70),
+            separator: false,
+            separator_top: false,
+            separator_color: Color::hex(0x313244),
+            active_ws_fg: Color::hex(0x11111b),
+            active_ws_bg: Color::hex(0xb4befe),
+            occupied_ws_fg: Color::hex(0xb4befe),
+            inactive_ws_fg: Color::hex(0x585b70),
+            pill_radius: 4,
         }
     }
 }
@@ -387,6 +439,9 @@ pub struct ExecEntry {
 }
 
 impl ExecEntry {
+    /// Parse a command string. Handles simple `"cmd arg1 arg2"` splitting.
+    /// Shell pipes (`|`) and redirects are passed verbatim as args — the
+    /// compositor hands the full argv to exec, not a shell.
     fn parse(s: &str) -> Self {
         let mut parts = s.split_whitespace();
         let command = parts.next().unwrap_or("").to_string();
@@ -451,7 +506,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             font_path: PathBuf::from("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"),
-            font_size: 20.0,
+            font_size: 14.0,
             gap: 4,
             border_width: 1,
             colors: Colors::default(),
@@ -460,7 +515,7 @@ impl Default for Config {
             keybinds: default_keybinds(),
             window_rules: Vec::new(),
             keyboard: KeyboardConfig::default(),
-            monitors: vec![MonitorConfig::default()],
+            monitors: Vec::new(),
             exec_once: Vec::new(),
             exec: Vec::new(),
             seat_name: "seat0".into(),
@@ -472,102 +527,335 @@ impl Default for Config {
 fn default_keybinds() -> Vec<(KeyCombo, KeyAction)> {
     vec![
         (
-            KeyCombo::parse("Super+Return").unwrap(),
+            KeyCombo::parse("Super:Return").unwrap(),
             KeyAction::Exec("foot".into(), vec![]),
         ),
-        (KeyCombo::parse("Super+q").unwrap(), KeyAction::Close),
-        (KeyCombo::parse("Super+f").unwrap(), KeyAction::Fullscreen),
-        (KeyCombo::parse("Super+b").unwrap(), KeyAction::ToggleBar),
-        (KeyCombo::parse("Super+h").unwrap(), KeyAction::FocusLeft),
-        (KeyCombo::parse("Super+l").unwrap(), KeyAction::FocusRight),
-        (KeyCombo::parse("Super+k").unwrap(), KeyAction::FocusUp),
-        (KeyCombo::parse("Super+j").unwrap(), KeyAction::FocusDown),
+        (KeyCombo::parse("Super:q").unwrap(), KeyAction::Close),
+        (KeyCombo::parse("Super:f").unwrap(), KeyAction::Fullscreen),
         (
-            KeyCombo::parse("Super+Shift+h").unwrap(),
+            KeyCombo::parse("Super+Shift:b").unwrap(),
+            KeyAction::ToggleBar,
+        ),
+        (KeyCombo::parse("Super:h").unwrap(), KeyAction::FocusLeft),
+        (KeyCombo::parse("Super:l").unwrap(), KeyAction::FocusRight),
+        (KeyCombo::parse("Super:k").unwrap(), KeyAction::FocusUp),
+        (KeyCombo::parse("Super:j").unwrap(), KeyAction::FocusDown),
+        (
+            KeyCombo::parse("Super+Shift:h").unwrap(),
             KeyAction::MoveLeft,
         ),
         (
-            KeyCombo::parse("Super+Shift+l").unwrap(),
+            KeyCombo::parse("Super+Shift:l").unwrap(),
             KeyAction::MoveRight,
         ),
-        (KeyCombo::parse("Super+Tab").unwrap(), KeyAction::NextLayout),
-        (KeyCombo::parse("Super+equal").unwrap(), KeyAction::GrowMain),
+        (KeyCombo::parse("Super:Tab").unwrap(), KeyAction::NextLayout),
+        (KeyCombo::parse("Super:equal").unwrap(), KeyAction::GrowMain),
         (
-            KeyCombo::parse("Super+minus").unwrap(),
+            KeyCombo::parse("Super:minus").unwrap(),
             KeyAction::ShrinkMain,
         ),
         (
-            KeyCombo::parse("Super+Right").unwrap(),
+            KeyCombo::parse("Super+Ctrl:Right").unwrap(),
             KeyAction::NextWorkspace,
         ),
         (
-            KeyCombo::parse("Super+Left").unwrap(),
+            KeyCombo::parse("Super+Ctrl:Left").unwrap(),
             KeyAction::PrevWorkspace,
         ),
     ]
 }
 
-impl Config {
-    pub fn load() -> Self {
-        let path = config_path();
-        tracing::info!("Config::load reading {:?}", path); // add this
-        match std::fs::read_to_string(&path) {
-            Ok(src) => {
-                tracing::info!("Config::load read {} bytes, parsing", src.len()); // add this
-                Self::from_source(&src, &path)
+// ── Known key sets (for unknown-key warnings) ─────────────────────────────────
+
+const KNOWN_TOP_LEVEL: &[&str] = &[
+    "font",
+    "font_size",
+    "gap",
+    "border_width",
+    "workspaces",
+    "seat_name",
+    "keybind",
+    "window_rule",
+    "exec_once",
+    "exec",
+    "source",
+];
+
+const KNOWN_COLORS: &[&str] = &[
+    "active_border",
+    "inactive_border",
+    "active_title",
+    "inactive_title",
+    "pane_bg",
+    "bar_bg",
+    "bar_fg",
+    "bar_accent",
+    "focus_ring",
+];
+
+const KNOWN_KEYBOARD: &[&str] = &[
+    "layout",
+    "variant",
+    "options",
+    "repeat_rate",
+    "repeat_delay",
+];
+
+const KNOWN_BAR: &[&str] = &[
+    "position",
+    "height",
+    "padding",
+    "item_spacing",
+    "font_size",
+    "glyph_y_offset",
+    "modules_left",
+    "modules_center",
+    "modules_right",
+    "bg",
+    "fg",
+    "accent",
+    "dim",
+    "separator",
+    "separator_top",
+    "separator_color",
+    "active_ws_fg",
+    "active_ws_bg",
+    "occupied_ws_fg",
+    "inactive_ws_fg",
+    "pill_radius",
+];
+
+const KNOWN_MONITOR: &[&str] = &["width", "height", "refresh", "position", "scale"];
+
+// Silently accepted blocks — no unknown-key warnings for their contents.
+const SILENT_BLOCKS: &[&str] = &["animations", "general"];
+
+fn warn_unknown_keys(block_name: &str, b: &parser::Block, known: &[&str]) {
+    for k in b.assignment_keys() {
+        if !known.contains(&k.value.as_str()) {
+            tracing::warn!(
+                "config: unknown key '{}' in '{}' block (line {})",
+                k.value,
+                block_name,
+                k.span.line
+            );
+        }
+    }
+}
+
+fn resolve_font_path(s: &str) -> PathBuf {
+    // 1. Already an absolute path?
+    let p = PathBuf::from(s);
+    if p.is_absolute() {
+        if p.exists() {
+            return p;
+        }
+        tracing::warn!("config: font path {:?} does not exist", p);
+        return p; // return as-is and let trixui fail with a clear error
+    }
+
+    // 2. Home-relative path?
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let p = PathBuf::from(home).join(rest);
+        if p.exists() {
+            return p;
+        }
+        tracing::warn!("config: font path {:?} does not exist", p);
+        return p;
+    }
+
+    // 3. Search font directories for a matching filename (or name + extension).
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let xdg_data =
+        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home));
+
+    let search_dirs: &[&str] = &[
+        // User font dirs
+        &format!("{}/fonts", xdg_data),
+        &format!("{}/.fonts", home),
+        &format!("{}/.local/share/fonts", home),
+        // System font dirs
+        "/usr/share/fonts",
+        "/usr/share/fonts/Iosevka",
+        "/usr/local/share/fonts",
+        "/usr/share/fonts/TTF",
+        "/usr/share/fonts/OTF",
+        "/usr/share/fonts/truetype",
+        "/usr/share/fonts/opentype",
+    ];
+
+    // Candidate filenames to try — with and without common extensions.
+    let mut candidates: Vec<String> = vec![s.to_string()];
+    if !s.ends_with(".ttf") && !s.ends_with(".otf") && !s.ends_with(".TTF") && !s.ends_with(".OTF")
+    {
+        candidates.push(format!("{}.ttf", s));
+        candidates.push(format!("{}.otf", s));
+        candidates.push(format!("{}.TTF", s));
+        candidates.push(format!("{}.OTF", s));
+    }
+
+    for dir in search_dirs {
+        let base = Path::new(dir);
+        if !base.exists() {
+            continue;
+        }
+        // Try direct match first (flat dir).
+        for cand in &candidates {
+            let p = base.join(cand);
+            if p.exists() {
+                tracing::info!("config: resolved font {:?} → {:?}", s, p);
+                return p;
             }
-            Err(e) => {
-                tracing::warn!("Could not read config {:?}: {e} — using defaults", path);
-                Self::default()
+        }
+        // Walk one level of subdirectories (e.g. /usr/share/fonts/nerd-fonts/…).
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    for cand in &candidates {
+                        let p = entry.path().join(cand);
+                        if p.exists() {
+                            tracing::info!("config: resolved font {:?} → {:?}", s, p);
+                            return p;
+                        }
+                    }
+                }
             }
         }
     }
 
-    pub fn from_source(src: &str, path: &Path) -> Self {
-        tracing::info!("Config::from_source parsing {} bytes", src.len()); // add this
-        let result = parse(src);
-        tracing::info!("Config parse done, {} errors", result.errors.len()); // add this
+    tracing::warn!(
+        "config: could not find font {:?} in any font directory — using default",
+        s
+    );
+    PathBuf::from("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf")
+}
+
+// ── Config impl ───────────────────────────────────────────────────────────────
+
+impl Config {
+    pub fn load() -> Self {
+        let path = config_path();
+        tracing::info!("Config::load reading {:?}", path);
+        if path.exists() {
+            Self::from_path(&path)
+        } else {
+            tracing::warn!("Config file not found at {:?} — using defaults", path);
+            Self::default()
+        }
+    }
+
+    pub fn from_path(path: &Path) -> Self {
+        let result = parser::parse_file(path);
         for e in &result.errors {
-            tracing::warn!("Config parse error in {:?}: {e}", path);
+            tracing::warn!("Config parse error in {:?}: {}", path, e);
+        }
+        tracing::info!(
+            "Config loaded: {} top-level items, {} errors",
+            result.file.items.len(),
+            result.errors.len()
+        );
+        // Log every top-level item at debug level so we can verify sourced
+        // files are being inlined correctly.
+        for item in &result.file.items {
+            match item {
+                parser::Item::Assignment(a) => {
+                    tracing::debug!("config item: {} = ...", a.key.value);
+                }
+                parser::Item::Block(b) => {
+                    tracing::debug!(
+                        "config block: {} (label={:?})",
+                        b.name.value,
+                        b.label.as_ref().map(|l| &l.value)
+                    );
+                }
+            }
+        }
+        Self::from_file(result.file)
+    }
+
+    // Keep from_source for callers that already have the src string (LSP etc.)
+    pub fn from_source(src: &str, path: &Path) -> Self {
+        let result = parse(src);
+        for e in &result.errors {
+            tracing::warn!("Config parse error in {:?}: {}", path, e);
         }
         Self::from_file(result.file)
     }
 
     pub fn from_file(f: ConfigFile) -> Self {
+        tracing::info!(
+            "from_file: {} items, keys: {:?}",
+            f.items.len(),
+            f.items
+                .iter()
+                .filter_map(|i| {
+                    if let parser::Item::Assignment(a) = i {
+                        Some(a.key.value.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
         let mut cfg = Self::default();
 
-        if let Some(v) = f.get("font") {
-            if let Some(s) = v.value.as_str() {
-                cfg.font_path = PathBuf::from(s);
+        // ── Warn on unknown top-level keys ────────────────────────────────────
+        for item in &f.items {
+            if let parser::Item::Assignment(a) = item {
+                if !KNOWN_TOP_LEVEL.contains(&a.key.value.as_str()) {
+                    tracing::warn!(
+                        "config: unknown top-level key '{}' (line {})",
+                        a.key.value,
+                        a.key.span.line
+                    );
+                }
             }
         }
-        if let Some(v) = f.get("font_size") {
+
+        // ── Core scalar fields ────────────────────────────────────────────────
+        // last-wins: sourced files come before main file in item order,
+        // so trixie.conf assignments naturally win.
+        if let Some(v) = f.get_last("font") {
+            tracing::info!(
+                "config: font key present={} value={:?}",
+                f.get_last("font").is_some(),
+                f.get_last("font").map(|v| &v.value),
+            );
+            if let Some(s) = v.value.as_str() {
+                cfg.font_path = resolve_font_path(s);
+            }
+        }
+        if let Some(v) = f.get_last("font_size") {
             if let Some(n) = v.value.as_f64() {
                 cfg.font_size = n as f32;
             }
         }
-        if let Some(v) = f.get("gap") {
+        if let Some(v) = f.get_last("gap") {
             if let Some(px) = v.value.as_px() {
                 cfg.gap = px;
             }
         }
-        if let Some(v) = f.get("border_width") {
+        if let Some(v) = f.get_last("border_width") {
             if let Some(px) = v.value.as_px() {
                 cfg.border_width = px;
             }
         }
-        if let Some(v) = f.get("seat") {
+        // Both `seat_name` and bare `seat` are accepted.
+        if let Some(v) = f.get_last("seat_name").or_else(|| f.get_last("seat")) {
             if let Some(s) = v.value.as_str() {
                 cfg.seat_name = s.to_string();
             }
         }
-        if let Some(v) = f.get("workspaces") {
+        if let Some(v) = f.get_last("workspaces") {
             if let Some(n) = v.value.as_i64() {
                 cfg.workspaces = n.clamp(1, 32) as u8;
             }
         }
 
-        if let Some(b) = f.block("colors") {
+        // ── colors { } ────────────────────────────────────────────────────────
+        if let Some(b) = f.block_last("colors") {
+            warn_unknown_keys("colors", b, KNOWN_COLORS);
             macro_rules! col {
                 ($field:ident, $key:literal) => {
                     if let Some(v) = b.get($key) {
@@ -588,15 +876,18 @@ impl Config {
             col!(focus_ring, "focus_ring");
         }
 
-        if let Some(b) = f.block("keyboard") {
+        // ── keyboard { } ──────────────────────────────────────────────────────
+        if let Some(b) = f.block_last("keyboard") {
+            warn_unknown_keys("keyboard", b, KNOWN_KEYBOARD);
             if let Some(v) = b.get("layout") {
-                cfg.keyboard.layout = v.value.as_str().map(String::from);
+                // Empty string means "use system default" — store as None.
+                cfg.keyboard.layout = v.value.as_str().filter(|s| !s.is_empty()).map(String::from);
             }
             if let Some(v) = b.get("variant") {
-                cfg.keyboard.variant = v.value.as_str().map(String::from);
+                cfg.keyboard.variant = v.value.as_str().filter(|s| !s.is_empty()).map(String::from);
             }
             if let Some(v) = b.get("options") {
-                cfg.keyboard.options = v.value.as_str().map(String::from);
+                cfg.keyboard.options = v.value.as_str().filter(|s| !s.is_empty()).map(String::from);
             }
             if let Some(v) = b.get("repeat_rate") {
                 if let Some(n) = v.value.as_i64() {
@@ -610,7 +901,10 @@ impl Config {
             }
         }
 
-        if let Some(b) = f.block("bar") {
+        // ── bar { } ───────────────────────────────────────────────────────────
+        if let Some(b) = f.block_last("bar") {
+            warn_unknown_keys("bar", b, KNOWN_BAR);
+
             if let Some(v) = b.get("position") {
                 cfg.bar.position = match v.value.as_str() {
                     Some("top") => BarPosition::Top,
@@ -627,6 +921,23 @@ impl Config {
                     cfg.bar.padding = px;
                 }
             }
+            if let Some(v) = b.get("item_spacing") {
+                if let Some(px) = v.value.as_px() {
+                    cfg.bar.item_spacing = px;
+                }
+            }
+            if let Some(v) = b.get("font_size") {
+                cfg.bar.font_size = v
+                    .value
+                    .as_f32()
+                    .or_else(|| v.value.as_px().map(|p| p as f32));
+            }
+            if let Some(v) = b.get("glyph_y_offset") {
+                if let Some(n) = v.value.as_i64() {
+                    cfg.bar.glyph_y_offset = n as i32;
+                }
+            }
+
             macro_rules! modules {
                 ($field:ident, $key:literal) => {
                     if let Some(v) = b.get($key) {
@@ -637,18 +948,44 @@ impl Config {
             modules!(modules_left, "modules_left");
             modules!(modules_center, "modules_center");
             modules!(modules_right, "modules_right");
-            if let Some(v) = b.get("bg") {
-                if let Some(c) = color_from_value(&v.value) {
-                    cfg.bar.bg = c;
+
+            macro_rules! col {
+                ($field:ident, $key:literal) => {
+                    if let Some(v) = b.get($key) {
+                        if let Some(c) = color_from_value(&v.value) {
+                            cfg.bar.$field = c;
+                        }
+                    }
+                };
+            }
+            col!(bg, "bg");
+            col!(fg, "fg");
+            col!(accent, "accent");
+            col!(dim, "dim");
+            col!(separator_color, "separator_color");
+            col!(active_ws_fg, "active_ws_fg");
+            col!(active_ws_bg, "active_ws_bg");
+            col!(occupied_ws_fg, "occupied_ws_fg");
+            col!(inactive_ws_fg, "inactive_ws_fg");
+
+            if let Some(v) = b.get("separator") {
+                if let Some(b2) = v.value.as_bool() {
+                    cfg.bar.separator = b2;
                 }
             }
-            if let Some(v) = b.get("fg") {
-                if let Some(c) = color_from_value(&v.value) {
-                    cfg.bar.fg = c;
+            if let Some(v) = b.get("separator_top") {
+                if let Some(b2) = v.value.as_bool() {
+                    cfg.bar.separator_top = b2;
+                }
+            }
+            if let Some(v) = b.get("pill_radius") {
+                if let Some(px) = v.value.as_px() {
+                    cfg.bar.pill_radius = px;
                 }
             }
         }
 
+        // ── bar_module <name> { } ─────────────────────────────────────────────
         for b in f.blocks("bar_module") {
             let Some(label) = b.label.as_ref().map(|l| l.value.clone()) else {
                 continue;
@@ -670,36 +1007,146 @@ impl Config {
             );
         }
 
+        // ── monitor <name> { } ────────────────────────────────────────────────
+        cfg.monitors.clear();
+        for b in f.blocks("monitor") {
+            warn_unknown_keys("monitor", b, KNOWN_MONITOR);
+
+            let name = b
+                .label
+                .as_ref()
+                .map(|l| l.value.clone())
+                .unwrap_or_else(|| "unknown".into());
+            let mut m = MonitorConfig {
+                name,
+                ..MonitorConfig::default()
+            };
+
+            if let Some(v) = b.get("width") {
+                if let Some(px) = v.value.as_px() {
+                    m.width = px;
+                }
+            }
+            if let Some(v) = b.get("height") {
+                if let Some(px) = v.value.as_px() {
+                    m.height = px;
+                }
+            }
+            if let Some(v) = b.get("refresh") {
+                // Accept both `144hz` (Dimension) and bare `144` (Int).
+                if let Some(hz) = v
+                    .value
+                    .as_hz()
+                    .or_else(|| v.value.as_px())
+                    .or_else(|| v.value.as_i64().map(|n| n as u32))
+                {
+                    m.refresh = hz;
+                }
+            }
+            if let Some(v) = b.get("position") {
+                // `position = x, y` parses as an implicit array of two ints.
+                if let Value::Array(parts) = &v.value {
+                    if parts.len() == 2 {
+                        let x = parts[0].value.as_i64().unwrap_or(0) as i32;
+                        let y = parts[1].value.as_i64().unwrap_or(0) as i32;
+                        m.position = (x, y);
+                    }
+                } else if let Some(n) = v.value.as_i64() {
+                    m.position = (n as i32, 0);
+                }
+            }
+            if let Some(v) = b.get("scale") {
+                if let Some(f) = v.value.as_f32() {
+                    m.scale = f;
+                }
+            }
+
+            cfg.monitors.push(m);
+        }
+
+        // Fall back to a single default monitor if none configured.
+        if cfg.monitors.is_empty() {
+            cfg.monitors.push(MonitorConfig::default());
+        }
+
+        // Fall back to hardcoded keybinds only if the config defined none at all.
+        if cfg.keybinds.is_empty() {
+            cfg.keybinds.extend(default_keybinds());
+        }
+
+        // ── Warn on silently accepted blocks ──────────────────────────────────
+        // (animations, general — parse fine, no warnings needed)
+        for block_name in SILENT_BLOCKS {
+            let _ = f.block(block_name); // just touch it so the compiler knows it's used
+        }
+
+        // ── keybind = COMBO, action, args... ──────────────────────────────────
         cfg.keybinds.clear();
-        cfg.keybinds.extend(default_keybinds());
         for sv in f.get_all("keybind") {
-            if let Value::Array(parts) = &sv.value {
-                let strs: Vec<&str> = parts.iter().filter_map(|p| p.value.as_str()).collect();
-                if strs.len() >= 2 {
-                    if let Some(combo) = KeyCombo::parse(strs[0]) {
-                        if let Some(action) = KeyAction::parse(strs[1], &strs[2..]) {
-                            cfg.keybinds.push((combo, action));
-                        }
+            // Collect parts as owned strings — needed because as_arg_string can
+            // return Cow::Owned for integer tokens (e.g. workspace numbers).
+            let owned: Vec<String> = match &sv.value {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|p| p.value.as_arg_string().map(|s| s.into_owned()))
+                    .collect(),
+                v => {
+                    if let Some(s) = v.as_arg_string() {
+                        vec![s.into_owned()]
+                    } else {
+                        continue;
                     }
                 }
+            };
+            let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
+            if parts.len() < 2 {
+                tracing::warn!(
+                    "config: keybind needs at least combo + action (line {})",
+                    sv.span.line
+                );
+                continue;
+            }
+            match KeyCombo::parse(parts[0]) {
+                Some(combo) => match KeyAction::parse(parts[1], &parts[2..]) {
+                    Some(action) => cfg.keybinds.push((combo, action)),
+                    None => tracing::warn!(
+                        "config: unknown keybind action '{}' (line {})",
+                        parts[1],
+                        sv.span.line
+                    ),
+                },
+                None => tracing::warn!(
+                    "config: could not parse key combo '{}' (line {})",
+                    parts[0],
+                    sv.span.line
+                ),
             }
         }
 
+        // ── window_rule ───────────────────────────────────────────────────────
         for sv in f.get_all("window_rule") {
-            if let Value::Array(parts) = &sv.value {
-                let strs: Vec<&str> = parts.iter().filter_map(|p| p.value.as_str()).collect();
-                if let Some(first) = strs.first() {
-                    if let Some(matcher) = RuleMatcher::parse(first) {
-                        let effects = strs[1..]
-                            .iter()
-                            .filter_map(|s| RuleEffect::parse(s))
-                            .collect();
-                        cfg.window_rules.push(WindowRule { matcher, effects });
+            let strs: Vec<&str> = match &sv.value {
+                Value::Array(items) => items.iter().filter_map(|p| p.value.as_str()).collect(),
+                v => {
+                    if let Some(s) = v.as_str() {
+                        vec![s]
+                    } else {
+                        continue;
                     }
+                }
+            };
+            if let Some(first) = strs.first() {
+                if let Some(matcher) = RuleMatcher::parse(first) {
+                    let effects = strs[1..]
+                        .iter()
+                        .filter_map(|s| RuleEffect::parse(s))
+                        .collect();
+                    cfg.window_rules.push(WindowRule { matcher, effects });
                 }
             }
         }
 
+        // ── exec_once / exec ──────────────────────────────────────────────────
         for sv in f.get_all("exec_once") {
             if let Some(s) = sv.value.as_str() {
                 cfg.exec_once.push(ExecEntry::parse(s));
@@ -715,7 +1162,9 @@ impl Config {
     }
 
     pub fn hot_reload(&mut self) {
-        let new = Self::load();
+        let new = Self::from_path(&config_path());
+        // Intentionally NOT reloading font_path — a font change requires
+        // re-initialising trixui which can't be done mid-session.
         self.font_size = new.font_size;
         self.gap = new.gap;
         self.border_width = new.border_width;
@@ -725,8 +1174,11 @@ impl Config {
         self.keybinds = new.keybinds;
         self.window_rules = new.window_rules;
         self.keyboard = new.keyboard;
+        self.monitors = new.monitors;
+        self.seat_name = new.seat_name;
+        self.workspaces = new.workspaces;
         self.exec = new.exec;
-        self.exec_once = new.exec_once;
+        // exec_once intentionally not reloaded — only runs at session start.
     }
 }
 
