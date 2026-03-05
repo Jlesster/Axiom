@@ -93,18 +93,12 @@ bitflags::bitflags! {
 }
 
 impl KeyCombo {
-    /// Parses both formats:
-    ///   - `SUPER+SHIFT:Return`  (trixie.conf colon-separated key)
-    ///   - `Super+Shift+Return`  (legacy plus-only format, last token is key)
     pub fn parse(s: &str) -> Option<Self> {
-        // Colon format: everything before the last ':' is mods, after is key.
-        // Plus-only format (no ':'): everything before the last '+' is mods.
         let (mods_part, key_part) = if let Some(colon) = s.rfind(':') {
             (&s[..colon], &s[colon + 1..])
         } else if let Some(plus) = s.rfind('+') {
             (&s[..plus], &s[plus + 1..])
         } else {
-            // No separator — bare key with no mods.
             return Some(Self {
                 mods: Modifiers::empty(),
                 key: s.to_lowercase(),
@@ -122,7 +116,7 @@ impl KeyCombo {
                 "ctrl" | "control" => mods |= Modifiers::CTRL,
                 "alt" | "mod1" => mods |= Modifiers::ALT,
                 "shift" => mods |= Modifiers::SHIFT,
-                "" => {} // leading/trailing '+' — ignore
+                "" => {}
                 other => tracing::warn!("unknown modifier '{}' in keybind '{}'", other, s),
             }
         }
@@ -139,6 +133,7 @@ pub enum KeyAction {
     Exec(String, Vec<String>),
     Close,
     Fullscreen,
+    ToggleFloat,
     ToggleBar,
     FocusLeft,
     FocusRight,
@@ -160,6 +155,7 @@ pub enum KeyAction {
     Reload,
     SwitchVt(i32),
     EmergencyQuit,
+    ToggleScratchpad(String),
     Custom(String, Vec<String>),
 }
 
@@ -176,6 +172,7 @@ impl KeyAction {
             )),
             "close" => Some(Self::Close),
             "fullscreen" => Some(Self::Fullscreen),
+            "toggle_float" => Some(Self::ToggleFloat),
             "toggle_bar" => Some(Self::ToggleBar),
             "focus" => match args.first().copied() {
                 Some("left") => Some(Self::FocusLeft),
@@ -202,6 +199,7 @@ impl KeyAction {
             "quit" => Some(Self::Quit),
             "reload" => Some(Self::Reload),
             "switch_vt" => args.first()?.parse().ok().map(Self::SwitchVt),
+            "scratchpad" => Some(Self::ToggleScratchpad(args.first()?.to_string())),
             other => Some(Self::Custom(
                 other.to_string(),
                 args.iter().map(|s| s.to_string()).collect(),
@@ -300,6 +298,9 @@ pub enum BarModuleKind {
     Workspaces,
     Clock,
     Layout,
+    Battery,
+    Network,
+    Volume,
     Systray,
     Custom,
 }
@@ -310,6 +311,9 @@ impl BarModuleKind {
             "workspaces" => Self::Workspaces,
             "clock" => Self::Clock,
             "layout" => Self::Layout,
+            "battery" => Self::Battery,
+            "network" => Self::Network,
+            "volume" => Self::Volume,
             "systray" => Self::Systray,
             _ => Self::Custom,
         }
@@ -318,33 +322,28 @@ impl BarModuleKind {
 
 // ── Bar config ────────────────────────────────────────────────────────────────
 
-/// All fields that bar.conf can set inside the `bar { }` block.
 #[derive(Debug, Clone)]
 pub struct BarConfig {
     pub position: BarPosition,
     pub height: u32,
     pub padding: u32,
     pub item_spacing: u32,
-    pub font_size: Option<f32>, // overrides global font_size for bar
+    pub font_size: Option<f32>,
     pub glyph_y_offset: i32,
     pub modules_left: Vec<String>,
     pub modules_center: Vec<String>,
     pub modules_right: Vec<String>,
-    // Colors
     pub bg: Color,
     pub fg: Color,
     pub accent: Color,
     pub dim: Color,
-    // Separator
     pub separator: bool,
     pub separator_top: bool,
     pub separator_color: Color,
-    // Workspace pills
     pub active_ws_fg: Color,
     pub active_ws_bg: Color,
     pub occupied_ws_fg: Color,
     pub inactive_ws_fg: Color,
-    // Pill geometry
     pub pill_radius: u32,
 }
 
@@ -365,7 +364,7 @@ impl Default for BarConfig {
             glyph_y_offset: 0,
             modules_left: vec!["workspaces".into()],
             modules_center: vec!["clock".into()],
-            modules_right: vec!["layout".into()],
+            modules_right: vec!["layout".into(), "battery".into(), "network".into()],
             bg: Color::hex(0x181825),
             fg: Color::hex(0xa6adc8),
             accent: Color::hex(0xb4befe),
@@ -439,14 +438,41 @@ pub struct ExecEntry {
 }
 
 impl ExecEntry {
-    /// Parse a command string. Handles simple `"cmd arg1 arg2"` splitting.
-    /// Shell pipes (`|`) and redirects are passed verbatim as args — the
-    /// compositor hands the full argv to exec, not a shell.
     fn parse(s: &str) -> Self {
         let mut parts = s.split_whitespace();
         let command = parts.next().unwrap_or("").to_string();
         let args = parts.map(|s| s.to_string()).collect();
         Self { command, args }
+    }
+}
+
+// ── Scratchpad config ─────────────────────────────────────────────────────────
+
+/// A scratchpad definition from the config file.
+///
+/// ```conf
+/// scratchpad discord {
+///     app_id    = discord
+///     width     = 70%
+///     height    = 70%
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ScratchpadConfig {
+    pub name: String,
+    pub app_id: String,
+    pub width_pct: f32,
+    pub height_pct: f32,
+}
+
+impl Default for ScratchpadConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            app_id: String::new(),
+            width_pct: 0.6,
+            height_pct: 0.6,
+        }
     }
 }
 
@@ -489,6 +515,8 @@ pub struct Config {
     pub font_size: f32,
     pub gap: u32,
     pub border_width: u32,
+    pub corner_radius: u32,
+    pub cursor_theme: Option<String>,
     pub colors: Colors,
     pub bar: BarConfig,
     pub bar_modules: HashMap<String, BarModuleDef>,
@@ -500,6 +528,7 @@ pub struct Config {
     pub exec: Vec<ExecEntry>,
     pub seat_name: String,
     pub workspaces: u8,
+    pub scratchpads: Vec<ScratchpadConfig>,
 }
 
 impl Default for Config {
@@ -509,6 +538,8 @@ impl Default for Config {
             font_size: 14.0,
             gap: 4,
             border_width: 1,
+            corner_radius: 0,
+            cursor_theme: None,
             colors: Colors::default(),
             bar: BarConfig::default(),
             bar_modules: HashMap::new(),
@@ -520,6 +551,7 @@ impl Default for Config {
             exec: Vec::new(),
             seat_name: "seat0".into(),
             workspaces: 9,
+            scratchpads: Vec::new(),
         }
     }
 }
@@ -532,6 +564,10 @@ fn default_keybinds() -> Vec<(KeyCombo, KeyAction)> {
         ),
         (KeyCombo::parse("Super:q").unwrap(), KeyAction::Close),
         (KeyCombo::parse("Super:f").unwrap(), KeyAction::Fullscreen),
+        (
+            KeyCombo::parse("Super+Shift:Space").unwrap(),
+            KeyAction::ToggleFloat,
+        ),
         (
             KeyCombo::parse("Super+Shift:b").unwrap(),
             KeyAction::ToggleBar,
@@ -565,13 +601,15 @@ fn default_keybinds() -> Vec<(KeyCombo, KeyAction)> {
     ]
 }
 
-// ── Known key sets (for unknown-key warnings) ─────────────────────────────────
+// ── Known key sets ────────────────────────────────────────────────────────────
 
 const KNOWN_TOP_LEVEL: &[&str] = &[
     "font",
     "font_size",
     "gap",
     "border_width",
+    "corner_radius",
+    "cursor_theme",
     "workspaces",
     "seat_name",
     "keybind",
@@ -627,7 +665,8 @@ const KNOWN_BAR: &[&str] = &[
 
 const KNOWN_MONITOR: &[&str] = &["width", "height", "refresh", "position", "scale"];
 
-// Silently accepted blocks — no unknown-key warnings for their contents.
+const KNOWN_SCRATCHPAD: &[&str] = &["app_id", "width", "height"];
+
 const SILENT_BLOCKS: &[&str] = &["animations", "general"];
 
 fn warn_unknown_keys(block_name: &str, b: &parser::Block, known: &[&str]) {
@@ -644,17 +683,15 @@ fn warn_unknown_keys(block_name: &str, b: &parser::Block, known: &[&str]) {
 }
 
 fn resolve_font_path(s: &str) -> PathBuf {
-    // 1. Already an absolute path?
     let p = PathBuf::from(s);
     if p.is_absolute() {
         if p.exists() {
             return p;
         }
         tracing::warn!("config: font path {:?} does not exist", p);
-        return p; // return as-is and let trixui fail with a clear error
+        return p;
     }
 
-    // 2. Home-relative path?
     if let Some(rest) = s.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         let p = PathBuf::from(home).join(rest);
@@ -665,17 +702,14 @@ fn resolve_font_path(s: &str) -> PathBuf {
         return p;
     }
 
-    // 3. Search font directories for a matching filename (or name + extension).
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let xdg_data =
         std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home));
 
     let search_dirs: &[&str] = &[
-        // User font dirs
         &format!("{}/fonts", xdg_data),
         &format!("{}/.fonts", home),
         &format!("{}/.local/share/fonts", home),
-        // System font dirs
         "/usr/share/fonts",
         "/usr/share/fonts/Iosevka",
         "/usr/local/share/fonts",
@@ -685,7 +719,6 @@ fn resolve_font_path(s: &str) -> PathBuf {
         "/usr/share/fonts/opentype",
     ];
 
-    // Candidate filenames to try — with and without common extensions.
     let mut candidates: Vec<String> = vec![s.to_string()];
     if !s.ends_with(".ttf") && !s.ends_with(".otf") && !s.ends_with(".TTF") && !s.ends_with(".OTF")
     {
@@ -700,7 +733,6 @@ fn resolve_font_path(s: &str) -> PathBuf {
         if !base.exists() {
             continue;
         }
-        // Try direct match first (flat dir).
         for cand in &candidates {
             let p = base.join(cand);
             if p.exists() {
@@ -708,7 +740,6 @@ fn resolve_font_path(s: &str) -> PathBuf {
                 return p;
             }
         }
-        // Walk one level of subdirectories (e.g. /usr/share/fonts/nerd-fonts/…).
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -729,6 +760,27 @@ fn resolve_font_path(s: &str) -> PathBuf {
         s
     );
     PathBuf::from("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf")
+}
+
+// ── Percent value parser ──────────────────────────────────────────────────────
+
+/// Parse a value as a 0..1 fraction. Accepts `70%` (Dimension/Percent),
+/// bare floats like `0.7`, and bare integers treated as percent (70 → 0.7).
+fn as_pct(v: &Value) -> Option<f32> {
+    match v {
+        Value::Dimension(f, parser::Unit::Percent) => Some((*f as f32 / 100.0).clamp(0.1, 1.0)),
+        Value::Float(f) => Some((*f as f32).clamp(0.1, 1.0)),
+        Value::Int(n) => {
+            let f = *n as f32;
+            // Heuristic: values > 1 are assumed to be percent (70 → 0.7).
+            if f > 1.0 {
+                Some((f / 100.0).clamp(0.1, 1.0))
+            } else {
+                Some(f.clamp(0.1, 1.0))
+            }
+        }
+        _ => None,
+    }
 }
 
 // ── Config impl ───────────────────────────────────────────────────────────────
@@ -755,8 +807,6 @@ impl Config {
             result.file.items.len(),
             result.errors.len()
         );
-        // Log every top-level item at debug level so we can verify sourced
-        // files are being inlined correctly.
         for item in &result.file.items {
             match item {
                 parser::Item::Assignment(a) => {
@@ -774,7 +824,6 @@ impl Config {
         Self::from_file(result.file)
     }
 
-    // Keep from_source for callers that already have the src string (LSP etc.)
     pub fn from_source(src: &str, path: &Path) -> Self {
         let result = parse(src);
         for e in &result.errors {
@@ -784,20 +833,6 @@ impl Config {
     }
 
     pub fn from_file(f: ConfigFile) -> Self {
-        tracing::info!(
-            "from_file: {} items, keys: {:?}",
-            f.items.len(),
-            f.items
-                .iter()
-                .filter_map(|i| {
-                    if let parser::Item::Assignment(a) = i {
-                        Some(a.key.value.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        );
         let mut cfg = Self::default();
 
         // ── Warn on unknown top-level keys ────────────────────────────────────
@@ -814,14 +849,7 @@ impl Config {
         }
 
         // ── Core scalar fields ────────────────────────────────────────────────
-        // last-wins: sourced files come before main file in item order,
-        // so trixie.conf assignments naturally win.
         if let Some(v) = f.get_last("font") {
-            tracing::info!(
-                "config: font key present={} value={:?}",
-                f.get_last("font").is_some(),
-                f.get_last("font").map(|v| &v.value),
-            );
             if let Some(s) = v.value.as_str() {
                 cfg.font_path = resolve_font_path(s);
             }
@@ -841,7 +869,16 @@ impl Config {
                 cfg.border_width = px;
             }
         }
-        // Both `seat_name` and bare `seat` are accepted.
+        if let Some(v) = f.get_last("corner_radius") {
+            if let Some(px) = v.value.as_px() {
+                cfg.corner_radius = px;
+            }
+        }
+        if let Some(v) = f.get_last("cursor_theme") {
+            if let Some(s) = v.value.as_str() {
+                cfg.cursor_theme = Some(s.to_string());
+            }
+        }
         if let Some(v) = f.get_last("seat_name").or_else(|| f.get_last("seat")) {
             if let Some(s) = v.value.as_str() {
                 cfg.seat_name = s.to_string();
@@ -880,7 +917,6 @@ impl Config {
         if let Some(b) = f.block_last("keyboard") {
             warn_unknown_keys("keyboard", b, KNOWN_KEYBOARD);
             if let Some(v) = b.get("layout") {
-                // Empty string means "use system default" — store as None.
                 cfg.keyboard.layout = v.value.as_str().filter(|s| !s.is_empty()).map(String::from);
             }
             if let Some(v) = b.get("variant") {
@@ -1033,7 +1069,6 @@ impl Config {
                 }
             }
             if let Some(v) = b.get("refresh") {
-                // Accept both `144hz` (Dimension) and bare `144` (Int).
                 if let Some(hz) = v
                     .value
                     .as_hz()
@@ -1044,7 +1079,6 @@ impl Config {
                 }
             }
             if let Some(v) = b.get("position") {
-                // `position = x, y` parses as an implicit array of two ints.
                 if let Value::Array(parts) = &v.value {
                     if parts.len() == 2 {
                         let x = parts[0].value.as_i64().unwrap_or(0) as i32;
@@ -1064,27 +1098,52 @@ impl Config {
             cfg.monitors.push(m);
         }
 
-        // Fall back to a single default monitor if none configured.
         if cfg.monitors.is_empty() {
             cfg.monitors.push(MonitorConfig::default());
         }
 
-        // Fall back to hardcoded keybinds only if the config defined none at all.
         if cfg.keybinds.is_empty() {
             cfg.keybinds.extend(default_keybinds());
         }
 
-        // ── Warn on silently accepted blocks ──────────────────────────────────
-        // (animations, general — parse fine, no warnings needed)
-        for block_name in SILENT_BLOCKS {
-            let _ = f.block(block_name); // just touch it so the compiler knows it's used
+        // ── scratchpad <name> { } ─────────────────────────────────────────────
+        cfg.scratchpads.clear();
+        for b in f.blocks("scratchpad") {
+            warn_unknown_keys("scratchpad", b, KNOWN_SCRATCHPAD);
+
+            let name = b
+                .label
+                .as_ref()
+                .map(|l| l.value.clone())
+                .unwrap_or_else(|| "unnamed".into());
+
+            let app_id = b
+                .get("app_id")
+                .and_then(|v| v.value.as_str().map(String::from))
+                .unwrap_or_else(|| name.clone());
+
+            let width_pct = b.get("width").and_then(|v| as_pct(&v.value)).unwrap_or(0.6);
+
+            let height_pct = b
+                .get("height")
+                .and_then(|v| as_pct(&v.value))
+                .unwrap_or(0.6);
+
+            cfg.scratchpads.push(ScratchpadConfig {
+                name,
+                app_id,
+                width_pct,
+                height_pct,
+            });
+        }
+
+        for _block_name in SILENT_BLOCKS {
+            // silently accepted
         }
 
         // ── keybind = COMBO, action, args... ──────────────────────────────────
         cfg.keybinds.clear();
         for sv in f.get_all("keybind") {
-            // Collect parts as owned strings — needed because as_arg_string can
-            // return Cow::Owned for integer tokens (e.g. workspace numbers).
             let owned: Vec<String> = match &sv.value {
                 Value::Array(items) => items
                     .iter()
@@ -1163,11 +1222,11 @@ impl Config {
 
     pub fn hot_reload(&mut self) {
         let new = Self::from_path(&config_path());
-        // Intentionally NOT reloading font_path — a font change requires
-        // re-initialising trixui which can't be done mid-session.
         self.font_size = new.font_size;
         self.gap = new.gap;
         self.border_width = new.border_width;
+        self.corner_radius = new.corner_radius;
+        self.cursor_theme = new.cursor_theme;
         self.colors = new.colors;
         self.bar = new.bar;
         self.bar_modules = new.bar_modules;
@@ -1178,7 +1237,8 @@ impl Config {
         self.seat_name = new.seat_name;
         self.workspaces = new.workspaces;
         self.exec = new.exec;
-        // exec_once intentionally not reloaded — only runs at session start.
+        self.scratchpads = new.scratchpads;
+        // exec_once and font_path intentionally not reloaded.
     }
 }
 

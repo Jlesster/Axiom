@@ -39,3 +39,4 @@ tracing-subscriber = "0.3"
 calloop = { version = "0.14.4", features = ["signals"] }
 libc = "0.2.182"
 serde_json = "1.0.149"
+gbm = "0.18.0"

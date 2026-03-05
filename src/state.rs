@@ -1,11 +1,5 @@
 // state.rs — Trixie root compositor state.
 
-use std::{
-    collections::HashMap,
-    sync::{atomic::AtomicBool, Arc},
-    time::{Duration, Instant},
-};
-
 use smithay::{
     backend::{
         allocator::gbm::{GbmAllocator, GbmDevice},
@@ -40,7 +34,7 @@ use smithay::{
             DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Monotonic, SERIAL_COUNTER as SCOUNTER},
+    utils::{Clock, Monotonic, Physical, SERIAL_COUNTER as SCOUNTER},
     wayland::{
         compositor::CompositorState,
         dmabuf::{DmabufGlobal, DmabufState},
@@ -53,12 +47,19 @@ use smithay::{
         shm::ShmState,
     },
 };
-
-use trixui::smithay::SmithayApp;
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
+};
+use trixui::layout::Rect as TrixuiRect;
+use trixui::pipelines::de::DePipeline;
+use trixui::pipelines::de::WindowInfo;
 
 use crate::{
-    chrome::{ChromeApp, ChromeMsg},
+    chrome::TrixieDE,
     config::Config,
+    cursor::CursorManager,
     twm::{anim::AnimSet, PaneId, TwmState},
 };
 
@@ -80,11 +81,7 @@ smithay::backend::renderer::element::render_elements! {
 pub struct SurfaceData {
     pub output: Output,
     pub compositor: GbmDrmCompositor,
-    /// Retained for informational use only.
     pub next_frame_time: Instant,
-    /// True from the moment a frame is queued until vblank fires.
-    /// render_surface will not submit a new frame while this is set,
-    /// preventing frame queue overflow on NVIDIA and other DRM drivers.
     pub pending_frame: bool,
     pub frame_duration: Duration,
 }
@@ -125,6 +122,14 @@ pub enum MouseMode {
     Passthrough,
 }
 
+#[derive(Debug, Clone, Default)]
+pub enum DragState {
+    #[default]
+    None,
+    Moving(PaneId),
+    Resizing(PaneId),
+}
+
 // ── Main compositor state ─────────────────────────────────────────────────────
 
 pub struct Trixie {
@@ -142,13 +147,13 @@ pub struct Trixie {
     pub xdg_decoration_state: XdgDecorationState,
     pub popups: PopupManager,
     pub space: Space<Window>,
-
-    /// Maps a Wayland surface ObjectId → TWM PaneId.
+    pub drag: DragState,
     pub surface_to_pane: HashMap<ObjectId, PaneId>,
 
     pub seat: Seat<Self>,
     pub pointer: PointerHandle<Self>,
     pub cursor_status: CursorImageStatus,
+    pub cursor: CursorManager,
     pub mouse_mode: MouseMode,
     pub libinput: Libinput,
 
@@ -161,7 +166,8 @@ pub struct Trixie {
     pub anim: AnimSet,
     pub unclaimed: HashMap<ObjectId, ToplevelSurface>,
 
-    pub ui: Option<SmithayApp<ChromeApp>>,
+    /// Chrome pipeline — None until the GL context is current in backend.rs.
+    pub de: Option<DePipeline<TrixieDE>>,
 
     pub config: Arc<Config>,
 
@@ -171,12 +177,6 @@ pub struct Trixie {
     pub start_time: Instant,
     pub exec_once_done: bool,
 
-    /// Set to true by any event that causes visible change:
-    /// client buffer commit, cursor move, window open/close, config reload,
-    /// animation tick, key binding that changes layout/focus.
-    /// Cleared in frame_finish after the next frame is scheduled.
-    /// This prevents the render loop from running at full refresh rate
-    /// when nothing has changed, fixing sluggishness and NVIDIA flicker.
     pub needs_redraw: bool,
 }
 
@@ -203,41 +203,33 @@ impl Trixie {
             None => return,
         };
 
-        // Do not submit a new frame while the previous one is still in-flight.
         if surface.pending_frame {
+            tracing::warn!("render_surface: skipping, pending_frame=true node={node:?}");
             return;
         }
 
         let frame_duration = surface.frame_duration;
 
-        // Advance animations. If any are still running, keep needs_redraw set
-        // so frame_finish schedules another frame after vblank.
         let still_animating = self.anim.tick();
         if still_animating {
             self.needs_redraw = true;
         }
 
+        // Push latest TWM snapshot into the chrome pipeline before rendering.
         let snap = self.twm.snapshot();
-        let chrome_cmds = if let Some(ui) = &mut self.ui {
-            ui.send(ChromeMsg::Snapshot(snap));
-            ui.collect()
-        } else {
-            vec![]
-        };
+        if let Some(de) = &mut self.de {
+            de.app_mut().snap = snap;
+        }
 
-        let queued = crate::render::render(self, node, crtc, chrome_cmds);
+        let queued = crate::render::render(self, node, crtc);
 
         if queued {
-            // render.rs sets pending_frame = true inside queue_frame on success.
-            // We only update next_frame_time here for informational purposes.
             if let Some(b) = self.backends.get_mut(&node) {
                 if let Some(s) = b.surfaces.get_mut(&crtc) {
                     s.next_frame_time = Instant::now() + s.frame_duration;
                 }
             }
         } else {
-            // render() returned false — DRM not ready or nothing to draw yet.
-            // Schedule a one-shot retry after one frame interval.
             self.handle
                 .insert_source(Timer::from_duration(frame_duration), move |_, _, state| {
                     state.render_surface(node, crtc);
@@ -250,8 +242,6 @@ impl Trixie {
     pub fn frame_finish(&mut self, node: DrmNode, crtc: crtc::Handle) {
         if let Some(b) = self.backends.get_mut(&node) {
             if let Some(s) = b.surfaces.get_mut(&crtc) {
-                // Vblank fired — the frame is on screen. Clear the guard so the
-                // next render_surface call can submit a new frame.
                 s.pending_frame = false;
                 if let Err(e) = s.compositor.frame_submitted() {
                     tracing::warn!("frame_submitted: {e}");
@@ -259,15 +249,6 @@ impl Trixie {
             }
         }
 
-        // Always schedule the next frame after vblank. The render loop runs
-        // continuously; pending_frame is the sole guard against frame queue
-        // overflow (render_surface returns early if pending_frame is set).
-        //
-        // The open-window seizure/flash was caused by reset_buffers() being
-        // called every frame in render.rs (now removed), not by the loop being
-        // unconditional. Demand-driven gating here caused the loop to die on
-        // the first idle frame because trixui's chrome path doesn't re-signal
-        // needs_redraw on every tick.
         self.needs_redraw = false;
         self.handle
             .insert_idle(move |s| s.render_surface(node, crtc));
@@ -336,6 +317,17 @@ impl Trixie {
         }
     }
 
+    /// Snapshot pane rects, reflow, diff, then kick layout morph animations
+    /// for any pane whose rect changed.  Use this instead of calling
+    /// `twm.reflow()` directly when a layout change has occurred.
+    pub fn sync_focus_and_reflow(&mut self) {
+        let old_rects = self.twm.pane_rects_snapshot();
+        self.twm.reflow();
+        let new_rects = self.twm.pane_rects_snapshot();
+        crate::twm::anim::diff_and_morph(&mut self.anim, &old_rects, &new_rects);
+        self.sync_focus();
+    }
+
     // ── Config reload ─────────────────────────────────────────────────────────
 
     pub fn apply_config_reload(&mut self) {
@@ -350,9 +342,9 @@ impl Trixie {
         let config_bar_h = self.config.bar.height;
         let at_bottom = self.config.bar.position == crate::config::BarPosition::Bottom;
 
-        let actual_bar_h = if let Some(ui) = &mut self.ui {
-            ui.set_bar_height_px(config_bar_h);
-            let cell_h = ui.line_h();
+        let actual_bar_h = if let Some(de) = &mut self.de {
+            de.set_bar_height_px(config_bar_h);
+            let cell_h = de.line_h();
             if cell_h == 0 {
                 config_bar_h
             } else {
@@ -364,8 +356,9 @@ impl Trixie {
 
         self.twm.set_bar_height(actual_bar_h, at_bottom);
 
-        if let Some(ui) = &mut self.ui {
-            ui.send(ChromeMsg::ConfigReloaded(new_arc));
+        if let Some(de) = &mut self.de {
+            de.app_mut().theme = crate::chrome::build_theme(&new_arc);
+            de.app_mut().config = Arc::clone(&new_arc);
         }
 
         if let Some(kbd) = self.seat.get_keyboard() {
@@ -421,4 +414,13 @@ pub fn expand_tilde(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+pub fn trixui_rect(r: smithay::utils::Rectangle<i32, Physical>) -> trixui::layout::Rect {
+    trixui::layout::Rect::new(
+        r.loc.x as u32,
+        r.loc.y as u32,
+        r.size.w as u32,
+        r.size.h as u32,
+    )
 }

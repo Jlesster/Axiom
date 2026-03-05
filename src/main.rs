@@ -3,6 +3,7 @@
 mod backend;
 mod chrome;
 mod config;
+mod cursor;
 mod handlers;
 mod input;
 mod ipc;
@@ -55,7 +56,8 @@ use smithay::{
 };
 
 use config::{BarPosition, Config};
-use state::Trixie;
+use cursor::CursorManager;
+use state::{DragState, Trixie};
 use twm::TwmState;
 
 fn main() {
@@ -162,8 +164,6 @@ fn main() {
 
     let bar_h = config.bar.height;
     let at_bottom = config.bar.position == BarPosition::Bottom;
-    // Initialize with zero dimensions — add_output will call twm.resize() with
-    // the real DRM mode size before any windows open, so this is safe.
     let twm = TwmState::new(
         0,
         0,
@@ -174,6 +174,13 @@ fn main() {
         12,
         config.workspaces,
     );
+
+    // Build CursorManager — theme is loaded later in backend.rs once the GL
+    // context is current and the cursor theme path is resolvable.
+    let mut cursor = CursorManager::default();
+    if let Some(theme) = config.cursor_theme.as_deref() {
+        cursor.theme_name = theme.to_string();
+    }
 
     let mut state = Trixie {
         display_handle: dh.clone(),
@@ -194,7 +201,9 @@ fn main() {
         seat,
         pointer,
         cursor_status: CursorImageStatus::default_named(),
+        cursor,
         mouse_mode: state::MouseMode::Normal,
+        drag: DragState::None,
         libinput: libinput_ctx,
         session,
         backends: HashMap::new(),
@@ -202,7 +211,6 @@ fn main() {
         wayland_socket: socket_name.clone(),
         twm,
         unclaimed: HashMap::new(),
-        ui: None,
         config: Arc::clone(&config),
         running: Arc::new(AtomicBool::new(true)),
         handle: event_loop.handle(),
@@ -211,7 +219,22 @@ fn main() {
         exec_once_done: false,
         anim: twm::anim::AnimSet::default(),
         needs_redraw: true,
+        de: None,
     };
+
+    // ── Register scratchpads from config ──────────────────────────────────────
+    for sp in &config.scratchpads.clone() {
+        state
+            .twm
+            .register_scratchpad_sized(&sp.name, &sp.app_id, sp.width_pct, sp.height_pct);
+        tracing::info!(
+            "Registered scratchpad '{}' for app_id='{}' ({:.0}%x{:.0}%)",
+            sp.name,
+            sp.app_id,
+            sp.width_pct * 100.0,
+            sp.height_pct * 100.0,
+        );
+    }
 
     let udev_backend = UdevBackend::new(state.session.seat()).unwrap();
     for (dev_id, path) in udev_backend.device_list() {
@@ -285,7 +308,7 @@ fn main() {
     let mut display_handle = state.display_handle.clone();
 
     while running.load(Ordering::SeqCst) {
-        let _ = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
+        let _ = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
         if reload_rx.try_recv().is_ok() {
             while reload_rx.try_recv().is_ok() {}
             state.apply_config_reload();
@@ -298,4 +321,13 @@ fn main() {
     }
 
     tracing::info!("Trixie shutting down");
+
+    drop(display_handle);
+    state.libinput.suspend();
+    for backend in state.backends.values_mut() {
+        backend.drm.pause();
+    }
+    drop(state);
+
+    tracing::info!("Trixie exited cleanly");
 }

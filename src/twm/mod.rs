@@ -2,7 +2,7 @@
 
 pub mod anim;
 pub mod layout;
-pub use anim::AnimSet;
+pub use anim::{AnimSet, WsDir};
 pub use layout::Layout;
 
 use std::collections::HashMap;
@@ -36,6 +36,22 @@ impl Rect {
             y: self.y + px,
             w: self.w.saturating_sub(px * 2),
             h: self.h.saturating_sub(px * 2),
+        }
+    }
+    pub fn clamp_to(self, bounds: Rect) -> Self {
+        let x = self
+            .x
+            .max(bounds.x)
+            .min(bounds.x + bounds.w.saturating_sub(self.w));
+        let y = self
+            .y
+            .max(bounds.y)
+            .min(bounds.y + bounds.h.saturating_sub(self.h));
+        Self {
+            x,
+            y,
+            w: self.w,
+            h: self.h,
         }
     }
 }
@@ -89,6 +105,7 @@ pub struct Pane {
     pub rect: Rect,
     pub fullscreen: bool,
     pub floating: bool,
+    /// Saved rect when floating — persists across workspace switches.
     pub float_rect: Rect,
 }
 
@@ -102,6 +119,41 @@ impl Pane {
             floating: false,
             float_rect: Rect::default(),
         }
+    }
+}
+
+// ── Scratchpad ────────────────────────────────────────────────────────────────
+
+/// A named scratchpad. The pane is hidden (not in any workspace pane list)
+/// when `visible = false`.
+#[derive(Debug, Clone)]
+pub struct Scratchpad {
+    pub name: String,
+    /// app_id to match when a new window is assigned here.
+    pub app_id: String,
+    pub pane_id: Option<PaneId>,
+    pub visible: bool,
+    /// Where to show it (centered + sized relative to screen).
+    pub width_pct: f32,
+    pub height_pct: f32,
+}
+
+impl Scratchpad {
+    pub fn new(name: impl Into<String>, app_id: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            app_id: app_id.into(),
+            pane_id: None,
+            visible: false,
+            width_pct: 0.6,
+            height_pct: 0.6,
+        }
+    }
+
+    pub fn with_size(mut self, w: f32, h: f32) -> Self {
+        self.width_pct = w.clamp(0.1, 1.0);
+        self.height_pct = h.clamp(0.1, 1.0);
+        self
     }
 }
 
@@ -172,6 +224,7 @@ pub enum TwmAction {
     MoveDown,
     Close,
     Fullscreen,
+    ToggleFloat,
     NextLayout,
     PrevLayout,
     GrowMain,
@@ -185,6 +238,11 @@ pub enum TwmAction {
     SetTitle(PaneId, String),
     AssignEmbedded(String),
     CloseAppId(String),
+    // Floating move/resize — driven from input.rs during drag.
+    FloatMove(PaneId, i32, i32),
+    FloatResize(PaneId, i32, i32),
+    // Scratchpad.
+    ToggleScratchpad(String),
 }
 
 // ── TwmSnapshot ───────────────────────────────────────────────────────────────
@@ -226,15 +284,14 @@ pub struct TwmState {
     pub active_ws: usize,
     pub screen_w: u32,
     pub screen_h: u32,
-    /// Content area: screen minus bar minus outer padding.
     pub content_rect: Rect,
     pub bar_rect: Rect,
     pub bar_visible: bool,
     pub gap: u32,
     pub border_w: u32,
-    /// Outer padding in pixels — insets the entire tiling area from all edges.
     pub padding: u32,
     pub workspaces_count: u8,
+    pub scratchpads: Vec<Scratchpad>,
 }
 
 impl TwmState {
@@ -267,9 +324,110 @@ impl TwmState {
             border_w,
             padding,
             workspaces_count,
+            scratchpads: Vec::new(),
         };
         s.reflow();
         s
+    }
+
+    // ── Scratchpad registration ───────────────────────────────────────────────
+
+    pub fn register_scratchpad(&mut self, name: impl Into<String>, app_id: impl Into<String>) {
+        let name = name.into();
+        if !self.scratchpads.iter().any(|s| s.name == name) {
+            self.scratchpads.push(Scratchpad::new(name, app_id));
+        }
+    }
+
+    pub fn register_scratchpad_sized(
+        &mut self,
+        name: impl Into<String>,
+        app_id: impl Into<String>,
+        w_pct: f32,
+        h_pct: f32,
+    ) {
+        let name = name.into();
+        if !self.scratchpads.iter().any(|s| s.name == name) {
+            self.scratchpads
+                .push(Scratchpad::new(name, app_id).with_size(w_pct, h_pct));
+        }
+    }
+
+    /// Called when a new window opens — assigns it to a matching scratchpad
+    /// if one exists and is unclaimed. Returns true if assigned.
+    pub fn try_assign_scratchpad(&mut self, pane_id: PaneId, app_id: &str) -> bool {
+        let idx = self
+            .scratchpads
+            .iter()
+            .position(|s| s.app_id == app_id && s.pane_id.is_none());
+        if let Some(i) = idx {
+            self.scratchpads[i].pane_id = Some(pane_id);
+            let rect = self.scratchpad_rect(&self.scratchpads[i].clone());
+            if let Some(p) = self.panes.get_mut(&pane_id) {
+                p.floating = true;
+                p.rect = rect;
+                p.float_rect = rect;
+            }
+            for ws in &mut self.workspaces {
+                ws.panes.retain(|&id| id != pane_id);
+                if ws.focused == Some(pane_id) {
+                    ws.focused = ws.panes.last().copied();
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn scratchpad_rect(&self, sp: &Scratchpad) -> Rect {
+        let w = (self.screen_w as f32 * sp.width_pct) as u32;
+        let h = (self.screen_h as f32 * sp.height_pct) as u32;
+        let x = (self.screen_w.saturating_sub(w)) / 2;
+        let y = (self.screen_h.saturating_sub(h)) / 2;
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn toggle_scratchpad(&mut self, name: &str) {
+        let idx = match self.scratchpads.iter().position(|s| s.name == name) {
+            Some(i) => i,
+            None => {
+                tracing::warn!("toggle_scratchpad: no scratchpad named '{name}'");
+                return;
+            }
+        };
+
+        let sp = self.scratchpads[idx].clone();
+
+        if sp.pane_id.is_none() {
+            tracing::debug!("toggle_scratchpad '{name}': no pane assigned yet");
+            return;
+        }
+
+        let pane_id = sp.pane_id.unwrap();
+
+        if sp.visible {
+            let ws = &mut self.workspaces[self.active_ws];
+            ws.panes.retain(|&id| id != pane_id);
+            if ws.focused == Some(pane_id) {
+                ws.focused = ws.panes.last().copied();
+            }
+            self.scratchpads[idx].visible = false;
+        } else {
+            let rect = self.scratchpad_rect(&sp);
+            if let Some(p) = self.panes.get_mut(&pane_id) {
+                p.rect = rect;
+                p.float_rect = rect;
+            }
+            for ws in &mut self.workspaces {
+                ws.panes.retain(|&id| id != pane_id);
+            }
+            let ws = &mut self.workspaces[self.active_ws];
+            ws.panes.push(pane_id);
+            ws.focused = Some(pane_id);
+            self.scratchpads[idx].visible = true;
+        }
+
+        self.reflow();
     }
 
     // ── Resize ────────────────────────────────────────────────────────────────
@@ -300,6 +458,10 @@ impl TwmState {
             title: app_id.to_owned(),
         });
         let id = p.id;
+        tracing::info!(
+            "open_shell: inserting pane id={id}, panes before={}",
+            self.panes.len()
+        );
         self.panes.insert(id, p);
         let ws = &mut self.workspaces[self.active_ws];
         ws.panes.push(id);
@@ -349,6 +511,12 @@ impl TwmState {
                 ws.focused = ws.panes.last().copied();
             }
         }
+        for sp in &mut self.scratchpads {
+            if sp.pane_id == Some(id) {
+                sp.pane_id = None;
+                sp.visible = false;
+            }
+        }
         self.reflow();
     }
 
@@ -362,6 +530,54 @@ impl TwmState {
         for id in ids {
             self.close_pane(id);
         }
+    }
+
+    // ── Float ─────────────────────────────────────────────────────────────────
+
+    pub fn toggle_float(&mut self) {
+        let Some(id) = self.focused_id() else { return };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        pane.floating = !pane.floating;
+        if pane.floating {
+            if pane.float_rect.is_empty() {
+                pane.float_rect = pane.rect;
+            }
+            pane.rect = pane.float_rect;
+        }
+        self.reflow();
+    }
+
+    /// Move a floating pane by (dx, dy) in pixels.
+    pub fn float_move(&mut self, id: PaneId, dx: i32, dy: i32) {
+        let screen = Rect::new(0, 0, self.screen_w, self.screen_h);
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if !pane.floating {
+            return;
+        }
+        let nx = (pane.rect.x as i32 + dx).max(0) as u32;
+        let ny = (pane.rect.y as i32 + dy).max(0) as u32;
+        pane.rect.x = nx.min(screen.w.saturating_sub(pane.rect.w));
+        pane.rect.y = ny.min(screen.h.saturating_sub(pane.rect.h));
+        pane.float_rect = pane.rect;
+    }
+
+    /// Resize a floating pane by (dw, dh) in pixels.
+    pub fn float_resize(&mut self, id: PaneId, dw: i32, dh: i32) {
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if !pane.floating {
+            return;
+        }
+        let nw = (pane.rect.w as i32 + dw).max(80) as u32;
+        let nh = (pane.rect.h as i32 + dh).max(60) as u32;
+        pane.rect.w = nw.min(self.screen_w);
+        pane.rect.h = nh.min(self.screen_h);
+        pane.float_rect = pane.rect;
     }
 
     // ── Focus ─────────────────────────────────────────────────────────────────
@@ -413,6 +629,19 @@ impl TwmState {
         }
     }
 
+    // ── Layout morph snapshot ─────────────────────────────────────────────────
+
+    /// Snapshot all current pane rects on the active workspace.
+    /// Call BEFORE reflow() to capture pre-change positions, then AFTER to get
+    /// post-change positions, and pass both to `anim::diff_and_morph()`.
+    pub fn pane_rects_snapshot(&self) -> Vec<(PaneId, Rect)> {
+        let ws = &self.workspaces[self.active_ws];
+        ws.panes
+            .iter()
+            .filter_map(|&id| self.panes.get(&id).map(|p| (id, p.rect)))
+            .collect()
+    }
+
     // ── Actions ───────────────────────────────────────────────────────────────
 
     pub fn dispatch(&mut self, action: TwmAction) {
@@ -444,6 +673,26 @@ impl TwmState {
                 }
             }
 
+            TwmAction::ToggleFloat => {
+                self.toggle_float();
+                return;
+            }
+
+            TwmAction::FloatMove(id, dx, dy) => {
+                self.float_move(id, dx, dy);
+                return;
+            }
+
+            TwmAction::FloatResize(id, dw, dh) => {
+                self.float_resize(id, dw, dh);
+                return;
+            }
+
+            TwmAction::ToggleScratchpad(name) => {
+                self.toggle_scratchpad(&name);
+                return;
+            }
+
             TwmAction::NextLayout => {
                 self.workspaces[self.active_ws].layout =
                     self.workspaces[self.active_ws].layout.next()
@@ -463,10 +712,24 @@ impl TwmState {
             }
 
             TwmAction::Workspace(n) => {
+                // Hide any visible scratchpads when switching workspaces.
+                for sp in &mut self.scratchpads {
+                    if sp.visible {
+                        if let Some(pid) = sp.pane_id {
+                            let ws = &mut self.workspaces[self.active_ws];
+                            ws.panes.retain(|&id| id != pid);
+                            if ws.focused == Some(pid) {
+                                ws.focused = ws.panes.last().copied();
+                            }
+                        }
+                        sp.visible = false;
+                    }
+                }
                 self.active_ws = (n as usize)
                     .saturating_sub(1)
                     .min(self.workspaces.len() - 1);
             }
+
             TwmAction::MoveToWorkspace(n) => {
                 let idx = (n as usize)
                     .saturating_sub(1)
@@ -553,11 +816,15 @@ impl TwmState {
             }
         }
 
-        // Fullscreen panes cover the full content area (ignoring padding).
+        // Fullscreen panes cover the entire screen.
         for &pid in &ws.panes {
             if let Some(p) = self.panes.get_mut(&pid) {
                 if p.fullscreen {
                     p.rect = Rect::new(0, 0, self.screen_w, self.screen_h);
+                }
+                // Floating panes keep their float_rect (set by toggle/drag).
+                if p.floating && !p.fullscreen {
+                    p.rect = p.float_rect;
                 }
             }
         }
@@ -630,7 +897,6 @@ impl TwmState {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Compute content and bar rects, then inset content by `padding` on all sides.
 fn compute_rects(sw: u32, sh: u32, bar_h: u32, bar_at_bottom: bool, padding: u32) -> (Rect, Rect) {
     let (content, bar) = if bar_h == 0 {
         (Rect::new(0, 0, sw, sh), Rect::new(0, 0, 0, 0))
@@ -650,7 +916,6 @@ fn compute_rects(sw: u32, sh: u32, bar_h: u32, bar_at_bottom: bool, padding: u32
         }
     };
 
-    // Inset the content area by padding on all four sides.
     let padded = if padding > 0 {
         content.inset(padding)
     } else {

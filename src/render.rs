@@ -1,4 +1,9 @@
 // render.rs — per-frame render logic.
+//
+// Changes vs original:
+//   - Applies workspace transition X offset (anim.ws_offsets()) to all windows.
+//   - Inserts a software cursor element when hardware cursor plane is unavailable.
+//   - Layout-morph animations are handled transparently via anim.get_rect().
 
 use std::time::Duration;
 
@@ -20,41 +25,81 @@ use smithay::{
     wayland::seat::WaylandFocus,
 };
 
+use trixui::pipelines::de::WindowInfo;
+use trixui::renderer::DrawCmd;
+
 use crate::{
-    state::{Trixie, TrixieElement},
+    state::{trixui_rect, Trixie, TrixieElement},
     twm::{PaneId, Rect as TwmRect},
 };
 
+macro_rules! rdebug {
+    ($($t:tt)*) => { tracing::debug!(target: "trixie_render", $($t)*) };
+}
+
 // ── Public entry ──────────────────────────────────────────────────────────────
 
-pub fn render(
-    state: &mut Trixie,
-    node: DrmNode,
-    crtc: crtc::Handle,
-    chrome_cmds: Vec<trixui::DrawCmd>,
-) -> bool {
+pub fn render(state: &mut Trixie, node: DrmNode, crtc: crtc::Handle) -> bool {
+    let focused_id = state.twm.workspaces[state.twm.active_ws].focused;
+
+    let pane_snapshots: Vec<(PaneId, String, bool)> = state
+        .twm
+        .panes
+        .values()
+        .filter(|p| !state.anim.is_closing(p.id))
+        .map(|p| (p.id, p.content.title().to_owned(), Some(p.id) == focused_id))
+        .collect();
+
+    rdebug!(
+        "render: {} panes in twm, {} in snapshot, {} in space",
+        state.twm.panes.len(),
+        pane_snapshots.len(),
+        state.space.elements().count(),
+    );
+
+    // Build the window list for the chrome pipeline.
+    let windows: Vec<WindowInfo> = pane_snapshots
+        .iter()
+        .map(|(id, title, focused)| {
+            let rect = resolve_pane_inner_rect(state, *id);
+            WindowInfo::new(trixui_rect(rect), title.as_str(), *focused).tag(*id as u64)
+        })
+        .collect();
+
+    if let Some(de) = &mut state.de {
+        de.set_windows(windows);
+    }
+
     sync_window_positions(state);
 
+    // Collect chrome commands before touching the backend (no GL calls yet).
+    let chrome_cmds: Vec<DrawCmd> = state.de.as_mut().map(|de| de.collect()).unwrap_or_default();
+
     let elements = build_elements(state, node);
+    rdebug!("render: {} elements built", elements.len());
 
     let backend = match state.backends.get_mut(&node) {
         Some(b) => b,
-        None => return false,
+        None => {
+            rdebug!("render: no backend for node");
+            return false;
+        }
     };
     let surface = match backend.surfaces.get_mut(&crtc) {
         Some(s) => s,
-        None => return false,
+        None => {
+            rdebug!("render: no surface for crtc");
+            return false;
+        }
     };
 
-    let clear = clear_color(&state.config.colors.pane_bg);
-    // NOTE: reset_buffers() must NOT be called here. Doing so every frame
-    // destroys DRM buffer-age tracking, forcing a full-screen recomposite on
-    // every vblank. When a new window is opening this creates a feedback loop:
-    // partial surface state → full recomposite → incomplete frame queued →
-    // vblank → repeat → visible seizure/flash.
-    // reset_buffers() belongs only in the VT-resume / device-reactivation path
-    // where the underlying framebuffer has actually been externally invalidated.
+    // Update hardware cursor position — inside the backend borrow so we only
+    // touch drm once.  move_cursor is a no-op when hw_cursor_ok is false.
+    let cx = state.cursor.pos.x as i32;
+    let cy = state.cursor.pos.y as i32;
+    state.cursor.move_cursor(&backend.drm, crtc, cx, cy);
 
+    let clear = clear_color(&state.config.colors.pane_bg);
     let flags = smithay::backend::drm::compositor::FrameFlags::empty();
 
     match surface.compositor.render_frame::<_, TrixieElement>(
@@ -64,20 +109,30 @@ pub fn render(
         flags,
     ) {
         Ok(frame) => {
-            // Always flush chrome — trixui repaints the bar every frame
-            // (clock updates, workspace state, etc.) and manages its own
-            // damage internally. Gating on frame.is_empty caused the bar
-            // to disappear when no client surfaces were producing damage.
-            if let Some(ui) = &mut state.ui {
-                ui.flush_collected(chrome_cmds);
+            rdebug!("render_frame ok: is_empty={}", frame.is_empty);
+
+            if !frame.is_empty {
+                if let Some(de) = &mut state.de {
+                    unsafe {
+                        gl::Enable(gl::BLEND);
+                        gl::BlendFuncSeparate(
+                            gl::ONE,
+                            gl::ONE_MINUS_SRC_ALPHA,
+                            gl::ONE,
+                            gl::ONE_MINUS_SRC_ALPHA,
+                        );
+                    }
+                    de.flush_collected(chrome_cmds);
+                }
             }
 
             match surface.compositor.queue_frame(()) {
                 Ok(()) => {
+                    rdebug!("queue_frame ok");
                     let output = surface.output.clone();
                     let time = state.clock.now();
-                    let windows: Vec<Window> = state.space.elements().cloned().collect();
-                    for window in &windows {
+                    let wins: Vec<Window> = state.space.elements().cloned().collect();
+                    for window in &wins {
                         if let Some(surf) = window.wl_surface() {
                             send_frames_surface_tree(
                                 surf.as_ref(),
@@ -88,9 +143,6 @@ pub fn render(
                             );
                         }
                     }
-
-                    // pending_frame is owned here — set it exactly once on
-                    // successful queue_frame. state.rs must NOT also set it.
                     surface.pending_frame = true;
                     true
                 }
@@ -107,9 +159,36 @@ pub fn render(
     }
 }
 
-// ── Window → pane resolution ──────────────────────────────────────────────────
+// ── Pane rect resolution ──────────────────────────────────────────────────────
 
-fn resolve_pane_inner_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
+fn resolve_pane_inner_rect(state: &Trixie, id: PaneId) -> smithay::utils::Rectangle<i32, Physical> {
+    let fullscreen = state
+        .twm
+        .panes
+        .get(&id)
+        .map(|p| p.fullscreen)
+        .unwrap_or(false);
+    let bw = state.config.border_width as i32;
+    let pane_rect = state.twm.panes.get(&id).map(|p| p.rect).unwrap_or_default();
+    let rect = state.anim.get_rect(id, pane_rect);
+
+    if fullscreen || bw == 0 {
+        smithay::utils::Rectangle::from_loc_and_size(
+            (rect.x as i32, rect.y as i32),
+            (rect.w.max(1) as i32, rect.h.max(1) as i32),
+        )
+    } else {
+        smithay::utils::Rectangle::from_loc_and_size(
+            (rect.x as i32 + bw, rect.y as i32 + bw),
+            (
+                (rect.w as i32 - bw * 2).max(1),
+                (rect.h as i32 - bw * 2).max(1),
+            ),
+        )
+    }
+}
+
+fn resolve_window_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
     let surf = window.wl_surface()?;
     let surf_id = surf.as_ref().id();
 
@@ -140,9 +219,6 @@ fn resolve_pane_inner_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
 
     let pane = state.twm.panes.get(&pane_id)?;
     let bw = state.twm.border_w;
-
-    // Route through the animation system — returns the interpolated rect
-    // while the pane is animating, or the real TWM rect when idle.
     let animated_rect = state.anim.get_rect(pane_id, pane.rect);
 
     let inner = if pane.fullscreen || bw == 0 {
@@ -157,10 +233,14 @@ fn resolve_pane_inner_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
 // ── Window position sync ──────────────────────────────────────────────────────
 
 fn sync_window_positions(state: &mut Trixie) {
+    // During layout morphs we still apply configure so clients resize to the
+    // new size while the animation plays — the visual position comes from
+    // the render element offset, not the Wayland surface location.
     let windows: Vec<Window> = state.space.elements().cloned().collect();
+    let morphing = state.anim.morphing_panes();
 
     for window in windows {
-        let Some(inner) = resolve_pane_inner_rect(state, &window) else {
+        let Some(inner) = resolve_window_rect(state, &window) else {
             continue;
         };
 
@@ -182,10 +262,18 @@ fn sync_window_positions(state: &mut Trixie) {
             continue;
         };
 
+        // During a morph, send configure to pre-size the client at the final size,
+        // but don't spam every frame — only send when size actually changes.
+        let surf_id = window.wl_surface().map(|s| s.as_ref().id());
+        let pane_id = surf_id
+            .as_ref()
+            .and_then(|id| state.surface_to_pane.get(id).copied());
+        let is_morphing = pane_id.map(|id| morphing.contains(&id)).unwrap_or(false);
+
         let already_pending = toplevel.with_pending_state(|s| s.size == Some(new_size));
         let already_committed = window.geometry().size == new_size;
 
-        if !already_pending && !already_committed {
+        if !already_pending && (!already_committed || is_morphing) {
             toplevel.with_pending_state(|s| s.size = Some(new_size));
             toplevel.send_configure();
         }
@@ -202,16 +290,28 @@ fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
 
     let scale = Scale::from(1.0_f64);
 
+    // Workspace transition X offset — slides the entire incoming workspace in.
+    let (incoming_x, _) = state.anim.ws_offsets();
+
     let win_locs: Vec<WinLoc> = state
         .space
         .elements()
         .filter_map(|w| {
-            let inner = resolve_pane_inner_rect(state, w)?;
+            let inner = resolve_window_rect(state, w)?;
+            let geom = w.geometry();
+            // Apply the workspace slide offset.
+            let base_x = inner.x as i32 - geom.loc.x + incoming_x;
             let loc = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
-                inner.x as i32,
-                inner.y as i32,
+                base_x,
+                inner.y as i32 - geom.loc.y,
             ))
             .to_physical_precise_round(scale);
+            rdebug!(
+                "window: geometry={:?} inner={:?} ws_offset={incoming_x} loc={:?}",
+                geom,
+                inner,
+                loc,
+            );
             Some(WinLoc {
                 window: w.clone(),
                 loc,
@@ -219,22 +319,12 @@ fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
         })
         .collect();
 
-    let backend = match state.backends.get_mut(&node) {
-        Some(b) => b,
-        None => return vec![],
-    };
+    rdebug!(
+        "build_elements: {} windows resolved from {} in space",
+        win_locs.len(),
+        state.space.elements().count(),
+    );
 
-    // Full-screen background element at the bottom of the stack.
-    //
-    // Without this, the DRM compositor only marks regions covered by Wayland
-    // surfaces or SolidColorRenderElements as damaged. The padding/gap areas
-    // between windows have no element covering them, so the compositor skips
-    // repainting them — leaving stale content from previous frames (e.g. a
-    // window title that persists after close). The clear colour only fills
-    // actually-damaged regions, not the entire framebuffer.
-    //
-    // A zero-alpha 1×1 element is not sufficient — it must cover the full
-    // output so every pixel is included in the damage region each frame.
     let out_w = state.twm.screen_w.max(1) as i32;
     let out_h = state.twm.screen_h.max(1) as i32;
 
@@ -250,102 +340,44 @@ fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
         smithay::backend::renderer::element::Kind::Unspecified,
     ));
 
-    let mut elements: Vec<TrixieElement> = win_locs
-        .iter()
-        .flat_map(|wl| {
-            wl.window
-                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                    &mut backend.renderer,
-                    wl.loc,
-                    scale,
-                    1.0,
-                )
-        })
-        .map(TrixieElement::Space)
-        .collect();
+    let backend = match state.backends.get_mut(&node) {
+        Some(b) => b,
+        None => return vec![],
+    };
 
-    elements.extend(border_elements(state, scale));
-    // Background goes last so it is below everything else in the element stack.
-    elements.push(bg_elem);
-    elements
-}
+    // Elements are drawn back-to-front: the LAST element in the vec is the
+    // bottom-most layer.  So we build: [cursor, ...windows..., background]
+    // which renders as: background → windows → cursor (cursor on top).
 
-// ── Border elements ───────────────────────────────────────────────────────────
+    let mut elements: Vec<TrixieElement> = Vec::new();
 
-fn border_elements(state: &Trixie, scale: Scale<f64>) -> Vec<TrixieElement> {
-    let border_w = state.twm.border_w;
-    if border_w == 0 {
-        return vec![];
+    // ── Cursor (top layer) ────────────────────────────────────────────────────
+    // Software cursor when hardware plane is unavailable.
+    if !state.cursor.hw_cursor_ok {
+        let sw_cursor = state.cursor.software_element(scale);
+        elements.push(TrixieElement::Cursor(sw_cursor));
     }
 
-    let ws = &state.twm.workspaces[state.twm.active_ws];
-    let focused_id = ws.focused;
-    let active_col = srgb(state.config.colors.active_border);
-    let inactive_col = srgb(state.config.colors.inactive_border);
+    // ── Windows (middle layer) ────────────────────────────────────────────────
+    elements.extend(
+        win_locs
+            .iter()
+            .flat_map(|wl| {
+                wl.window
+                    .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                        &mut backend.renderer,
+                        wl.loc,
+                        scale,
+                        1.0,
+                    )
+            })
+            .map(TrixieElement::Space),
+    );
 
-    ws.panes
-        .iter()
-        .filter_map(|&id| {
-            let pane = state.twm.panes.get(&id)?;
-            if pane.fullscreen {
-                return None;
-            }
-            // Don't render borders for panes playing a close animation — the
-            // Wayland surface is already destroyed so there's no window content
-            // to frame. Without this the border/title lingers on the clear color
-            // for the full 150 ms deferred-close window.
-            if state.anim.is_closing(id) {
-                return None;
-            }
-            // Use the animated rect for borders too so they slide with the window.
-            let rect = state.anim.get_rect(id, pane.rect);
-            let color = if Some(id) == focused_id {
-                active_col
-            } else {
-                inactive_col
-            };
-            Some(border_rects(rect, border_w, color, scale))
-        })
-        .flatten()
-        .collect()
-}
+    // ── Background (bottom layer) ─────────────────────────────────────────────
+    elements.push(bg_elem);
 
-fn border_rects(rect: TwmRect, bw: u32, color: [f32; 4], scale: Scale<f64>) -> Vec<TrixieElement> {
-    let strips: [(i32, i32, i32, i32); 4] = [
-        (rect.x as i32, rect.y as i32, rect.w as i32, bw as i32),
-        (
-            rect.x as i32,
-            (rect.y + rect.h - bw) as i32,
-            rect.w as i32,
-            bw as i32,
-        ),
-        (rect.x as i32, rect.y as i32, bw as i32, rect.h as i32),
-        (
-            (rect.x + rect.w - bw) as i32,
-            rect.y as i32,
-            bw as i32,
-            rect.h as i32,
-        ),
-    ];
-
-    strips
-        .into_iter()
-        .map(|(x, y, w, h)| {
-            let buf =
-                smithay::backend::renderer::element::solid::SolidColorBuffer::new((w, h), color);
-            let loc = smithay::utils::Point::<i32, Physical>::from((
-                (x as f64 * scale.x) as i32,
-                (y as f64 * scale.y) as i32,
-            ));
-            TrixieElement::Cursor(SolidColorRenderElement::from_buffer(
-                &buf,
-                loc,
-                scale,
-                1.0,
-                smithay::backend::renderer::element::Kind::Unspecified,
-            ))
-        })
-        .collect()
+    elements
 }
 
 // ── Colour helpers ────────────────────────────────────────────────────────────
@@ -355,15 +387,6 @@ fn clear_color(c: &crate::config::Color) -> [f32; 4] {
         c.r as f32 / 255.0,
         c.g as f32 / 255.0,
         c.b as f32 / 255.0,
-        1.0,
-    ]
-}
-
-fn srgb(c: crate::config::Color) -> [f32; 4] {
-    [
-        (c.r as f32 / 255.0).powf(2.2),
-        (c.g as f32 / 255.0).powf(2.2),
-        (c.b as f32 / 255.0).powf(2.2),
         1.0,
     ]
 }

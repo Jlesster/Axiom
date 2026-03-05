@@ -1,4 +1,8 @@
 // input.rs — raw libinput events → keybind dispatch → TWM actions.
+//
+// Changes vs original:
+//   - Workspace switch dispatches record direction for AnimSet::workspace_transition().
+//   - Pointer motion updates state.cursor.pos for hardware cursor tracking.
 
 use smithay::{
     backend::input::{
@@ -16,8 +20,8 @@ use smithay::{
 use crate::{
     config::{KeyAction, KeyCombo, Modifiers},
     session::switch_vt,
-    state::Trixie,
-    twm::TwmAction,
+    state::{DragState, Trixie},
+    twm::{anim::WsDir, TwmAction},
 };
 
 // ── Main dispatcher ────────────────────────────────────────────────────────────
@@ -139,9 +143,61 @@ fn dispatch_action(state: &mut Trixie, action: KeyAction) {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         KeyAction::Reload => state.apply_config_reload(),
+
+        // Workspace switches — record direction for slide animation.
+        KeyAction::Workspace(n) => {
+            let old = state.twm.active_ws;
+            state.twm.dispatch(TwmAction::Workspace(n));
+            let new = state.twm.active_ws;
+            if new != old {
+                let dir = if new > old { WsDir::Right } else { WsDir::Left };
+                state.anim.workspace_transition(dir);
+            }
+            state.sync_focus();
+        }
+        KeyAction::NextWorkspace => {
+            let old = state.twm.active_ws;
+            state.twm.dispatch(TwmAction::NextWorkspace);
+            let new = state.twm.active_ws;
+            if new != old {
+                state.anim.workspace_transition(WsDir::Right);
+            }
+            state.sync_focus();
+        }
+        KeyAction::PrevWorkspace => {
+            let old = state.twm.active_ws;
+            state.twm.dispatch(TwmAction::PrevWorkspace);
+            let new = state.twm.active_ws;
+            if new != old {
+                state.anim.workspace_transition(WsDir::Left);
+            }
+            state.sync_focus();
+        }
+
         other => {
             if let Some(a) = key_to_twm(other) {
+                // For layout changes, snapshot rects before and diff after.
+                let is_layout_change = matches!(
+                    &a,
+                    TwmAction::NextLayout
+                        | TwmAction::PrevLayout
+                        | TwmAction::GrowMain
+                        | TwmAction::ShrinkMain
+                        | TwmAction::ToggleFloat
+                );
+                let old_rects = if is_layout_change {
+                    state.twm.pane_rects_snapshot()
+                } else {
+                    vec![]
+                };
+
                 state.twm.dispatch(a);
+
+                if is_layout_change && !old_rects.is_empty() {
+                    let new_rects = state.twm.pane_rects_snapshot();
+                    crate::twm::anim::diff_and_morph(&mut state.anim, &old_rects, &new_rects);
+                }
+
                 state.sync_focus();
             }
         }
@@ -161,34 +217,31 @@ fn key_to_twm(action: KeyAction) -> Option<TwmAction> {
         MoveDown => TwmAction::MoveDown,
         Close => TwmAction::Close,
         Fullscreen => TwmAction::Fullscreen,
+        ToggleFloat => TwmAction::ToggleFloat,
         NextLayout => TwmAction::NextLayout,
         PrevLayout => TwmAction::PrevLayout,
         GrowMain => TwmAction::GrowMain,
         ShrinkMain => TwmAction::ShrinkMain,
-        Workspace(n) => TwmAction::Workspace(n),
         MoveToWorkspace(n) => TwmAction::MoveToWorkspace(n),
-        NextWorkspace => TwmAction::NextWorkspace,
-        PrevWorkspace => TwmAction::PrevWorkspace,
         ToggleBar => TwmAction::ToggleBar,
+        ToggleScratchpad(name) => TwmAction::ToggleScratchpad(name),
         _ => return None,
     })
 }
 
 // ── Pointer hit testing ───────────────────────────────────────────────────────
 
-fn window_under(
+fn pane_at(
     state: &Trixie,
     loc: smithay::utils::Point<f64, smithay::utils::Logical>,
-) -> Option<(
-    WlSurface,
-    smithay::utils::Point<f64, smithay::utils::Logical>,
-)> {
+) -> Option<crate::twm::PaneId> {
     let px = loc.x as u32;
     let py = loc.y as u32;
     let bw = state.twm.border_w;
     let ws = &state.twm.workspaces[state.twm.active_ws];
 
-    let pane_id = ws.panes.iter().rev().find_map(|&id| {
+    // Floating panes checked first (they sit on top of tiled).
+    ws.panes.iter().rev().find_map(|&id| {
         let pane = state.twm.panes.get(&id)?;
         let inner = if pane.fullscreen || bw == 0 {
             pane.rect
@@ -200,7 +253,17 @@ fn window_under(
         } else {
             None
         }
-    })?;
+    })
+}
+
+fn window_under(
+    state: &Trixie,
+    loc: smithay::utils::Point<f64, smithay::utils::Logical>,
+) -> Option<(
+    WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
+    let pane_id = pane_at(state, loc)?;
 
     let window = state.space.elements().find(|w| {
         w.wl_surface()
@@ -209,6 +272,7 @@ fn window_under(
     })?;
 
     let pane = state.twm.panes.get(&pane_id)?;
+    let bw = state.twm.border_w;
     let inner = if pane.fullscreen || bw == 0 {
         pane.rect
     } else {
@@ -246,8 +310,47 @@ where
             .min(state.twm.screen_h as f64),
     ));
 
-    let under = window_under(state, new_loc);
+    // Update cursor manager position for hardware cursor plane.
+    state.cursor.pos = new_loc;
 
+    // Handle active drag.
+    let dx = delta.x as i32;
+    let dy = delta.y as i32;
+    match state.drag.clone() {
+        DragState::Moving(pane_id) => {
+            state.twm.dispatch(TwmAction::FloatMove(pane_id, dx, dy));
+            state.needs_redraw = true;
+            ptr.motion(
+                state,
+                None,
+                &smithay::input::pointer::MotionEvent {
+                    location: new_loc,
+                    serial,
+                    time: event.time_msec(),
+                },
+            );
+            ptr.frame(state);
+            return;
+        }
+        DragState::Resizing(pane_id) => {
+            state.twm.dispatch(TwmAction::FloatResize(pane_id, dx, dy));
+            state.needs_redraw = true;
+            ptr.motion(
+                state,
+                None,
+                &smithay::input::pointer::MotionEvent {
+                    location: new_loc,
+                    serial,
+                    time: event.time_msec(),
+                },
+            );
+            ptr.frame(state);
+            return;
+        }
+        DragState::None => {}
+    }
+
+    let under = window_under(state, new_loc);
     ptr.motion(
         state,
         under,
@@ -257,9 +360,6 @@ where
             time: event.time_msec(),
         },
     );
-    // wl_pointer.frame must be sent after every group of pointer events.
-    // Without this clients buffer the enter/motion events indefinitely and
-    // never process them — this was preventing windows from receiving input.
     ptr.frame(state);
 }
 
@@ -272,6 +372,9 @@ where
         event.x_transformed(state.twm.screen_w as i32),
         event.y_transformed(state.twm.screen_h as i32),
     ));
+
+    // Update cursor manager position.
+    state.cursor.pos = new_loc;
 
     let Some(ptr) = state.seat.get_pointer() else {
         return;
@@ -287,7 +390,6 @@ where
             time: event.time_msec(),
         },
     );
-    // Same as above — frame event required to flush the event group.
     ptr.frame(state);
 }
 
@@ -302,35 +404,72 @@ where
         return;
     };
     let button_state = event.state();
+    let button = event.button_code();
+
+    const BTN_LEFT: u32 = 272;
+    const BTN_RIGHT: u32 = 273;
+
+    if button_state == ButtonState::Released {
+        if !matches!(state.drag, crate::state::DragState::None) {
+            state.drag = crate::state::DragState::None;
+            tracing::debug!("drag ended");
+        }
+    }
 
     if button_state == ButtonState::Pressed {
         let loc = ptr.current_location();
-        let px = loc.x as u32;
-        let py = loc.y as u32;
-        let bw = state.twm.border_w;
-        let ws_idx = state.twm.active_ws;
+        let mods = state
+            .seat
+            .get_keyboard()
+            .map(|k| k.modifier_state())
+            .unwrap_or_default();
+        let super_held = mods.logo;
 
-        let clicked_pane = state.twm.workspaces[ws_idx]
-            .panes
-            .iter()
-            .rev()
-            .find_map(|&id| {
-                let pane = state.twm.panes.get(&id)?;
-                let inner = if pane.fullscreen || bw == 0 {
-                    pane.rect
-                } else {
-                    pane.rect.inset(bw)
-                };
-                if inner.contains(px, py) {
-                    Some(id)
-                } else {
-                    None
-                }
-            });
+        let clicked_pane = pane_at(state, loc);
 
         if let Some(pane_id) = clicked_pane {
             state.twm.set_focused(pane_id);
 
+            let is_floating = state
+                .twm
+                .panes
+                .get(&pane_id)
+                .map(|p| p.floating)
+                .unwrap_or(false);
+
+            if super_held && button == BTN_LEFT && is_floating {
+                state.drag = crate::state::DragState::Moving(pane_id);
+                tracing::debug!("drag move start: pane={pane_id}");
+                ptr.button(
+                    state,
+                    &smithay::input::pointer::ButtonEvent {
+                        button,
+                        state: button_state,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                ptr.frame(state);
+                return;
+            }
+
+            if super_held && button == BTN_RIGHT && is_floating {
+                state.drag = crate::state::DragState::Resizing(pane_id);
+                tracing::debug!("drag resize start: pane={pane_id}");
+                ptr.button(
+                    state,
+                    &smithay::input::pointer::ButtonEvent {
+                        button,
+                        state: button_state,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                ptr.frame(state);
+                return;
+            }
+
+            // Normal click — focus the surface.
             let surf = state.surface_to_pane.iter().find_map(|(oid, &pid)| {
                 if pid != pane_id {
                     return None;
@@ -356,12 +495,11 @@ where
     ptr.button(
         state,
         &smithay::input::pointer::ButtonEvent {
-            button: event.button_code(),
+            button,
             state: button_state,
             serial,
             time: event.time_msec(),
         },
     );
-    // Frame event required after button events too.
     ptr.frame(state);
 }

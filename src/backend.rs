@@ -27,8 +27,10 @@ use smithay::{
     utils::{DeviceFd, Size, Transform},
 };
 
+use trixui::pipelines::de::{DeConfig, DePipeline};
+
 use crate::{
-    chrome::ChromeApp,
+    chrome::TrixieDE,
     config::BarPosition,
     state::{BackendData, SurfaceData, Trixie},
 };
@@ -58,7 +60,8 @@ pub fn add_gpu(
         unsafe { smithay::backend::egl::ffi::egl::GetProcAddress(sym.as_ptr()) as *const _ }
     });
 
-    if state.ui.is_none() {
+    // Initialise the chrome pipeline once, with the EGL context current.
+    if state.de.is_none() {
         if let Err(e) = unsafe { renderer.egl_context().make_current() } {
             tracing::warn!("make_current for trixui init: {e}");
         } else {
@@ -66,16 +69,17 @@ pub fn add_gpu(
         }
     }
 
-    // VBlank events are the sole render driver. Each vblank calls frame_finish,
-    // which clears pending_frame and schedules the next render via insert_idle.
     state
         .handle
-        .insert_source(drm_notifier, move |event, _, state| {
-            if let DrmEvent::VBlank(crtc) = event {
+        .insert_source(drm_notifier, move |event, _, state| match event {
+            DrmEvent::VBlank(crtc) => {
+                tracing::debug!("vblank: node={node:?} crtc={crtc:?}");
                 state.frame_finish(node, crtc);
             }
-        })
-        .unwrap();
+            DrmEvent::Error(e) => {
+                tracing::error!("DRM error on node={node:?}: {e}");
+            }
+        })?;
 
     let mut backend = BackendData {
         surfaces: Default::default(),
@@ -96,7 +100,6 @@ pub fn add_gpu(
     for conn in connectors {
         let conn_name = format!("{}-{}", conn.interface().as_str(), conn.interface_id());
 
-        // Look up this connector in the config.
         let mon_cfg = state
             .config
             .monitors
@@ -105,7 +108,6 @@ pub fn add_gpu(
             .cloned();
 
         let mode = if let Some(ref mc) = mon_cfg {
-            // 1. Exact match: resolution + refresh.
             conn.modes()
                 .iter()
                 .find(|m| {
@@ -114,7 +116,6 @@ pub fn add_gpu(
                         && mh as u32 == mc.height
                         && m.vrefresh() as u32 == mc.refresh
                 })
-                // 2. Resolution match, any refresh — pick highest refresh.
                 .or_else(|| {
                     conn.modes()
                         .iter()
@@ -124,19 +125,16 @@ pub fn add_gpu(
                         })
                         .max_by_key(|m| m.vrefresh())
                 })
-                // 3. Kernel preferred.
                 .or_else(|| {
                     conn.modes()
                         .iter()
                         .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
                 })
-                // 4. Whatever is first.
                 .or_else(|| conn.modes().first())
                 .copied()
         } else {
             tracing::warn!(
-                "No monitor config found for connector '{conn_name}' — using kernel preferred mode. \
-                 Add a `monitor {conn_name} {{ }}` block to monitors.conf to configure it."
+                "No monitor config found for connector '{conn_name}' — using kernel preferred mode."
             );
             conn.modes()
                 .iter()
@@ -151,15 +149,10 @@ pub fn add_gpu(
         };
 
         tracing::info!(
-            "Connector '{conn_name}': selected mode {}x{}@{}Hz{}",
+            "Connector '{conn_name}': selected mode {}x{}@{}Hz",
             mode.size().0,
             mode.size().1,
             mode.vrefresh(),
-            if mon_cfg.is_some() {
-                " (from config)"
-            } else {
-                " (kernel preferred)"
-            },
         );
 
         let crtc = res
@@ -186,41 +179,41 @@ pub fn add_gpu(
 fn init_chrome(state: &mut Trixie) {
     tracing::info!("init_chrome: loading font {:?}", state.config.font_path);
 
-    let font_bytes: &'static [u8] = match std::fs::read(&state.config.font_path) {
-        Ok(b) => Box::leak(b.into_boxed_slice()),
+    let font_bytes: Option<Vec<u8>> = match std::fs::read(&state.config.font_path) {
+        Ok(b) => Some(b),
         Err(e) => {
-            tracing::warn!("Could not load font: {e} — using embedded fallback font");
-            // Fall through with no font_bytes — SmithayApp uses its own
-            // embedded Iosevka when constructed via the builder with no
-            // explicit .font() call.
-            &[]
+            tracing::warn!("Could not load font: {e} — using embedded fallback");
+            None
         }
     };
 
-    let chrome_app = ChromeApp::new(std::sync::Arc::clone(&state.config));
+    let chrome_app = TrixieDE::new(std::sync::Arc::clone(&state.config));
 
-    // SmithayApp::new(app, vp_w, vp_h) — viewport is 0×0 here;
-    // add_output calls ui.resize(pw, ph) with the real DRM dimensions
-    // immediately after, before any rendering occurs.
-    let result = if font_bytes.is_empty() {
-        // No font on disk — use the embedded fallback.
-        trixui::smithay::SmithayApp::new(chrome_app, 0, 0)
-    } else {
-        trixui::smithay::SmithayApp::builder(chrome_app)
-            .viewport(0, 0)
-            .font(font_bytes, state.config.font_size)
-            .build()
+    let mut cfg = DeConfig {
+        font_size_px: state.config.font_size,
+        bar_height_px: state.config.bar.height,
+        vp_w: 0,
+        vp_h: 0,
+        ..DeConfig::default()
     };
 
-    match result {
-        Ok(ui) => {
-            state.ui = Some(ui);
-            tracing::info!("Chrome init OK");
+    if let Some(bytes) = font_bytes {
+        cfg.font_data = std::sync::Arc::from(bytes.into_boxed_slice());
+    }
+
+    match DePipeline::new(chrome_app, cfg) {
+        Ok(de) => {
+            state.de = Some(de);
+            tracing::info!("Chrome (DePipeline) init OK");
         }
         Err(e) => {
-            tracing::warn!("SmithayApp init failed: {e}");
+            tracing::warn!("DePipeline init failed: {e}");
         }
     }
+
+    // Load the cursor theme now that the GL/EGL context is current and the
+    // XCursor search paths are accessible.
+    state.cursor.load_theme();
 }
 
 // ── add_output ────────────────────────────────────────────────────────────────
@@ -265,12 +258,11 @@ pub fn add_output(
     let config_bar_h = state.config.bar.height;
     let at_bottom = state.config.bar.position == BarPosition::Bottom;
 
-    let actual_bar_h = if let Some(ui) = &mut state.ui {
-        ui.resize(pw, ph);
-        ui.set_bar_height_px(config_bar_h);
+    let actual_bar_h = if let Some(de) = &mut state.de {
+        de.resize(pw, ph);
+        de.set_bar_height_px(config_bar_h);
 
-        // Mirror trixui's own rounding: ceil(bar_h_px / cell_h) * cell_h
-        let cell_h = ui.line_h();
+        let cell_h = de.line_h();
         let rounded = if cell_h == 0 {
             config_bar_h
         } else {
@@ -285,7 +277,6 @@ pub fn add_output(
         config_bar_h
     };
 
-    // TWM gets the rounded value so its content_rect matches trixui exactly.
     state.twm.resize(pw, ph);
     state.anim.resize(pw, ph);
     state.twm.set_bar_height(actual_bar_h, at_bottom);
@@ -320,16 +311,34 @@ pub fn add_output(
         SurfaceData {
             output: output.clone(),
             compositor,
-            // next_frame_time is no longer used as a gate — pending_frame is
-            // the sole guard. Set to now so the first render fires immediately.
             next_frame_time: Instant::now(),
             pending_frame: false,
             frame_duration,
         },
     );
 
-    // Kick the first render. After that, vblank → frame_finish → insert_idle
-    // forms the self-sustaining render loop with no repeating timer needed.
+    // Upload the hardware cursor bitmap to the DRM cursor plane for this output.
+    // Done via insert_idle so the backend HashMap borrow has been released.
+    {
+        let node_copy = node;
+        let crtc_copy = crtc;
+        state.handle.insert_idle(move |s| {
+            // Reborrow both the cursor and the backend separately.
+            if let Some(b) = s.backends.get_mut(&node_copy) {
+                let ok = s.cursor.upload_to_drm(&b.drm, crtc_copy, &b.gbm);
+                if ok {
+                    tracing::info!(
+                        "Hardware cursor active on {node_copy:?}/{crtc_copy:?}"
+                    );
+                } else {
+                    tracing::info!(
+                        "Hardware cursor unavailable on {node_copy:?}/{crtc_copy:?} — using software fallback"
+                    );
+                }
+            }
+        });
+    }
+
     state
         .handle
         .insert_idle(move |s| s.render_surface(node, crtc));

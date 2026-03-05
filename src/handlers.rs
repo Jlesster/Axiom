@@ -119,6 +119,15 @@ impl CompositorHandler for Trixie {
                 tracing::info!("commit: claiming unclaimed surface app_id={app_id:?}");
                 self.unclaimed.remove(&obj_id);
                 let pane_id = self.twm.open_shell(&app_id);
+                tracing::info!(
+                    "commit unclaimed: open_shell id={pane_id} panes={}",
+                    self.twm.panes.len()
+                );
+                self.surface_to_pane.insert(obj_id.clone(), pane_id);
+                tracing::info!(
+                    "commit unclaimed: surface_to_pane now has {} entries",
+                    self.surface_to_pane.len()
+                );
                 self.surface_to_pane.insert(obj_id.clone(), pane_id);
 
                 // Kick open animation for the newly claimed pane.
@@ -304,6 +313,10 @@ impl XdgShellHandler for Trixie {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        tracing::info!(
+            "new_toplevel: after open_shell twm.panes.len()={}",
+            self.twm.panes.len()
+        );
         let surf_id = surface.wl_surface().id();
 
         let app_id = with_states(surface.wl_surface(), |states| {
@@ -416,6 +429,8 @@ impl XdgShellHandler for Trixie {
         self.unclaimed.remove(&surf_id);
 
         if let Some(pane_id) = self.surface_to_pane.remove(&surf_id) {
+            tracing::info!("toplevel_destroyed: surf={surf_id:?} -> pane={pane_id}");
+
             // Play close animation then defer actual close by 150 ms.
             if let Some(pane) = self.twm.panes.get(&pane_id) {
                 self.anim.close(pane_id, pane.rect);
@@ -435,6 +450,10 @@ impl XdgShellHandler for Trixie {
                 )
                 .ok();
         } else {
+            // No surface_to_pane entry. This can happen for unclaimed surfaces
+            // that never got an app_id. Only close panes by app_id if no live
+            // surface_to_pane entry maps to a pane with that app_id — otherwise
+            // we would nuke panes that are still displayed.
             let app_id = with_states(surface.wl_surface(), |states| {
                 states
                     .data_map
@@ -443,8 +462,29 @@ impl XdgShellHandler for Trixie {
                     .and_then(|l| l.app_id.clone())
             })
             .unwrap_or_default();
+
+            tracing::info!(
+                "toplevel_destroyed: surf={surf_id:?} has no pane mapping, app_id={app_id:?}"
+            );
+
             if !app_id.is_empty() {
-                self.twm.close_by_app_id(&app_id);
+                // Collect pane IDs for this app_id that are NOT referenced by
+                // any live surface_to_pane entry (i.e. truly orphaned panes).
+                let live_pane_ids: std::collections::HashSet<_> =
+                    self.surface_to_pane.values().copied().collect();
+
+                let orphaned: Vec<_> = self
+                    .twm
+                    .panes
+                    .values()
+                    .filter(|p| p.content.app_id() == app_id && !live_pane_ids.contains(&p.id))
+                    .map(|p| p.id)
+                    .collect();
+
+                for pane_id in orphaned {
+                    tracing::info!("toplevel_destroyed: closing orphaned pane {pane_id}");
+                    self.twm.close_pane(pane_id);
+                }
             }
         }
 
