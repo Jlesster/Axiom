@@ -47,6 +47,14 @@ pub fn render(
     };
 
     let clear = clear_color(&state.config.colors.pane_bg);
+    // NOTE: reset_buffers() must NOT be called here. Doing so every frame
+    // destroys DRM buffer-age tracking, forcing a full-screen recomposite on
+    // every vblank. When a new window is opening this creates a feedback loop:
+    // partial surface state → full recomposite → incomplete frame queued →
+    // vblank → repeat → visible seizure/flash.
+    // reset_buffers() belongs only in the VT-resume / device-reactivation path
+    // where the underlying framebuffer has actually been externally invalidated.
+
     let flags = smithay::backend::drm::compositor::FrameFlags::empty();
 
     match surface.compositor.render_frame::<_, TrixieElement>(
@@ -56,10 +64,12 @@ pub fn render(
         flags,
     ) {
         Ok(frame) => {
-            if !frame.is_empty || !chrome_cmds.is_empty() {
-                if let Some(ui) = &mut state.ui {
-                    ui.flush_collected(chrome_cmds);
-                }
+            // Always flush chrome — trixui repaints the bar every frame
+            // (clock updates, workspace state, etc.) and manages its own
+            // damage internally. Gating on frame.is_empty caused the bar
+            // to disappear when no client surfaces were producing damage.
+            if let Some(ui) = &mut state.ui {
+                ui.flush_collected(chrome_cmds);
             }
 
             match surface.compositor.queue_frame(()) {
@@ -79,6 +89,8 @@ pub fn render(
                         }
                     }
 
+                    // pending_frame is owned here — set it exactly once on
+                    // successful queue_frame. state.rs must NOT also set it.
                     surface.pending_frame = true;
                     true
                 }
@@ -128,10 +140,15 @@ fn resolve_pane_inner_rect(state: &Trixie, window: &Window) -> Option<TwmRect> {
 
     let pane = state.twm.panes.get(&pane_id)?;
     let bw = state.twm.border_w;
+
+    // Route through the animation system — returns the interpolated rect
+    // while the pane is animating, or the real TWM rect when idle.
+    let animated_rect = state.anim.get_rect(pane_id, pane.rect);
+
     let inner = if pane.fullscreen || bw == 0 {
-        pane.rect
+        animated_rect
     } else {
-        pane.rect.inset(bw)
+        animated_rect.inset(bw)
     };
 
     Some(inner)
@@ -207,6 +224,32 @@ fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
         None => return vec![],
     };
 
+    // Full-screen background element at the bottom of the stack.
+    //
+    // Without this, the DRM compositor only marks regions covered by Wayland
+    // surfaces or SolidColorRenderElements as damaged. The padding/gap areas
+    // between windows have no element covering them, so the compositor skips
+    // repainting them — leaving stale content from previous frames (e.g. a
+    // window title that persists after close). The clear colour only fills
+    // actually-damaged regions, not the entire framebuffer.
+    //
+    // A zero-alpha 1×1 element is not sufficient — it must cover the full
+    // output so every pixel is included in the damage region each frame.
+    let out_w = state.twm.screen_w.max(1) as i32;
+    let out_h = state.twm.screen_h.max(1) as i32;
+
+    let bg_buf = smithay::backend::renderer::element::solid::SolidColorBuffer::new(
+        (out_w, out_h),
+        clear_color(&state.config.colors.pane_bg),
+    );
+    let bg_elem = TrixieElement::Cursor(SolidColorRenderElement::from_buffer(
+        &bg_buf,
+        smithay::utils::Point::<i32, Physical>::from((0, 0)),
+        scale,
+        1.0,
+        smithay::backend::renderer::element::Kind::Unspecified,
+    ));
+
     let mut elements: Vec<TrixieElement> = win_locs
         .iter()
         .flat_map(|wl| {
@@ -222,15 +265,12 @@ fn build_elements(state: &mut Trixie, node: DrmNode) -> Vec<TrixieElement> {
         .collect();
 
     elements.extend(border_elements(state, scale));
+    // Background goes last so it is below everything else in the element stack.
+    elements.push(bg_elem);
     elements
 }
 
 // ── Border elements ───────────────────────────────────────────────────────────
-//
-// Draws colored border strips as DRM SolidColorRenderElements.
-// Colors come from config.colors.active_border / inactive_border.
-// trixui's draw_pane() draws the title notch on top of these strips.
-// If border_width = 0 in config, both are skipped.
 
 fn border_elements(state: &Trixie, scale: Scale<f64>) -> Vec<TrixieElement> {
     let border_w = state.twm.border_w;
@@ -250,12 +290,21 @@ fn border_elements(state: &Trixie, scale: Scale<f64>) -> Vec<TrixieElement> {
             if pane.fullscreen {
                 return None;
             }
+            // Don't render borders for panes playing a close animation — the
+            // Wayland surface is already destroyed so there's no window content
+            // to frame. Without this the border/title lingers on the clear color
+            // for the full 150 ms deferred-close window.
+            if state.anim.is_closing(id) {
+                return None;
+            }
+            // Use the animated rect for borders too so they slide with the window.
+            let rect = state.anim.get_rect(id, pane.rect);
             let color = if Some(id) == focused_id {
                 active_col
             } else {
                 inactive_col
             };
-            Some(border_rects(pane.rect, border_w, color, scale))
+            Some(border_rects(rect, border_w, color, scale))
         })
         .flatten()
         .collect()
@@ -310,8 +359,6 @@ fn clear_color(c: &crate::config::Color) -> [f32; 4] {
     ]
 }
 
-/// Linear sRGB for DRM compositor color elements.
-/// DRM/GPU expects linear light values, not gamma-encoded.
 fn srgb(c: crate::config::Color) -> [f32; 4] {
     [
         (c.r as f32 / 255.0).powf(2.2),

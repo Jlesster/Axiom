@@ -1,6 +1,8 @@
 // twm/mod.rs — Trixie Window Manager state. Pure pixel coordinates throughout.
 
+pub mod anim;
 pub mod layout;
+pub use anim::AnimSet;
 pub use layout::Layout;
 
 use std::collections::HashMap;

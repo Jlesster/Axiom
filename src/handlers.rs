@@ -100,6 +100,9 @@ impl CompositorHandler for Trixie {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
+        // Every client commit means new pixel content — always request a redraw.
+        self.needs_redraw = true;
+
         // Claim surfaces that arrived without app_id at new_toplevel time.
         let obj_id = surface.id();
         if self.unclaimed.contains_key(&obj_id) {
@@ -117,6 +120,11 @@ impl CompositorHandler for Trixie {
                 self.unclaimed.remove(&obj_id);
                 let pane_id = self.twm.open_shell(&app_id);
                 self.surface_to_pane.insert(obj_id.clone(), pane_id);
+
+                // Kick open animation for the newly claimed pane.
+                if let Some(pane) = self.twm.panes.get(&pane_id) {
+                    self.anim.open(pane_id, pane.rect);
+                }
 
                 if let Some(pane) = self.twm.panes.get(&pane_id) {
                     let bw = self.twm.border_w;
@@ -139,8 +147,6 @@ impl CompositorHandler for Trixie {
                         .cloned();
 
                     if let Some(window) = window {
-                        // activate=true so the window gets wl_surface.enter and
-                        // knows it is the focused output surface.
                         self.space.map_element(window.clone(), loc, true);
 
                         if let Some(toplevel) = window.toplevel() {
@@ -152,10 +158,6 @@ impl CompositorHandler for Trixie {
                             }
                         }
 
-                        // Set keyboard focus now that the surface is properly
-                        // mapped and has a valid pane rect. Doing this here
-                        // (post-configure) rather than in new_toplevel avoids
-                        // focusing a surface that hasn't ack'd its configure yet.
                         if let Some(surf) = window.wl_surface().map(|s| s.into_owned()) {
                             let serial = SCOUNTER.next_serial();
                             if let Some(kbd) = self.seat.get_keyboard() {
@@ -164,8 +166,6 @@ impl CompositorHandler for Trixie {
                         }
                     }
                 }
-                // sync_focus handles the general case; explicit focus above
-                // covers the unclaimed path specifically.
                 self.sync_focus();
             }
         }
@@ -234,8 +234,11 @@ impl SeatHandler for Trixie {
         set_data_device_focus(dh, seat, focus.clone());
         set_primary_focus(dh, seat, focus);
     }
+
     fn cursor_image(&mut self, _: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
+        // Cursor shape changed — need to repaint.
+        self.needs_redraw = true;
     }
 }
 delegate_seat!(Trixie);
@@ -263,6 +266,7 @@ impl WlrLayerShellHandler for Trixie {
             map.map_layer(&smithay::desktop::LayerSurface::new(surface, namespace))
                 .ok();
         }
+        self.needs_redraw = true;
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
@@ -287,6 +291,7 @@ impl WlrLayerShellHandler for Trixie {
                 map.unmap_layer(&l);
             }
         }
+        self.needs_redraw = true;
     }
 }
 delegate_layer_shell!(Trixie);
@@ -329,8 +334,6 @@ impl XdgShellHandler for Trixie {
             }
         }
 
-        // Register with TWM first so reflow() produces a valid rect before
-        // we send the initial configure with the correct size.
         let pane_id = if !app_id.is_empty() {
             let id = self.twm.open_shell(&app_id);
             self.surface_to_pane.insert(surf_id.clone(), id);
@@ -339,16 +342,17 @@ impl XdgShellHandler for Trixie {
                     pane.floating = true;
                 }
             }
+            // Kick open animation immediately for panes with known rects.
+            if let Some(pane) = self.twm.panes.get(&id) {
+                self.anim.open(id, pane.rect);
+            }
             Some(id)
         } else {
-            // app_id not yet available — park in unclaimed. commit() will
-            // finish the registration once app_id arrives.
             tracing::info!("new_toplevel: app_id empty, parking as unclaimed");
             self.unclaimed.insert(surf_id, surface.clone());
             None
         };
 
-        // Compute the configure size: forced_size > TWM pane rect > output size.
         let configure_size = forced_size
             .map(|(w, h)| smithay::utils::Size::from((w as i32, h as i32)))
             .or_else(|| {
@@ -392,14 +396,8 @@ impl XdgShellHandler for Trixie {
             })
             .unwrap_or((0, 0));
 
-        // activate=true so Smithay marks this window as the active element.
-        // This is needed for wl_surface.enter to fire and for the space's
-        // own focus tracking to stay consistent with ours.
         self.space.map_element(window.clone(), loc, true);
 
-        // Only set keyboard focus for surfaces that already have a known
-        // pane. Unclaimed surfaces are focused in commit() after their
-        // app_id arrives and configure has been sent.
         if pane_id.is_some() {
             if let Some(surf) = window.wl_surface().map(|s| s.into_owned()) {
                 let serial = SCOUNTER.next_serial();
@@ -408,6 +406,8 @@ impl XdgShellHandler for Trixie {
                 }
             }
         }
+
+        self.needs_redraw = true;
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -416,7 +416,24 @@ impl XdgShellHandler for Trixie {
         self.unclaimed.remove(&surf_id);
 
         if let Some(pane_id) = self.surface_to_pane.remove(&surf_id) {
-            self.twm.close_pane(pane_id);
+            // Play close animation then defer actual close by 150 ms.
+            if let Some(pane) = self.twm.panes.get(&pane_id) {
+                self.anim.close(pane_id, pane.rect);
+            }
+
+            let handle = self.handle.clone();
+            handle
+                .insert_source(
+                    smithay::reexports::calloop::timer::Timer::from_duration(
+                        std::time::Duration::from_millis(150),
+                    ),
+                    move |_, _, state: &mut Trixie| {
+                        state.twm.close_pane(pane_id);
+                        state.needs_redraw = true;
+                        smithay::reexports::calloop::timer::TimeoutAction::Drop
+                    },
+                )
+                .ok();
         } else {
             let app_id = with_states(surface.wl_surface(), |states| {
                 states
@@ -443,6 +460,8 @@ impl XdgShellHandler for Trixie {
                 kbd.set_focus(self, Some(next), serial);
             }
         }
+
+        self.needs_redraw = true;
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _: PositionerState) {

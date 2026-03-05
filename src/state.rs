@@ -14,7 +14,6 @@ use smithay::{
             DrmDeviceFd, DrmNode,
         },
         renderer::{
-            damage::OutputDamageTracker,
             element::{
                 solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
                 AsRenderElements,
@@ -60,7 +59,7 @@ use trixui::smithay::SmithayApp;
 use crate::{
     chrome::{ChromeApp, ChromeMsg},
     config::Config,
-    twm::{PaneId, TwmState},
+    twm::{anim::AnimSet, PaneId, TwmState},
 };
 
 // ── Type alias ────────────────────────────────────────────────────────────────
@@ -81,9 +80,7 @@ smithay::backend::renderer::element::render_elements! {
 pub struct SurfaceData {
     pub output: Output,
     pub compositor: GbmDrmCompositor,
-    pub damage_tracker: OutputDamageTracker,
-    /// Retained for informational use; no longer used as a render gate.
-    /// The render loop is driven purely by vblank via pending_frame.
+    /// Retained for informational use only.
     pub next_frame_time: Instant,
     /// True from the moment a frame is queued until vblank fires.
     /// render_surface will not submit a new frame while this is set,
@@ -147,10 +144,6 @@ pub struct Trixie {
     pub space: Space<Window>,
 
     /// Maps a Wayland surface ObjectId → TWM PaneId.
-    /// Inserted in `handlers.rs` when a toplevel is mapped to a pane.
-    /// Removed in `toplevel_destroyed`.
-    /// Used by `render.rs::sync_window_positions` as the primary match key,
-    /// eliminating the duplicate-app_id bug entirely.
     pub surface_to_pane: HashMap<ObjectId, PaneId>,
 
     pub seat: Seat<Self>,
@@ -165,6 +158,7 @@ pub struct Trixie {
     pub wayland_socket: String,
 
     pub twm: TwmState,
+    pub anim: AnimSet,
     pub unclaimed: HashMap<ObjectId, ToplevelSurface>,
 
     pub ui: Option<SmithayApp<ChromeApp>>,
@@ -176,11 +170,23 @@ pub struct Trixie {
     pub clock: Clock<Monotonic>,
     pub start_time: Instant,
     pub exec_once_done: bool,
+
+    /// Set to true by any event that causes visible change:
+    /// client buffer commit, cursor move, window open/close, config reload,
+    /// animation tick, key binding that changes layout/focus.
+    /// Cleared in frame_finish after the next frame is scheduled.
+    /// This prevents the render loop from running at full refresh rate
+    /// when nothing has changed, fixing sluggishness and NVIDIA flicker.
+    pub needs_redraw: bool,
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
 impl Trixie {
+    pub fn request_redraw(&mut self) {
+        self.needs_redraw = true;
+    }
+
     pub fn render_all(&mut self) {
         let nodes: Vec<DrmNode> = self.backends.keys().copied().collect();
         for node in nodes {
@@ -198,18 +204,23 @@ impl Trixie {
         };
 
         // Do not submit a new frame while the previous one is still in-flight.
-        // Clearing this flag too early (before vblank) was the root cause of
-        // frame queue overflow and the low effective framerate.
         if surface.pending_frame {
             return;
         }
 
         let frame_duration = surface.frame_duration;
 
+        // Advance animations. If any are still running, keep needs_redraw set
+        // so frame_finish schedules another frame after vblank.
+        let still_animating = self.anim.tick();
+        if still_animating {
+            self.needs_redraw = true;
+        }
+
         let snap = self.twm.snapshot();
         let chrome_cmds = if let Some(ui) = &mut self.ui {
             ui.send(ChromeMsg::Snapshot(snap));
-            ui.collect() // collect() is the correct method name
+            ui.collect()
         } else {
             vec![]
         };
@@ -217,19 +228,16 @@ impl Trixie {
         let queued = crate::render::render(self, node, crtc, chrome_cmds);
 
         if queued {
-            // Mark in-flight immediately so no other code path can queue
-            // a second frame before vblank clears this flag.
+            // render.rs sets pending_frame = true inside queue_frame on success.
+            // We only update next_frame_time here for informational purposes.
             if let Some(b) = self.backends.get_mut(&node) {
                 if let Some(s) = b.surfaces.get_mut(&crtc) {
-                    s.pending_frame = true;
                     s.next_frame_time = Instant::now() + s.frame_duration;
                 }
             }
         } else {
             // render() returned false — DRM not ready or nothing to draw yet.
-            // Schedule a one-shot retry after one frame interval so the loop
-            // can recover without spinning. This replaces the old repeating
-            // timer which raced against vblank and caused double-submission.
+            // Schedule a one-shot retry after one frame interval.
             self.handle
                 .insert_source(Timer::from_duration(frame_duration), move |_, _, state| {
                     state.render_surface(node, crtc);
@@ -242,27 +250,31 @@ impl Trixie {
     pub fn frame_finish(&mut self, node: DrmNode, crtc: crtc::Handle) {
         if let Some(b) = self.backends.get_mut(&node) {
             if let Some(s) = b.surfaces.get_mut(&crtc) {
-                // Vblank has fired — the frame is on screen. Clear the guard
-                // so the next render_surface call can submit a new frame.
+                // Vblank fired — the frame is on screen. Clear the guard so the
+                // next render_surface call can submit a new frame.
                 s.pending_frame = false;
                 if let Err(e) = s.compositor.frame_submitted() {
                     tracing::warn!("frame_submitted: {e}");
                 }
             }
         }
-        // Schedule the next frame on the next event loop iteration.
-        // insert_idle fires after all pending events are drained, which means
-        // input events that arrived during this frame are processed first —
-        // giving us input-to-display latency of at most one frame.
+
+        // Always schedule the next frame after vblank. The render loop runs
+        // continuously; pending_frame is the sole guard against frame queue
+        // overflow (render_surface returns early if pending_frame is set).
+        //
+        // The open-window seizure/flash was caused by reset_buffers() being
+        // called every frame in render.rs (now removed), not by the loop being
+        // unconditional. Demand-driven gating here caused the loop to die on
+        // the first idle frame because trixui's chrome path doesn't re-signal
+        // needs_redraw on every tick.
+        self.needs_redraw = false;
         self.handle
             .insert_idle(move |s| s.render_surface(node, crtc));
     }
 
     // ── Focus sync ────────────────────────────────────────────────────────────
 
-    /// Set keyboard focus to the Wayland surface that corresponds to the TWM
-    /// focused pane. Uses `surface_to_pane` for O(n) lookup instead of
-    /// app_id string matching.
     pub fn sync_focus(&mut self) {
         let focused_pane_id = self.twm.workspaces[self.twm.active_ws].focused;
 
@@ -291,10 +303,6 @@ impl Trixie {
             if let Some(kbd) = self.seat.get_keyboard() {
                 kbd.set_focus(self, Some(surf.clone()), serial);
             }
-            // Also update pointer focus so the newly-focused window receives
-            // wl_pointer.enter and wl_pointer.frame. Without this, clients
-            // that gate keyboard input on pointer focus (most terminals) will
-            // remain unresponsive after a keyboard-driven focus switch.
             if let Some(ptr) = self.seat.get_pointer() {
                 let loc = ptr.current_location();
                 let bw = self.twm.border_w;
@@ -320,9 +328,6 @@ impl Trixie {
                     &smithay::input::pointer::MotionEvent {
                         location: loc,
                         serial: serial2,
-                        // Use the compositor monotonic clock so the timestamp
-                        // is always valid and monotonically increasing.
-                        // time: 0 caused clients to reject the enter event entirely.
                         time: self.clock.now().as_millis(),
                     },
                 );
@@ -345,11 +350,9 @@ impl Trixie {
         let config_bar_h = self.config.bar.height;
         let at_bottom = self.config.bar.position == crate::config::BarPosition::Bottom;
 
-        // Mirror trixui's cell-rounding so TWM content_rect always matches
-        // what trixui actually draws. Raw config px must never go to the TWM.
         let actual_bar_h = if let Some(ui) = &mut self.ui {
             ui.set_bar_height_px(config_bar_h);
-            let cell_h = ui.line_h(); // line_h() == cell_h from the atlas
+            let cell_h = ui.line_h();
             if cell_h == 0 {
                 config_bar_h
             } else {
@@ -372,6 +375,7 @@ impl Trixie {
             );
         }
 
+        self.needs_redraw = true;
         tracing::info!("Config reloaded");
     }
 

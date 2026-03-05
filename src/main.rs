@@ -209,6 +209,8 @@ fn main() {
         clock: Clock::new(),
         start_time: std::time::Instant::now(),
         exec_once_done: false,
+        anim: twm::anim::AnimSet::default(),
+        needs_redraw: true,
     };
 
     let udev_backend = UdevBackend::new(state.session.seat()).unwrap();

@@ -16,7 +16,7 @@ use smithay::{
             DrmDeviceFd, DrmEvent, DrmNode,
         },
         egl::{EGLContext, EGLDisplay},
-        renderer::{damage::OutputDamageTracker, gles::GlesRenderer},
+        renderer::gles::GlesRenderer,
         session::Session,
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -287,6 +287,7 @@ pub fn add_output(
 
     // TWM gets the rounded value so its content_rect matches trixui exactly.
     state.twm.resize(pw, ph);
+    state.anim.resize(pw, ph);
     state.twm.set_bar_height(actual_bar_h, at_bottom);
 
     tracing::info!(
@@ -319,7 +320,6 @@ pub fn add_output(
         SurfaceData {
             output: output.clone(),
             compositor,
-            damage_tracker: OutputDamageTracker::from_output(&output),
             // next_frame_time is no longer used as a gate — pending_frame is
             // the sole guard. Set to now so the first render fires immediately.
             next_frame_time: Instant::now(),
