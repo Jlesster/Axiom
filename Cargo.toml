@@ -1,42 +1,71 @@
 [package]
-name = "trixie"
+name    = "axiom"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "trixie"
+name = "axiom"
 path = "src/main.rs"
 
+[[bin]]
+name = "axctl"
+path = "src/bin/axiomctl.rs"
+
 [dependencies]
-# Your local trixui — enable the smithay backend feature
-trixui = { path = "../libs/trixui", features = ["backend-smithay"] }
+# ── Wayland ───────────────────────────────────────────────────────────────────
+wayland-server        = "0.31"
+wayland-protocols     = { version = "0.31", features = ["server", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.2",  features = ["server"] }
 
-smithay = { version = "0.7", default-features = false, features = [
-    "desktop",
-    "wayland_frontend",       # wl_surface, wl_seat, etc.
-    "backend_drm",            # DrmDevice, DrmNode, DrmCompositor
-    "backend_gbm",            # GbmDevice, GbmAllocator
-    "backend_egl",            # EGLDisplay, EGLContext
-    "backend_session_libseat",# LibSeatSession
-    "backend_udev",           # UdevBackend
-    "backend_libinput",       # LibinputInputBackend
-    "renderer_gl",            # GlesRenderer  (NOT renderer_gles)
-] }
+# ── DRM / GBM / EGL ──────────────────────────────────────────────────────────
+drm         = "0.12"
+drm-fourcc  = "2"
+gbm         = "0.15"
+khronos-egl = { version = "6", features = ["dynamic"] }
+gl          = "0.14"
+libloading  = "0.8"
 
-# Smithay's GlesRenderer needs the glow feature too in 0.7
-# (renderer_gl pulls it but list it explicitly to be safe)
-# renderer_glow is separate — only needed if you use GlowRenderer
+# ── Input ─────────────────────────────────────────────────────────────────────
+input     = "0.8"
+xkbcommon = { version = "0.7", features = ["wayland"] }
 
-bitflags          = "2"
-chrono            = "0.4"   # `clock` feature (Local::now) is on by default
-gl                = "0.14"
-# smithay 0.7 vendors its own rustix (version 1.x), but your session::open
-# call uses rustix directly — match smithay's version:
-rustix            = { version = "1", features = ["fs"] }
-notify            = "6"
-tracing           = "0.1"
-tracing-subscriber = "0.3"
-calloop = { version = "0.14.4", features = ["signals"] }
-libc = "0.2.182"
-serde_json = "1.0.149"
-gbm = "0.18.0"
+# ── Event loop ────────────────────────────────────────────────────────────────
+calloop                = { version = "0.12", features = ["signals"] }
+calloop-wayland-source = "0.2"
+
+# ── Scripting ─────────────────────────────────────────────────────────────────
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
+
+# ── XWayland ──────────────────────────────────────────────────────────────────
+# We manage the XWayland process ourselves and speak the XWMCP socket protocol.
+# x11rb gives us a pure-Rust X11 client to pair X windows with Wayland surfaces.
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "composite", "damage", "randr", "render", "shm", "xfixes", "xinput", "xtest"] }
+
+# ── IPC ───────────────────────────────────────────────────────────────────────
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# ── Screen capture / Portal ───────────────────────────────────────────────────
+# PipeWire 0.8 has a libspa binding bug on some distros — we use zwlr-screencopy
+# directly for grim/wayshot and provide a D-Bus portal via zbus for browser
+# screen-share. PipeWire streaming is stubbed until libspa stabilises.
+zbus  = { version = "4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "net"] }
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log                = "0.4"
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+anyhow   = "1"
+bytemuck = "1"
+nix      = { version = "0.28", features = ["process", "signal", "fs", "socket"] }
+rustix   = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "shm"] }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"

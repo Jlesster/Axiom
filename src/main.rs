@@ -1,333 +1,585 @@
-// main.rs — Trixie compositor entry point.
+// src/main.rs — Axiom compositor entry point.
 
 mod backend;
-mod chrome;
-mod config;
-mod cursor;
-mod handlers;
 mod input;
 mod ipc;
+mod portal;
+mod proto;
 mod render;
-mod session;
-mod signal;
+mod scripting;
 mod state;
-mod twm;
+mod sys;
+mod wm;
+mod xwayland;
 
 use std::{
-    collections::HashMap,
+    os::unix::io::AsRawFd,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use notify::{EventKind, RecursiveMode, Watcher};
-use smithay::backend::drm::NodeType;
-use smithay::desktop::{PopupManager, Space};
-use smithay::input::pointer::CursorImageStatus;
-use smithay::{
-    backend::{
-        drm::DrmNode,
-        libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::ImportDma,
-        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
-        udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent},
-    },
-    input::{keyboard::XkbConfig, SeatState},
-    reexports::{
-        calloop::{generic::Generic, EventLoop, Interest, Mode as CalloopMode, PostAction},
-        input::Libinput,
-        wayland_server::Display as WlDisplay,
-    },
-    utils::Clock,
-    wayland::{
-        compositor::CompositorState,
-        dmabuf::DmabufState,
-        output::OutputManagerState,
-        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
-        shell::{
-            wlr_layer::WlrLayerShellState,
-            xdg::{decoration::XdgDecorationState, XdgShellState},
-        },
-        shm::ShmState,
-        socket::ListeningSocketSource,
-    },
+use anyhow::{Context, Result};
+use calloop::{
+    generic::Generic,
+    signals::{Signal, Signals},
+    EventLoop, Interest, Mode, PostAction,
+};
+use wayland_server::{backend::ClientData as WlClientData, Display};
+
+use crate::{
+    backend::Backend,
+    input::InputState,
+    ipc::IpcServer,
+    proto::seat::SeatState,
+    render::RenderState,
+    scripting::ScriptEngine,
+    state::{Axiom, GrabKind, OutputState},
+    wm::{anim::AnimSet, WmConfig, WmState},
+    xwayland::{X11Action, XWaylandState},
 };
 
-use config::{BarPosition, Config};
-use cursor::CursorManager;
-use state::{DragState, Trixie};
-use twm::TwmState;
+struct NoopClientData;
+impl WlClientData for NoopClientData {
+    fn initialized(&self, _: wayland_server::backend::ClientId) {}
+    fn disconnected(
+        &self,
+        _: wayland_server::backend::ClientId,
+        _: wayland_server::backend::DisconnectReason,
+    ) {
+    }
+}
 
-fn main() {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_writer(|| -> Box<dyn std::io::Write> { Box::new(std::io::stderr()) })
-        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(std::io::stderr)
+        .with_env_filter(std::env::var("AXIOM_LOG").unwrap_or_else(|_| "axiom=debug,warn".into()))
         .init();
+    tracing::info!("Axiom starting");
 
-    tracing::info!("Trixie starting");
+    let mut event_loop: EventLoop<'static, Axiom> = EventLoop::try_new()?;
+    let loop_handle = event_loop.handle();
 
+    let session = backend::session::Session::open()?;
+    let gpu_path = find_primary_gpu()?;
+    tracing::info!("GPU: {gpu_path:?}");
+    let mut backend = Backend::open(&gpu_path, session)?;
+    let outputs_raw = backend.create_outputs()?;
+
+    if let Some(out) = outputs_raw.first() {
+        out.make_current(&backend.egl)?;
+    }
+    let render = RenderState::new()?;
+
+    let mut display: Display<Axiom> = Display::new()?;
+    let display_handle = display.handle();
+
+    let socket_name = "wayland-axiom".to_string();
+    let listener =
+        wayland_server::ListeningSocket::bind(&socket_name).context("bind Wayland socket")?;
+    tracing::info!("WAYLAND_DISPLAY={socket_name}");
     unsafe {
-        std::env::set_var("GBM_BACKEND", "nvidia-drm");
-        std::env::set_var("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
-        std::env::set_var("__GL_SYNC_TO_VBLANK", "0");
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     }
 
-    let config = Arc::new(Config::load());
-    tracing::info!("Config loaded from {:?}", config::config_path());
+    proto::register_globals(&display_handle);
 
-    let mut event_loop: EventLoop<'static, Trixie> = EventLoop::try_new().unwrap();
-    let display: WlDisplay<Trixie> = WlDisplay::new().unwrap();
-    let dh = display.handle();
+    let (sw, sh) = primary_output_size(&outputs_raw);
+    let mut wm = WmState::new(sw, sh, WmConfig::default());
 
-    event_loop
-        .handle()
-        .insert_source(
-            Generic::new(display, Interest::READ, CalloopMode::Level),
-            |_, display, state| {
-                unsafe { display.get_mut().dispatch_clients(state).unwrap() };
-                Ok(PostAction::Continue)
-            },
-        )
-        .unwrap();
+    let config_dir = xdg_config_dir();
+    let script = ScriptEngine::new(&config_dir, &wm)?;
+    script.run_rc(&mut wm)?;
 
-    let source = ListeningSocketSource::new_auto().unwrap();
-    let socket_name = source.socket_name().to_string_lossy().into_owned();
-    event_loop
-        .handle()
-        .insert_source(source, |stream, _, state| {
-            state
-                .display_handle
-                .insert_client(stream, Arc::new(state::ClientState::default()))
-                .unwrap();
-        })
-        .unwrap();
+    let input = InputState::new(&backend.session)?;
+    let seat = SeatState::new();
 
-    let (session, notifier) = LibSeatSession::new().expect("libseat session");
-    event_loop
-        .handle()
-        .insert_source(notifier, |event, _, state| match event {
-            SessionEvent::PauseSession => {
-                tracing::info!("Session paused");
-                state.libinput.suspend();
-                for b in state.backends.values_mut() {
-                    b.drm.pause();
-                }
-            }
-            SessionEvent::ActivateSession => {
-                tracing::info!("Session resumed");
-                let _ = state
-                    .libinput
-                    .udev_assign_seat(state.session.seat().as_str());
-                for b in state.backends.values_mut() {
-                    let _ = b.drm.activate(false);
-                }
-                state.handle.insert_idle(|s| s.render_all());
-            }
-        })
-        .unwrap();
+    // ── IPC server ────────────────────────────────────────────────────────────
+    let ipc = IpcServer::bind(&socket_name).unwrap_or_else(|e| {
+        tracing::warn!("IPC socket unavailable: {e}");
+        IpcServer::bind("0").expect("IPC fallback bind")
+    });
 
-    let primary_gpu = primary_gpu(session.seat())
-        .unwrap()
-        .and_then(|p| DrmNode::from_path(p).ok())
-        .and_then(|n| n.node_with_type(NodeType::Render).and_then(|n| n.ok()))
-        .unwrap_or_else(|| {
-            all_gpus(session.seat())
-                .unwrap()
-                .into_iter()
-                .find_map(|p| DrmNode::from_path(p).ok())
-                .expect("No GPU found")
-        });
-    tracing::info!("Primary GPU: {primary_gpu}");
-
-    let mut libinput_ctx =
-        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
-    libinput_ctx
-        .udev_assign_seat(session.seat().as_str())
-        .unwrap();
-
-    let mut seat_state = SeatState::new();
-    let mut seat = seat_state.new_wl_seat(&dh, &config.seat_name);
-    let pointer = seat.add_pointer();
-    seat.add_keyboard(
-        XkbConfig {
-            layout: config.keyboard.layout.as_deref().unwrap_or(""),
-            variant: config.keyboard.variant.as_deref().unwrap_or(""),
-            options: config.keyboard.options.clone(),
-            ..XkbConfig::default()
-        },
-        config.keyboard.repeat_delay as i32,
-        config.keyboard.repeat_rate as i32,
-    )
-    .unwrap();
-
-    let bar_h = config.bar.height;
-    let at_bottom = config.bar.position == BarPosition::Bottom;
-    let twm = TwmState::new(
-        0,
-        0,
-        bar_h,
-        at_bottom,
-        config.gap,
-        config.border_width,
-        12,
-        config.workspaces,
-    );
-
-    // Build CursorManager — theme is loaded later in backend.rs once the GL
-    // context is current and the cursor theme path is resolvable.
-    let mut cursor = CursorManager::default();
-    if let Some(theme) = config.cursor_theme.as_deref() {
-        cursor.theme_name = theme.to_string();
+    // ── XWayland ──────────────────────────────────────────────────────────────
+    let mut xwayland = XWaylandState::new();
+    if let Err(e) = xwayland.start(&socket_name, sw, sh) {
+        tracing::warn!("XWayland unavailable: {e}");
     }
 
-    let mut state = Trixie {
-        display_handle: dh.clone(),
-        compositor_state: CompositorState::new::<Trixie>(&dh),
-        shm_state: ShmState::new::<Trixie>(&dh, vec![]),
-        dmabuf_state: DmabufState::new(),
-        dmabuf_global: None,
-        output_manager_state: OutputManagerState::new_with_xdg_output::<Trixie>(&dh),
-        seat_state,
-        data_device_state: DataDeviceState::new::<Trixie>(&dh),
-        primary_selection_state: PrimarySelectionState::new::<Trixie>(&dh),
-        xdg_shell_state: XdgShellState::new::<Trixie>(&dh),
-        layer_shell_state: WlrLayerShellState::new::<Trixie>(&dh),
-        xdg_decoration_state: XdgDecorationState::new::<Trixie>(&dh),
-        popups: PopupManager::default(),
-        space: Space::default(),
-        surface_to_pane: HashMap::new(),
+    // ── Portal ────────────────────────────────────────────────────────────────
+    let portal = portal::spawn_portal().ok();
+    if portal.is_none() {
+        tracing::warn!("xdg-desktop-portal backend failed to start (D-Bus unavailable?)");
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    let outputs: Vec<OutputState> = outputs_raw
+        .into_iter()
+        .enumerate()
+        .map(|(i, surf)| {
+            let (w, h) = surf.mode_size();
+            OutputState {
+                name: format!("output-{i}"),
+                width: w,
+                height: h,
+                refresh_mhz: 60_000,
+                scale: 1.0,
+                render_surf: surf,
+                wl_id: i as u32,
+                last_vblank: Instant::now(),
+                frame_pending: false,
+            }
+        })
+        .collect();
+
+    let mut state = Axiom {
+        display: display_handle.clone(),
+        socket_name: socket_name.clone(),
+        backend,
+        render,
+        input,
         seat,
-        pointer,
-        cursor_status: CursorImageStatus::default_named(),
-        cursor,
-        mouse_mode: state::MouseMode::Normal,
-        drag: DragState::None,
-        libinput: libinput_ctx,
-        session,
-        backends: HashMap::new(),
-        primary_gpu,
-        wayland_socket: socket_name.clone(),
-        twm,
-        unclaimed: HashMap::new(),
-        config: Arc::clone(&config),
-        running: Arc::new(AtomicBool::new(true)),
-        handle: event_loop.handle(),
-        clock: Clock::new(),
-        start_time: std::time::Instant::now(),
-        exec_once_done: false,
-        anim: twm::anim::AnimSet::default(),
+        wm,
+        anim: AnimSet::new(),
+        script,
+        outputs,
+        surface_map: Default::default(),
+        toplevel_map: Default::default(),
+        pending_windows: Default::default(),
+        closing_windows: Default::default(),
+        layer_surfaces: Default::default(),
+        ipc,
+        idle_inhibit: crate::proto::idle_inhibit::IdleInhibitState::new(),
+        xwayland,
+        portal,
+        running: Arc::clone(&running),
+        handle: loop_handle.clone(),
+        start_time: Instant::now(),
         needs_redraw: true,
-        de: None,
+        grab: GrabKind::None,
     };
 
-    // ── Register scratchpads from config ──────────────────────────────────────
-    for sp in &config.scratchpads.clone() {
+    // ── Register all monitors with the WM ─────────────────────────────────────
+    for (i, out) in state.outputs.iter().enumerate() {
+        let x_off: i32 = state.outputs[..i].iter().map(|o| o.width as i32).sum();
         state
-            .twm
-            .register_scratchpad_sized(&sp.name, &sp.app_id, sp.width_pct, sp.height_pct);
-        tracing::info!(
-            "Registered scratchpad '{}' for app_id='{}' ({:.0}%x{:.0}%)",
-            sp.name,
-            sp.app_id,
-            sp.width_pct * 100.0,
-            sp.height_pct * 100.0,
-        );
+            .wm
+            .add_monitor(out.wl_id, x_off, 0, out.width as i32, out.height as i32);
     }
 
-    let udev_backend = UdevBackend::new(state.session.seat()).unwrap();
-    for (dev_id, path) in udev_backend.device_list() {
-        let Ok(node) = smithay::backend::drm::DrmNode::from_dev_id(dev_id) else {
+    // ── Initial modeset ───────────────────────────────────────────────────────
+    for out in &mut state.outputs {
+        use ::drm::control::Device;
+        if let Err(e) = out.render_surf.make_current(&state.backend.egl) {
+            tracing::warn!("initial make_current: {e}");
             continue;
-        };
-        if let Err(e) = backend::add_gpu(&mut state, &dh, node, path) {
-            tracing::warn!("GPU {node} skipped: {e}");
+        }
+        unsafe {
+            gl::ClearColor(0.0, 0.0, 0.0, 1.0);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+        match out
+            .render_surf
+            .present(&state.backend.egl, &state.backend.drm)
+        {
+            Ok(fb) => {
+                if let Ok(res) = state.backend.drm.resource_handles() {
+                    let conn = res.connectors().iter().find_map(|&ch| {
+                        state
+                            .backend
+                            .drm
+                            .get_connector(ch, false)
+                            .ok()
+                            .and_then(|c| {
+                                let matches = c
+                                    .current_encoder()
+                                    .and_then(|eh| state.backend.drm.get_encoder(eh).ok())
+                                    .map(|enc| enc.crtc() == Some(out.render_surf.crtc))
+                                    .unwrap_or(false);
+                                if matches {
+                                    Some(ch)
+                                } else {
+                                    None
+                                }
+                            })
+                    });
+                    if let Some(conn_h) = conn {
+                        let mode = out.render_surf.mode;
+                        if let Err(e) = state.backend.drm.set_crtc(
+                            out.render_surf.crtc,
+                            Some(fb),
+                            (0, 0),
+                            &[conn_h],
+                            Some(mode),
+                        ) {
+                            tracing::warn!("set_crtc: {e}");
+                        } else {
+                            tracing::info!("Initial modeset OK for {}", out.name);
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("initial present: {e}"),
         }
     }
 
-    if let Some(b) = state.backends.get(&state.primary_gpu) {
-        let formats: Vec<_> = b.renderer.dmabuf_formats().iter().copied().collect();
-        let global = state.dmabuf_state.create_global::<Trixie>(&dh, formats);
-        state.dmabuf_global = Some(global);
+    // ── Hardware cursor ───────────────────────────────────────────────────────
+    match render::cursor::HwCursor::load(&state.backend.drm) {
+        Ok(cur) => {
+            for out in &state.outputs {
+                cur.set_on_crtc(&state.backend.drm, out.render_surf.crtc, 0, 0);
+            }
+            state.input.hw_cursor_active = true;
+            state.render.hw_cursor = Some(cur);
+            tracing::info!("hardware cursor loaded");
+        }
+        Err(e) => tracing::warn!("hardware cursor unavailable ({e}), using software fallback"),
     }
 
-    event_loop
-        .handle()
-        .insert_source(udev_backend, |event, _, state| match event {
-            UdevEvent::Added { device_id, path } => {
-                if let Ok(node) = smithay::backend::drm::DrmNode::from_dev_id(device_id) {
-                    let _ = backend::add_gpu(state, &state.display_handle.clone(), node, &path);
+    // ── Event sources ─────────────────────────────────────────────────────────
+
+    // Wayland display fd.
+    {
+        let poll_fd = display.backend().poll_fd().as_raw_fd();
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(poll_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            |_, _, _state| Ok(PostAction::Continue),
+        )?;
+    }
+
+    // Wayland listener (new client connections).
+    {
+        let listener_fd = listener.as_raw_fd();
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(listener_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            move |_, _, state| {
+                if let Some(stream) = listener.accept()? {
+                    state
+                        .display
+                        .insert_client(stream, Arc::new(NoopClientData))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 }
-            }
-            UdevEvent::Changed { .. } => {}
-            UdevEvent::Removed { device_id } => {
-                if let Ok(node) = smithay::backend::drm::DrmNode::from_dev_id(device_id) {
-                    state.backends.remove(&node);
+                Ok(PostAction::Continue)
+            },
+        )?;
+    }
+
+    // DRM page-flip events.
+    {
+        let drm_fd = state.backend.drm.as_raw_fd();
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(drm_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            |_, _, state| {
+                state.backend.drm.handle_events(|crtc| {
+                    for out in &mut state.outputs {
+                        if out.render_surf.crtc == crtc {
+                            out.render_surf.on_flip_complete(&state.backend.drm);
+                            out.frame_pending = false;
+                            tracing::debug!("page-flip complete for crtc {:?}", crtc);
+                        }
+                    }
+                    state.needs_redraw = true;
+                });
+                Ok(PostAction::Continue)
+            },
+        )?;
+    }
+
+    // libinput events.
+    {
+        let li_fd = state.input.as_raw_fd();
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(li_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            |_, _, state| {
+                input::dispatch_libinput_events(state);
+                Ok(PostAction::Continue)
+            },
+        )?;
+    }
+
+    // libseat session events.
+    {
+        let seat_fd = state.backend.session.fd;
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(seat_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            |_, _, state| {
+                if let Err(e) = state.backend.session.dispatch(0) {
+                    tracing::warn!("libseat dispatch: {e}");
                 }
-            }
-        })
-        .unwrap();
-
-    event_loop
-        .handle()
-        .insert_source(
-            LibinputInputBackend::new(state.libinput.clone()),
-            |event, _, state| input::handle_input(state, event),
-        )
-        .unwrap();
-
-    state.run_exec_once();
-    state.run_exec();
-    tracing::info!("WAYLAND_DISPLAY={socket_name}");
-
-    let cfg_dir = config::config_dir();
-    let (reload_tx, reload_rx) = mpsc::channel::<()>();
-    let mut watcher = {
-        let tx = reload_tx.clone();
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else { return };
-            let is_write = matches!(ev.kind, EventKind::Create(_) | EventKind::Modify(_));
-            let is_conf = ev
-                .paths
-                .iter()
-                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("conf"));
-            if is_write && is_conf {
-                let _ = tx.send(());
-            }
-        })
-    }
-    .expect("file watcher");
-
-    if cfg_dir.exists() {
-        let _ = watcher.watch(&cfg_dir, RecursiveMode::Recursive);
-        tracing::info!("Watching {:?} for config changes", cfg_dir);
+                if state.backend.session.take_disable_pending() {
+                    tracing::info!("VT switched away — pausing render");
+                    for out in &mut state.outputs {
+                        out.frame_pending = true;
+                    }
+                }
+                if state.backend.session.take_enable_pending() {
+                    tracing::info!("VT returned — resuming render");
+                    for out in &mut state.outputs {
+                        out.frame_pending = false;
+                    }
+                    state.needs_redraw = true;
+                }
+                Ok(PostAction::Continue)
+            },
+        )?;
     }
 
-    let running = state.running.clone();
-    let mut display_handle = state.display_handle.clone();
+    // XWayland X11 connection fd (if started successfully).
+    if let Some(x11_fd) = state.xwayland.x11_fd() {
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(x11_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            |_, _, state| {
+                let actions = state.xwayland.dispatch_events();
+                for action in actions {
+                    match action {
+                        X11Action::MapWindow { .. } => state.map_xwayland_window(action),
+                        X11Action::UnmapWindow { x11_win } => state.unmap_xwayland_window(x11_win),
+                        X11Action::ConfigureRequest {
+                            x11_win,
+                            x,
+                            y,
+                            w,
+                            h,
+                        } => {
+                            if let Some(&wl_id) = state.xwayland.x11_to_wl.get(&x11_win) {
+                                if let Some(win) = state.wm.windows.get_mut(&wl_id) {
+                                    if win.floating {
+                                        if let Some(nx) = x {
+                                            win.rect.x = nx;
+                                        }
+                                        if let Some(ny) = y {
+                                            win.rect.y = ny;
+                                        }
+                                        if let Some(nw) = w {
+                                            win.rect.w = nw as i32;
+                                        }
+                                        if let Some(nh) = h {
+                                            win.rect.h = nh as i32;
+                                        }
+                                        win.float_rect = win.rect;
+                                    }
+                                }
+                                state.needs_redraw = true;
+                            }
+                        }
+                        X11Action::TitleChanged { x11_win, title } => {
+                            if let Some(&wl_id) = state.xwayland.x11_to_wl.get(&x11_win) {
+                                state.wm.set_title(wl_id, title);
+                            }
+                        }
+                        X11Action::FocusRequest { x11_win } => {
+                            if let Some(&wl_id) = state.xwayland.x11_to_wl.get(&x11_win) {
+                                state.wm.focus_window(wl_id);
+                                state.sync_keyboard_focus();
+                            }
+                        }
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )?;
+    }
+
+    // Signals.
+    event_loop.handle().insert_source(
+        Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap(),
+        |_, _, state| {
+            tracing::info!("signal — shutting down");
+            state.running.store(false, Ordering::SeqCst);
+        },
+    )?;
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
+    tracing::info!("Axiom running — WAYLAND_DISPLAY={socket_name}");
+    state.script.emit_bare("compositor.ready");
 
     while running.load(Ordering::SeqCst) {
-        let _ = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
-        if reload_rx.try_recv().is_ok() {
-            while reload_rx.try_recv().is_ok() {}
-            state.apply_config_reload();
+        event_loop.dispatch(Some(Duration::from_millis(2)), &mut state)?;
+        display.dispatch_clients(&mut state)?;
+
+        if state.anim.tick() {
+            state.needs_redraw = true;
         }
-        state.space.refresh();
-        state.popups.cleanup();
-        if let Err(e) = display_handle.flush_clients() {
+        state.script.tick(&state.wm);
+        let actions: Vec<_> = std::mem::take(&mut *state.script.queue.lock().unwrap());
+        crate::scripting::lua_api::apply_actions(&mut state, actions);
+
+        if state.idle_inhibit.inhibited() {
+            reset_dpms_timer();
+        }
+
+        state.poll_portal_requests();
+        crate::ipc::drain_ipc(&mut state);
+
+        if state.needs_redraw {
+            render_all(&mut state);
+            state.needs_redraw = false;
+        }
+
+        if let Err(e) = state.display.flush_clients() {
             tracing::warn!("flush_clients: {e}");
         }
     }
 
-    tracing::info!("Trixie shutting down");
+    tracing::info!("Axiom shutdown");
 
-    drop(display_handle);
-    state.libinput.suspend();
-    for backend in state.backends.values_mut() {
-        backend.drm.pause();
+    if let Some(mut child) = state.xwayland.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    drop(state);
 
-    tracing::info!("Trixie exited cleanly");
+    Ok(())
+}
+
+// ── render_all ────────────────────────────────────────────────────────────────
+
+fn render_all(state: &mut Axiom) {
+    let n = state.outputs.len();
+    let (cx, cy) = (state.input.pointer_x as i32, state.input.pointer_y as i32);
+
+    for idx in 0..n {
+        if state.outputs[idx].frame_pending {
+            tracing::debug!("render_all: output {} skipped (frame_pending)", idx);
+            continue;
+        }
+
+        // Make the EGL context current before rendering.
+        // We access render_surf by index each time rather than holding a raw
+        // pointer alias alongside a mutable borrow of state — that was UB.
+        if state.outputs[idx]
+            .render_surf
+            .make_current(&state.backend.egl)
+            .is_err()
+        {
+            continue;
+        }
+
+        // Move hardware cursor before rendering so it's in the right place.
+        if let Some(ref hw) = state.render.hw_cursor {
+            let crtc = state.outputs[idx].render_surf.crtc;
+            hw.move_on_crtc(&state.backend.drm, crtc, cx, cy);
+        }
+
+        // Collect the output dimensions we need for the portal path.
+        let (out_w, out_h) = (state.outputs[idx].width, state.outputs[idx].height);
+
+        // Render. We pass a shared reference to the surface obtained via a
+        // fresh index borrow — no raw pointers needed.
+        {
+            let surf = &state.outputs[idx].render_surf;
+            state.render.render_output(
+                &state.wm,
+                &state.anim,
+                &state.input,
+                &state.outputs,
+                &state.layer_surfaces,
+                surf,
+                idx,
+            );
+        }
+
+        // Portal frame capture (best-effort; errors are non-fatal).
+        let portal_tx = state.portal.as_ref().map(|p| p.tx.clone());
+        if let Some(tx) = portal_tx {
+            if let Some(pixels) = state.read_output_pixels(idx) {
+                let _ = tx.try_send(crate::portal::PortalEvent::Frame {
+                    pixels,
+                    width: out_w,
+                    height: out_h,
+                });
+            }
+        }
+
+        // Present (eglSwapBuffers + lock_front_buffer + add_framebuffer).
+        let fb_id = match state.outputs[idx]
+            .render_surf
+            .present(&state.backend.egl, &state.backend.drm)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("present: {e}");
+                continue;
+            }
+        };
+
+        // Queue page flip.
+        match state.outputs[idx]
+            .render_surf
+            .page_flip(&state.backend.drm, fb_id)
+        {
+            Err(e) => tracing::warn!("page_flip: {e}"),
+            Ok(()) => {
+                state.outputs[idx].frame_pending = true;
+                tracing::debug!("render_all: output {} flip submitted", idx);
+            }
+        }
+    }
+}
+
+// ── DPMS idle inhibit ─────────────────────────────────────────────────────────
+
+fn reset_dpms_timer() {}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn find_primary_gpu() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("DRM_DEVICE") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    for n in 0..8u32 {
+        let p = PathBuf::from(format!("/dev/dri/card{n}"));
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    anyhow::bail!("no DRI card found")
+}
+
+fn xdg_config_dir() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".config")
+        });
+    base.join("axiom")
+}
+
+fn primary_output_size(outputs: &[backend::OutputSurface]) -> (i32, i32) {
+    outputs
+        .first()
+        .map(|o| {
+            let (w, h) = o.mode_size();
+            (w as i32, h as i32)
+        })
+        .unwrap_or((1920, 1080))
 }
