@@ -1,6 +1,6 @@
 // src/scripting/signals.rs — AwesomeWM-compatible Lua signal system.
 
-use crate::wm::{Window, WmState};
+use crate::wm::{Window, WindowId, WmState};
 use mlua::prelude::*;
 
 // ── Signal name constants ─────────────────────────────────────────────────────

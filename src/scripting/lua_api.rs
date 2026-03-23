@@ -34,15 +34,10 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
 
     // ── axiom.config(t) ───────────────────────────────────────────────────────
     {
-        // Obtain a raw pointer to WmConfig WITHOUT going through &T first.
-        // addr_of_mut! is the correct way to get *mut T from a field without
-        // creating an intermediate &mut or violating the aliasing rules.
         let cfg_ptr = std::ptr::addr_of!(wm.config) as *mut WmConfig as usize;
         axiom.set(
             "config",
             lua.create_function(move |_, t: LuaTable| {
-                // SAFETY: WmConfig outlives Lua; Lua runs single-threaded inside
-                // the compositor main loop; no aliasing occurs here.
                 let cfg = unsafe { &mut *(cfg_ptr as *mut WmConfig) };
                 if let Ok(v) = t.get::<_, i32>("border_width") {
                     cfg.border_w = v;
@@ -114,6 +109,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
     )?;
 
     // ── axiom.workspace(n) ────────────────────────────────────────────────────
+    // Methods use colon syntax in Lua → first arg is self (the table).
     {
         let q = Arc::clone(&queue);
         axiom.set(
@@ -122,10 +118,11 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                 let ws = lua.create_table()?;
                 ws.set("index", n)?;
 
+                // ws:focus()
                 let qf = Arc::clone(&q);
                 ws.set(
                     "focus",
-                    lua.create_function(move |_, ()| {
+                    lua.create_function(move |_, _self: LuaValue| {
                         qf.lock()
                             .unwrap()
                             .push(LuaAction::SwitchWorkspace(n.saturating_sub(1)));
@@ -133,10 +130,11 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                     })?,
                 )?;
 
+                // ws:set_layout("tile"|"bsp"|"monocle"|"float")
                 let ql = Arc::clone(&q);
                 ws.set(
                     "set_layout",
-                    lua.create_function(move |_, name: String| {
+                    lua.create_function(move |_, (_self, name): (LuaValue, String)| {
                         let layout = match name.as_str() {
                             "tile" | "master_stack" => Layout::MasterStack,
                             "bsp" => Layout::Bsp,
@@ -144,7 +142,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                             "float" => Layout::Float,
                             other => {
                                 return Err(LuaError::RuntimeError(format!(
-                                    "unknown layout '{other}'"
+                                    "unknown layout '{other}' — use tile/bsp/monocle/float"
                                 )))
                             }
                         };
@@ -160,8 +158,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
         )?;
     }
 
-    // Store a raw pointer to WmState so closures can read it.
-    // SAFETY: WmState outlives Lua; pointer is read-only in closures.
+    // Store WmState pointer for read-only closures.
     let wm_ptr = wm as *const WmState as usize;
     lua.set_named_registry_value("axiom_wm_ptr", wm_ptr)?;
 
@@ -178,7 +175,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                     for &id in &ws.windows {
                         if seen.insert(id) {
                             if let Some(win) = wm.windows.get(&id) {
-                                let c = build_client(
+                                list.push(build_client(
                                     lua,
                                     win.id,
                                     &win.app_id,
@@ -191,8 +188,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                                     win.rect.w,
                                     win.rect.h,
                                     Arc::clone(&q),
-                                )?;
-                                list.push(c)?;
+                                )?)?;
                             }
                         }
                     }
@@ -215,7 +211,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                 let Some(win) = wm.windows.get(&id) else {
                     return Ok(LuaValue::Nil);
                 };
-                let c = build_client(
+                Ok(LuaValue::Table(build_client(
                     lua,
                     win.id,
                     &win.app_id,
@@ -228,8 +224,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                     win.rect.w,
                     win.rect.h,
                     Arc::clone(&q),
-                )?;
-                Ok(LuaValue::Table(c))
+                )?))
             })?,
         )?;
     }
@@ -263,38 +258,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
         })?,
     )?;
 
-    // ── Action shortcuts ──────────────────────────────────────────────────────
-    macro_rules! action_fn {
-        ($name:literal, $act:expr) => {{
-            let q = Arc::clone(&queue);
-            axiom.set(
-                $name,
-                lua.create_function(move |_, ()| {
-                    q.lock().unwrap().push($act);
-                    Ok(())
-                })?,
-            )?;
-        }};
-        ($name:literal, focused, $mk:expr) => {{
-            let q = Arc::clone(&queue);
-            axiom.set(
-                $name,
-                lua.create_function(move |lua, ()| {
-                    let wm = unsafe { &*(get_wm_ptr(lua)? as *const WmState) };
-                    if let Some(id) = wm.focused_window() {
-                        q.lock().unwrap().push($mk(id, wm));
-                    }
-                    Ok(())
-                })?,
-            )?;
-        }};
-    }
-
-    action_fn!("inc_master", LuaAction::IncMaster);
-    action_fn!("dec_master", LuaAction::DecMaster);
-    action_fn!("quit", LuaAction::Quit);
-    action_fn!("reload", LuaAction::Reload);
-
+    // ── Focused-window action shortcuts ───────────────────────────────────────
     {
         let q = Arc::clone(&queue);
         axiom.set(
@@ -336,52 +300,73 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
             })?,
         )?;
     }
+    {
+        let q = Arc::clone(&queue);
+        axiom.set(
+            "inc_master",
+            lua.create_function(move |_, ()| {
+                q.lock().unwrap().push(LuaAction::IncMaster);
+                Ok(())
+            })?,
+        )?;
+    }
+    {
+        let q = Arc::clone(&queue);
+        axiom.set(
+            "dec_master",
+            lua.create_function(move |_, ()| {
+                q.lock().unwrap().push(LuaAction::DecMaster);
+                Ok(())
+            })?,
+        )?;
+    }
+    {
+        let q = Arc::clone(&queue);
+        axiom.set(
+            "quit",
+            lua.create_function(move |_, ()| {
+                q.lock().unwrap().push(LuaAction::Quit);
+                Ok(())
+            })?,
+        )?;
+    }
+    {
+        let q = Arc::clone(&queue);
+        axiom.set(
+            "reload",
+            lua.create_function(move |_, ()| {
+                q.lock().unwrap().push(LuaAction::Reload);
+                Ok(())
+            })?,
+        )?;
+    }
 
-    // ── Focus / move direction helpers ────────────────────────────────────────
-    // These go via the input action queue in input/mod.rs; provide Lua helpers
-    // that call back into the same action system via the keybind table.
-    // For now we store them as named registry values that input/mod.rs can use.
+    // ── Direction helpers (queued, drained each tick) ─────────────────────────
     lua.set_named_registry_value("axiom_pending_focus_dir", lua.create_table()?)?;
     lua.set_named_registry_value("axiom_pending_move_dir", lua.create_table()?)?;
 
+    axiom.set(
+        "focus_dir",
+        lua.create_function(|lua, dir: String| {
+            let tbl: LuaTable = lua.named_registry_value("axiom_pending_focus_dir")?;
+            tbl.push(dir)?;
+            Ok(())
+        })?,
+    )?;
+    axiom.set(
+        "move_dir",
+        lua.create_function(|lua, dir: String| {
+            let tbl: LuaTable = lua.named_registry_value("axiom_pending_move_dir")?;
+            tbl.push(dir)?;
+            Ok(())
+        })?,
+    )?;
     {
-        let _q = Arc::clone(&queue);
-        axiom.set(
-            "focus_dir",
-            lua.create_function(move |lua, dir: String| {
-                // Enqueue as a switch-workspace no-op for now; real directional
-                // focus is handled by input::Action::FocusDir wired below.
-                let tbl: LuaTable = lua.named_registry_value("axiom_pending_focus_dir")?;
-                tbl.push(dir)?;
-                Ok(())
-            })?,
-        )?;
-    }
-    {
-        let _q = Arc::clone(&queue);
-        axiom.set(
-            "move_dir",
-            lua.create_function(move |lua, dir: String| {
-                let tbl: LuaTable = lua.named_registry_value("axiom_pending_move_dir")?;
-                tbl.push(dir)?;
-                Ok(())
-            })?,
-        )?;
-    }
-    {
-        let _q = Arc::clone(&queue);
         axiom.set(
             "cycle_focus",
-            lua.create_function(move |lua, delta: i32| {
-                // Translate to SwitchWorkspace as a placeholder; real impl needs
-                // a CycleFocus action wired to wm.cycle_focus.
-                // For now push to pending so drain() can handle it.
-                lua.named_registry_value::<LuaTable>("axiom_pending_focus_dir")?
-                    .push(if delta > 0 {
-                        "cycle+".to_string()
-                    } else {
-                        "cycle-".to_string()
-                    })?;
+            lua.create_function(|lua, delta: i32| {
+                let tbl: LuaTable = lua.named_registry_value("axiom_pending_focus_dir")?;
+                tbl.push(if delta > 0 { "cycle+" } else { "cycle-" })?;
                 Ok(())
             })?,
         )?;
@@ -441,9 +426,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
     )?;
 
     lua.globals().set("axiom", axiom)?;
-
     install_compat(lua, Arc::clone(&queue))?;
-
     Ok(queue)
 }
 
@@ -463,7 +446,6 @@ pub fn fire_keybind(lua: &Lua, combo: &str) -> LuaResult<()> {
 
 // ── Emit a signal ─────────────────────────────────────────────────────────────
 
-/// Emit a signal with a single table argument (or nil).
 pub fn emit_table(lua: &Lua, event: &str, arg: Option<LuaTable>) {
     let Ok(tbl) = lua.named_registry_value::<LuaTable>("axiom_signals") else {
         return;
@@ -484,18 +466,21 @@ pub fn emit_table(lua: &Lua, event: &str, arg: Option<LuaTable>) {
     }
 }
 
-/// Emit a signal with no arguments.
 pub fn emit_bare(lua: &Lua, event: &str) {
     emit_table(lua, event, None);
 }
 
 // ── Drain actions ─────────────────────────────────────────────────────────────
 
+/// Called from ScriptEngine::drain — kept for internal use.
 pub fn drain(queue: &ActionQueue, state: &mut crate::state::Axiom) {
-    // Drain directional focus/move requests from Lua.
     drain_dir_actions(state);
-
     let actions: Vec<LuaAction> = std::mem::take(&mut *queue.lock().unwrap());
+    drain_actions(actions, state);
+}
+
+pub fn drain_actions(actions: Vec<LuaAction>, state: &mut crate::state::Axiom) {
+    // dir actions still need lua access — call separately before dropping script borrow
     for action in actions {
         apply(state, action);
     }
@@ -511,7 +496,6 @@ fn drain_dir_actions(state: &mut crate::state::Axiom) {
             let v: Vec<String> = (1..=tbl.raw_len())
                 .filter_map(|i| tbl.get::<_, String>(i).ok())
                 .collect();
-            // Clear the table.
             for i in 1..=tbl.raw_len() {
                 let _ = tbl.set(i, LuaValue::Nil);
             }
@@ -651,15 +635,7 @@ fn apply(state: &mut crate::state::Axiom, action: LuaAction) {
     }
 }
 
-pub fn apply_actions(state: &mut crate::state::Axiom, actions: Vec<LuaAction>) {
-    // Drain directional focus/move requests from Lua registry tables.
-    drain_dir_actions(state);
-    for action in actions {
-        apply(state, action);
-    }
-}
-
-// ── Client table ──────────────────────────────────────────────────────────────
+// ── Client table builder ──────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn build_client<'lua>(
@@ -690,6 +666,7 @@ fn build_client<'lua>(
     c.set("width", w)?;
     c.set("height", h)?;
 
+    // All methods use colon syntax → first arg is self (LuaValue).
     let qc = Arc::clone(&q);
     c.set(
         "close",
@@ -735,49 +712,13 @@ fn build_client<'lua>(
     Ok(c)
 }
 
-// ── WmState pointer helpers ───────────────────────────────────────────────────
+// ── WmState pointer ───────────────────────────────────────────────────────────
 
 fn get_wm_ptr(lua: &Lua) -> LuaResult<usize> {
     lua.named_registry_value::<usize>("axiom_wm_ptr")
 }
 
-// ── Rule application (called on window open) ──────────────────────────────────
-
-pub fn apply_rules(lua: &Lua, app_id: &str, title: &str) -> Vec<LuaAction> {
-    let mut actions = Vec::new();
-    let Ok(tbl) = lua.named_registry_value::<LuaTable>("axiom_rules") else {
-        return actions;
-    };
-    for pair in tbl.clone().pairs::<LuaValue, LuaTable>() {
-        let Ok((_, rule)) = pair else { continue };
-        let Ok(m) = rule.get::<_, LuaTable>("match") else {
-            continue;
-        };
-        let app_ok = m
-            .get::<_, String>("app_id")
-            .map(|a| glob_match(&a, app_id))
-            .unwrap_or(true);
-        let ttl_ok = m
-            .get::<_, String>("title")
-            .map(|t| glob_match(&t, title))
-            .unwrap_or(true);
-        if !app_ok || !ttl_ok {
-            continue;
-        }
-        let Ok(act) = rule.get::<_, LuaTable>("action") else {
-            continue;
-        };
-        if let Ok(ws) = act.get::<_, usize>("workspace") {
-            actions.push(LuaAction::MoveToWorkspace(0, ws.saturating_sub(1)));
-        }
-        if let Ok(on) = act.get::<_, bool>("fullscreen") {
-            actions.push(LuaAction::SetFullscreen(0, on));
-        }
-    }
-    actions
-}
-
-// ── AwesomeWM compat shims ────────────────────────────────────────────────────
+// ── AwesomeWM compat ──────────────────────────────────────────────────────────
 
 fn install_compat(lua: &Lua, q: ActionQueue) -> LuaResult<()> {
     let client = lua.create_table()?;
@@ -838,36 +779,22 @@ fn install_compat(lua: &Lua, q: ActionQueue) -> LuaResult<()> {
         })?,
     )?;
     lua.globals().set("awful", awful)?;
-
     Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Normalise "Super+Return" → "super+return", "MOD4+shift+h" → "super+shift+h"
 pub fn normalise_combo(s: &str) -> String {
     s.split('+')
-        .map(|part| {
-            match part.to_lowercase().as_str() {
-                "mod4" | "super" | "logo" => "super",
-                "mod1" | "alt" => "alt",
-                "control" | "ctrl" => "ctrl",
-                "shift" => "shift",
-                _ => part, // keep original if unknown
-            }
+        .map(|part| match part.to_lowercase().as_str() {
+            "mod4" | "super" | "logo" => "super".to_string(),
+            "mod1" | "alt" => "alt".to_string(),
+            "control" | "ctrl" => "ctrl".to_string(),
+            "shift" => "shift".to_string(),
+            other => other.to_string(),
         })
         .collect::<Vec<_>>()
         .join("+")
-}
-
-fn glob_match(pattern: &str, s: &str) -> bool {
-    if let Some(p) = pattern.strip_suffix('*') {
-        s.starts_with(p)
-    } else if let Some(p) = pattern.strip_prefix('*') {
-        s.ends_with(p)
-    } else {
-        pattern == s
-    }
 }
 
 pub fn parse_color(s: &str) -> Option<[f32; 4]> {

@@ -105,11 +105,16 @@ impl DrmDevice {
         let gbm_surface = gbm_create_surface(gbm, w, h, DrmFourcc::Xrgb8888)?;
         let egl_surface: khronos_egl::Surface = egl.create_window_surface(&gbm_surface)?.0;
 
-        // Do NOT swap buffers or lock a buffer here — the initial modeset in
-        // main.rs will do the first present. Doing it here causes a double
-        // lock_front_buffer which corrupts the GBM surface state and leads to
-        // a black screen on some Mesa drivers.
         egl.make_current(&EglSurface(egl_surface))?;
+        egl.swap_buffers(&EglSurface(egl_surface))?;
+
+        let bo = unsafe { gbm_surface.lock_front_buffer() }?;
+        let fb = self
+            .add_framebuffer(&bo, 24, 32)
+            .context("drmModeAddFB (initial)")?;
+
+        self.set_crtc(crtc_h, Some(fb), (0, 0), &[conn_h], Some(mode))
+            .context("set_crtc")?;
 
         tracing::info!(
             "Output ready: {:?} {}x{}@{}Hz",
@@ -127,9 +132,9 @@ impl DrmDevice {
             egl_surface,
             crtc: crtc_h,
             mode,
-            scanning_fb: None,
-            scanning_bo: None,
+            front_fb: Some(fb),
             pending_fb: None,
+            front_bo: Some(bo),
             pending_bo: None,
         })
     }
@@ -142,6 +147,7 @@ impl DrmDevice {
         let conn_info = self.get_connector(conn, false).ok()?;
         for &enc_h in conn_info.encoders() {
             if let Ok(enc) = self.get_encoder(enc_h) {
+                // filter_crtcs returns Vec<crtc::Handle> — use .first()
                 let compatible = res.filter_crtcs(enc.possible_crtcs());
                 if let Some(&crtc_h) = compatible.first() {
                     return Some(crtc_h);

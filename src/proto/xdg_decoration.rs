@@ -7,7 +7,7 @@ use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_decoration_manager_v1::{self, ZxdgDecorationManagerV1},
     zxdg_toplevel_decoration_v1::{self, Mode, ZxdgToplevelDecorationV1},
 };
-use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
 use crate::state::Axiom;
 
@@ -28,7 +28,7 @@ impl GlobalDispatch<ZxdgDecorationManagerV1, ()> for Axiom {
 
 impl Dispatch<ZxdgDecorationManagerV1, ()> for Axiom {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &ZxdgDecorationManagerV1,
         request: zxdg_decoration_manager_v1::Request,
@@ -37,7 +37,7 @@ impl Dispatch<ZxdgDecorationManagerV1, ()> for Axiom {
         init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            zxdg_decoration_manager_v1::Request::GetToplevelDecoration { id, toplevel: _ } => {
+            zxdg_decoration_manager_v1::Request::GetToplevelDecoration { id, toplevel } => {
                 let dec = init.init(id, ());
                 // Immediately tell the client we'll handle decorations.
                 dec.configure(Mode::ServerSide);

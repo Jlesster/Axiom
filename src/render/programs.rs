@@ -7,13 +7,25 @@ use crate::state::RawBuffer;
 
 // ── syscall + EGL proc-address shims ─────────────────────────────────────────
 
-// mmap/munmap/constants from crate::sys; EGL queries are local.
-mod egl_sys {
+mod sys {
     use std::ffi::c_void;
     extern "C" {
+        pub fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn eglGetCurrentDisplay() -> *mut c_void;
         pub fn eglGetProcAddress(name: *const u8) -> *mut c_void;
     }
+    pub const PROT_READ: i32 = 0x1;
+    pub const MAP_SHARED: i32 = 0x01;
+    pub const MAP_FAILED: *mut c_void = !0usize as *mut _;
+
     pub unsafe fn egl_get_current_display() -> *mut c_void {
         eglGetCurrentDisplay()
     }
@@ -21,7 +33,7 @@ mod egl_sys {
 
 /// Look up an EGL/GL extension function by NUL-terminated name.
 unsafe fn egl_proc(name: &[u8]) -> Option<*mut std::ffi::c_void> {
-    let p = unsafe { egl_sys::eglGetProcAddress(name.as_ptr()) };
+    let p = unsafe { sys::eglGetProcAddress(name.as_ptr()) };
     if p.is_null() {
         None
     } else {
@@ -107,7 +119,7 @@ unsafe fn compile_shader(kind: u32, src: &str) -> Result<u32> {
 /// A VAO+VBO that holds a unit [0,1]² quad.
 /// Vertex layout: vec2 position (a_pos), vec2 uv (a_uv).
 pub struct QuadVao {
-    pub vao: u32,
+    vao: u32,
     vbo: u32,
 }
 
@@ -192,7 +204,7 @@ impl GlTexture {
         Self { id }
     }
 
-    pub fn upload_buffer(&mut self, buf: &RawBuffer, _w: i32, _h: i32) {
+    pub fn upload_buffer(&mut self, buf: &RawBuffer, w: i32, h: i32) {
         match buf {
             RawBuffer::Shm {
                 pool_fd,
@@ -204,16 +216,16 @@ impl GlTexture {
             } => {
                 let size = (*stride * *height) as usize;
                 let ptr = unsafe {
-                    crate::sys::mmap(
+                    sys::mmap(
                         std::ptr::null_mut(),
                         size,
-                        crate::sys::PROT_READ,
-                        crate::sys::MAP_SHARED,
+                        sys::PROT_READ,
+                        sys::MAP_SHARED,
                         *pool_fd,
                         *offset as i64,
                     )
                 };
-                if ptr == crate::sys::MAP_FAILED {
+                if ptr == sys::MAP_FAILED {
                     tracing::warn!("mmap SHM pool failed");
                     return;
                 }
@@ -235,7 +247,7 @@ impl GlTexture {
                         ptr,
                     );
                     gl::BindTexture(gl::TEXTURE_2D, 0);
-                    crate::sys::munmap(ptr, size);
+                    sys::munmap(ptr, size);
                 }
             }
             RawBuffer::Dmabuf {
@@ -287,7 +299,7 @@ impl GlTexture {
             let create: CreateFn = std::mem::transmute(create);
             let destroy: DestroyFn = std::mem::transmute(destroy);
             let target: TargetFn = std::mem::transmute(target);
-            let dpy = egl_sys::egl_get_current_display();
+            let dpy = sys::egl_get_current_display();
             let img = create(
                 dpy,
                 std::ptr::null_mut(),

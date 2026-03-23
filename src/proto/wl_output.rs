@@ -5,7 +5,7 @@
 
 use wayland_server::{
     protocol::wl_output::{self, Subpixel, Transform, WlOutput},
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
 use crate::state::Axiom;

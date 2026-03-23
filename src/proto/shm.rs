@@ -1,7 +1,7 @@
 // src/proto/shm.rs — wl_shm / wl_shm_pool / wl_buffer (shared-memory buffers).
 
+use std::ffi::c_void;
 use std::{
-    ffi::c_void,
     os::unix::io::OwnedFd,
     ptr, slice,
     sync::{Arc, Mutex},
@@ -25,7 +25,7 @@ const SUPPORTED_FORMATS: &[wl_shm::Format] = &[
     wl_shm::Format::Xrgb8888,
     wl_shm::Format::Abgr8888,
     wl_shm::Format::Xbgr8888,
-] as &[wl_shm::Format];
+];
 
 // ── Pool data ─────────────────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ pub struct ShmPool {
 
 pub struct ShmPoolInner {
     ptr: ptr::NonNull<u8>,
-    pub size: usize,
+    size: usize,
     fd: OwnedFd,
 }
 
@@ -61,14 +61,12 @@ impl ShmPoolInner {
         Ok(ptr::NonNull::new(ptr as *mut u8).unwrap())
     }
 
-    pub fn new(fd: OwnedFd, size: usize) -> anyhow::Result<Self> {
+    fn new(fd: OwnedFd, size: usize) -> anyhow::Result<Self> {
         let ptr = Self::mmap(&fd, size)?;
         Ok(Self { ptr, size, fd })
     }
 
-    pub fn resize(&mut self, new_size: usize) -> anyhow::Result<()> {
-        // Map the new region BEFORE unmapping the old one so that if the new
-        // mmap fails self.ptr is never left dangling.
+    fn resize(&mut self, new_size: usize) -> anyhow::Result<()> {
         let new_ptr = Self::mmap(&self.fd, new_size)?;
         unsafe { crate::sys::munmap(self.ptr.as_ptr() as *mut c_void, self.size) };
         self.ptr = new_ptr;
@@ -76,10 +74,6 @@ impl ShmPoolInner {
         Ok(())
     }
 
-    /// Borrow raw bytes for a buffer slice (bounds-checked).
-    /// The caller must hold the Mutex lock for the entire duration they
-    /// use the returned slice — do not release the lock while GL or any
-    /// other consumer is still reading from it.
     pub fn data(&self, offset: usize, len: usize) -> Option<&[u8]> {
         if offset.saturating_add(len) > self.size {
             return None;
@@ -111,9 +105,6 @@ pub struct ShmBuffer {
 }
 
 impl ShmBuffer {
-    /// Read pixel data for this buffer (slice into the pool mmap).
-    /// The lock is held for the duration of the closure so that a concurrent
-    /// pool resize cannot unmap the memory while the caller is reading it.
     pub fn with_data<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce(&[u8]) -> R,
@@ -122,10 +113,8 @@ impl ShmBuffer {
         let len = (self.stride * self.height) as usize;
         let data = pool.data(self.offset as usize, len)?;
         Some(f(data))
-        // pool lock released here, after f() returns
     }
 
-    /// Expose the pool's file descriptor so screencopy can mmap with PROT_WRITE.
     pub fn pool_fd_raw(&self) -> std::os::unix::io::RawFd {
         self.pool.lock().unwrap().fd_raw()
     }
@@ -143,7 +132,7 @@ impl GlobalDispatch<WlShm, ()> for Axiom {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let shm = data_init.init(resource, ());
-        for &fmt in SUPPORTED_FORMATS.iter() {
+        for &fmt in SUPPORTED_FORMATS {
             shm.format(fmt);
         }
     }
@@ -211,14 +200,12 @@ impl Dispatch<WlShmPool, ShmPool> for Axiom {
                     data_init.init(id, buf);
                 }
             }
-
             wl_shm_pool::Request::Resize { size } => {
                 let mut inner = data.inner.lock().unwrap();
                 if let Err(e) = inner.resize(size as usize) {
                     log::error!("wl_shm_pool resize failed: {}", e);
                 }
             }
-
             wl_shm_pool::Request::Destroy => {}
             _ => {}
         }
@@ -242,8 +229,3 @@ impl Dispatch<WlBuffer, ShmBuffer> for Axiom {
         }
     }
 }
-
-// (libc FFI lives in crate::sys)
-pub const PROT_READ: i32 = 0x1;
-pub const MAP_SHARED: i32 = 0x01;
-pub const MAP_FAILED: *mut c_void = !0usize as *mut _;

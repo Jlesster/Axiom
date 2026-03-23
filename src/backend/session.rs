@@ -1,5 +1,4 @@
 // src/backend/session.rs — libseat session management.
-
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
@@ -48,7 +47,7 @@ extern "C" fn on_enable_seat(_seat: *mut LibseatOpaque, userdata: *mut SeatUserD
         (*userdata).enabled = true;
         (*userdata).enable_pending = true;
     }
-    log::info!("libseat: seat enabled");
+    tracing::info!("libseat: seat enabled");
 }
 
 extern "C" fn on_disable_seat(_seat: *mut LibseatOpaque, userdata: *mut SeatUserData) {
@@ -59,7 +58,7 @@ extern "C" fn on_disable_seat(_seat: *mut LibseatOpaque, userdata: *mut SeatUser
         (*userdata).enabled = false;
         (*userdata).disable_pending = true;
     }
-    log::info!("libseat: seat disabled (VT switch)");
+    tracing::info!("libseat: seat disabled (VT switch)");
 }
 
 static SEAT_LISTENER: LibseatListener = LibseatListener {
@@ -117,7 +116,7 @@ impl Session {
             session.dispatch(100)?;
         }
 
-        log::info!("libseat session opened (fd={})", fd);
+        tracing::info!("libseat session opened (fd={})", fd);
         Ok(session)
     }
 
@@ -137,7 +136,7 @@ impl Session {
             anyhow::bail!(
                 "libseat_switch_session(vt={}) failed: errno {}",
                 vt,
-                unsafe { crate::sys::errno() }
+                unsafe { *libc::__errno_location() }
             );
         }
         Ok(())
@@ -157,7 +156,7 @@ impl Session {
 
         if raw_fd < 0 {
             anyhow::bail!("libseat_open_device({:?}) failed: errno {}", path, unsafe {
-                crate::sys::errno()
+                *libc::__errno_location()
             });
         }
 
@@ -167,13 +166,13 @@ impl Session {
             self.open_devices
                 .insert(path.to_path_buf(), (clone, device_id));
         } else {
-            log::warn!(
+            tracing::warn!(
                 "open_device: could not clone fd for {:?}; close tracking disabled",
                 path
             );
         }
 
-        log::debug!(
+        tracing::debug!(
             "Opened device {:?} fd={} device_id={}",
             path,
             raw_fd,
@@ -227,4 +226,10 @@ impl Drop for Session {
     }
 }
 
-// (libc FFI lives in crate::sys)
+// ── libc shim ─────────────────────────────────────────────────────────────────
+
+mod libc {
+    extern "C" {
+        pub fn __errno_location() -> *mut i32;
+    }
+}

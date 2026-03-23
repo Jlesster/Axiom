@@ -116,7 +116,7 @@ impl EglContext {
 
     pub fn create_window_surface<U>(&self, gbm_surf: &GbmSurface<U>) -> Result<EglSurface> {
         use gbm::AsRaw;
-        let raw = gbm_surf.as_raw() as egl::NativeWindowType;
+        let raw = unsafe { gbm_surf.as_raw() } as egl::NativeWindowType;
         // create_window_surface is unsafe in khronos-egl 6.
         let surf = unsafe {
             self.egl_lib

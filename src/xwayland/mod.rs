@@ -4,10 +4,11 @@ pub mod atoms;
 pub mod surface;
 pub mod wm;
 
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use std::{
     collections::HashMap,
     os::unix::{
-        io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        io::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         process::CommandExt,
     },
     process::{Child, Command},
@@ -18,18 +19,18 @@ use anyhow::{Context, Result};
 use x11rb::{
     connection::Connection,
     protocol::xproto::{
-        AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigWindow, ConfigureWindowAux,
-        ConnectionExt, CreateWindowAux, EventMask, InputFocus, PropMode, WindowClass,
+        AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux, ConnectionExt,
+        CreateWindowAux, EventMask, InputFocus, PropMode, WindowClass,
     },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as WrapperExt,
     COPY_DEPTH_FROM_PARENT, CURRENT_TIME,
 };
 
-pub use self::atoms::Atoms;
-use crate::wm::WindowId;
 pub use surface::XwaylandSurface;
 pub use wm::X11WmState;
+
+use crate::wm::WindowId;
 
 // ── Actions emitted from X11 event handling ───────────────────────────────────
 
@@ -252,7 +253,7 @@ impl XWaylandState {
             Some(c) => c.clone(),
             None => return vec![],
         };
-        let wm: &mut X11WmState = match self.wm.as_mut() {
+        let wm = match self.wm.as_mut() {
             Some(w) => w,
             None => return vec![],
         };
@@ -277,7 +278,6 @@ impl XWaylandState {
 
     pub fn set_focus(&self, x11_win: u32) {
         if let (Some(conn), Some(wm)) = (self.conn.as_ref(), self.wm.as_ref()) {
-            let conn: &RustConnection = conn;
             let _ = conn.set_input_focus(InputFocus::POINTER_ROOT, x11_win, CURRENT_TIME);
             let _ = conn.change_property32(
                 PropMode::REPLACE,
@@ -292,7 +292,6 @@ impl XWaylandState {
 
     pub fn close_window(&self, x11_win: u32) {
         if let (Some(conn), Some(wm)) = (self.conn.as_ref(), self.wm.as_ref()) {
-            let conn: &RustConnection = conn;
             let event = ClientMessageEvent::new(
                 32,
                 x11_win,
@@ -317,7 +316,7 @@ impl XWaylandState {
     /// Return the raw fd of the X11 connection for calloop registration.
     pub fn x11_fd(&self) -> Option<RawFd> {
         self.conn.as_ref().map(|c| {
-            use x11rb::connection::Connection;
+            use x11rb::connection::Connection as _;
             c.stream().as_raw_fd()
         })
     }
@@ -347,10 +346,14 @@ fn read_display_number(fd: RawFd) -> Result<u32> {
 }
 
 unsafe fn clear_cloexec(fd: RawFd) {
-    use nix::fcntl::*;
+    let fd = BorrowedFd::borrow_raw(fd);
+
     let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap_or(0);
+
     let _ = fcntl(
         fd,
-        FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags & !1)),
+        FcntlArg::F_SETFD(FdFlag::from_bits_truncate(
+            flags & !FdFlag::FD_CLOEXEC.bits(),
+        )),
     );
 }

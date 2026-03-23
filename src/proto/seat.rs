@@ -289,26 +289,26 @@ fn create_keymap_fd(keymap: &str) -> anyhow::Result<(OwnedFd, u32)> {
 
     // memfd_create(2) — available on Linux 3.17+.
     let name = CString::new("xkb-keymap").unwrap();
-    let fd: RawFd = unsafe { crate::sys::memfd_create(name.as_ptr(), crate::sys::MFD_CLOEXEC) };
+    let fd: RawFd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         anyhow::bail!("memfd_create failed: errno {}", unsafe {
-            crate::sys::errno()
+            *libc::__errno_location()
         });
     }
 
     // ftruncate to the required size.
-    if unsafe { crate::sys::ftruncate(fd, size as i64) } < 0 {
+    if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
         unsafe {
-            crate::sys::close(fd);
+            libc::close(fd);
         }
         anyhow::bail!("ftruncate failed");
     }
 
     // Write via a dup so the OwnedFd retains ownership of the original.
-    let dup_fd = unsafe { crate::sys::dup(fd) };
+    let dup_fd = unsafe { libc::dup(fd) };
     if dup_fd < 0 {
         unsafe {
-            crate::sys::close(fd);
+            libc::close(fd);
         }
         anyhow::bail!("dup failed");
     }
@@ -322,5 +322,17 @@ fn create_keymap_fd(keymap: &str) -> anyhow::Result<(OwnedFd, u32)> {
     Ok((owned, size as u32))
 }
 
-// (libc FFI lives in crate::sys)
-pub const MFD_CLOEXEC: u32 = 0x0001;
+// ── libc shim ─────────────────────────────────────────────────────────────────
+
+mod libc {
+    extern "C" {
+        pub fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
+        pub fn ftruncate(fd: i32, length: i64) -> i32;
+        pub fn close(fd: i32) -> i32;
+        pub fn dup(oldfd: i32) -> i32;
+        pub fn __errno_location() -> *mut i32;
+    }
+    pub use std::os::raw::c_char;
+    pub const MFD_CLOEXEC: u32 = 0x0001;
+    pub type off_t = i64;
+}

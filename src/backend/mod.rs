@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use std::os::unix::io::OwnedFd;
 use std::path::Path;
 
+// drm::control types used here — imported from the drm crate directly,
+// not through a re-export that doesn't exist in drm 0.12.
 use ::drm::control::{crtc, framebuffer};
 
 // ── OutputSurface extension methods ──────────────────────────────────────────

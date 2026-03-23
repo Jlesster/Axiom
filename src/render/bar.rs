@@ -131,12 +131,20 @@ fn parse_kb(l: &str) -> Option<u64> {
 }
 
 pub fn wall_time() -> String {
-    let mut ts = crate::sys::Timespec { sec: 0, nsec: 0 };
+    let mut ts = Ts { sec: 0, nsec: 0 };
     unsafe {
-        crate::sys::clock_gettime(0, &mut ts);
+        clock_gettime(0, &mut ts);
     }
     let s = ts.sec as u64 % 86400;
     format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
+}
+#[repr(C)]
+struct Ts {
+    sec: i64,
+    nsec: i64,
+}
+extern "C" {
+    fn clock_gettime(clk: i32, tp: *mut Ts) -> i32;
 }
 
 // ── DrawCtx ───────────────────────────────────────────────────────────────────

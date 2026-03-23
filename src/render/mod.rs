@@ -389,7 +389,7 @@ pub fn ortho(w: f32, h: f32) -> [f32; 9] {
     [2.0 / w, 0.0, 0.0, 0.0, -2.0 / h, 0.0, -1.0, 1.0, 1.0]
 }
 
-pub fn layer_geom(
+fn layer_geom(
     ls: &crate::proto::layer_shell::LayerSurfaceState,
     ow: i32,
     oh: i32,

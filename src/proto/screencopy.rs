@@ -1,4 +1,19 @@
 // src/proto/screencopy.rs — zwlr-screencopy-v1
+//
+// Lets clients (grim, wayshot, OBS via wlr-obs-source, slurp, etc.) capture
+// the compositor framebuffer into a wl_shm buffer.
+//
+// Flow:
+//   1. Client binds zwlr_screencopy_manager_v1.
+//   2. Client calls capture_output(wl_output) → zwlr_screencopy_frame_v1.
+//   3. We send buffer() event describing the required SHM buffer format.
+//   4. Client creates a wl_shm_pool + wl_buffer of the described size.
+//   5. Client calls copy(wl_buffer).
+//   6. We read back the GL framebuffer into the SHM buffer and send ready().
+//
+// The readback is synchronous on the compositor thread (glReadPixels) which
+// is fine for screenshot tools.  For streaming (OBS) this is acceptable because
+// wlr-obs-source throttles to the frame rate itself.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +31,9 @@ use crate::state::Axiom;
 // ── Frame request data ────────────────────────────────────────────────────────
 
 pub struct ScreencopyFrame {
-    pub output_id: u32,
+    pub output_id: u32, // wl_output protocol_id
     pub overlay_cursor: bool,
+    /// The wl_buffer the client passes to copy(); set on copy request.
     pub pending_buffer: Option<WlBuffer>,
     pub done: bool,
 }
@@ -63,14 +79,16 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for Axiom {
                         done: false,
                     })),
                 );
+                // Tell client what buffer dimensions we need.
                 let (w, h) = state
                     .outputs
                     .iter()
                     .find(|o| o.wl_id == out_id)
                     .map(|o| (o.width, o.height))
                     .unwrap_or((1920, 1080));
-                let stride = w * 4;
+                let stride = w * 4; // XRGB8888 = 4 bytes/pixel
                 frame_obj.buffer(wl_shm::Format::Xrgb8888, w, h, stride);
+                // For protocol v3+ also send buffer_done.
                 if frame_obj.version() >= 3 {
                     frame_obj.buffer_done();
                 }
@@ -142,6 +160,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, Arc<Mutex<ScreencopyFrame>>> for Axiom {
             }
 
             zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => {
+                // Treat as a regular copy — send the whole buffer.
                 let mut frame = data.lock().unwrap();
                 if frame.done {
                     frame_obj.failed();
@@ -154,6 +173,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, Arc<Mutex<ScreencopyFrame>>> for Axiom {
                     tracing::warn!("screencopy copy_with_damage: {e}");
                     frame_obj.failed();
                 } else {
+                    // Report entire buffer as damaged.
                     let frame = data.lock().unwrap();
                     let (w, h) = state
                         .outputs
@@ -200,7 +220,8 @@ fn do_copy(
     let surf = unsafe { &*surf_ptr };
     surf.make_current(&state.backend.egl)?;
 
-    // Re-render so the capture is always up to date.
+    // Read pixels from the current GL framebuffer.
+    // We re-render first so the capture is always up to date.
     state.render.render_output(
         &state.wm,
         &state.anim,
@@ -215,51 +236,29 @@ fn do_copy(
             .unwrap_or(0),
     );
 
-    // Map the SHM pool and write pixels at the correct offset within it.
-    //
-    // FIX: previously `offset` was passed directly as the mmap file offset,
-    // which is wrong when the buffer does not start at byte 0 of the pool.
-    // The correct approach is to map the entire pool from offset 0 and then
-    // advance the pointer by the buffer's offset within the pool.
-    // mmap(2) requires the offset to be page-aligned; mapping from 0 always
-    // satisfies that constraint.
     let pool = shm.pool.lock().unwrap();
-    let pool_size = pool.size;
-    let buf_offset = shm.offset as usize;
     let byte_len = (shm.stride * shm.height) as usize;
+    let offset = shm.offset as usize;
 
-    if buf_offset + byte_len > pool_size {
-        anyhow::bail!(
-            "screencopy: buffer offset+size ({}) exceeds pool size ({})",
-            buf_offset + byte_len,
-            pool_size
-        );
-    }
-
-    // Map the whole pool from offset 0.
-    let map_ptr = unsafe {
+    let ptr = unsafe {
         crate::sys::mmap(
             std::ptr::null_mut(),
-            pool_size,
+            byte_len,
             crate::sys::PROT_READ | crate::sys::PROT_WRITE,
             crate::sys::MAP_SHARED,
             pool.fd_raw(),
-            0, // always map from the start of the fd
+            offset as i64,
         )
     };
-    if map_ptr == crate::sys::MAP_FAILED {
+    if ptr == crate::sys::MAP_FAILED {
         anyhow::bail!("screencopy mmap failed");
     }
 
     unsafe {
-        // Advance by buf_offset to reach the start of this buffer within the pool.
-        let pixel_ptr = (map_ptr as *mut u8).add(buf_offset) as *mut std::ffi::c_void;
-
-        gl::ReadPixels(0, 0, w, h, gl::BGRA, gl::UNSIGNED_BYTE, pixel_ptr);
-
+        gl::ReadPixels(0, 0, w, h, gl::BGRA, gl::UNSIGNED_BYTE, ptr);
         // GL reads bottom-up; flip vertically in-place.
         let row_bytes = shm.stride as usize;
-        let pixels = std::slice::from_raw_parts_mut(pixel_ptr as *mut u8, byte_len);
+        let pixels = std::slice::from_raw_parts_mut(ptr as *mut u8, byte_len);
         let mut tmp = vec![0u8; row_bytes];
         for row in 0..(h as usize / 2) {
             let top = row * row_bytes;
@@ -268,10 +267,10 @@ fn do_copy(
             pixels.copy_within(bot..bot + row_bytes, top);
             pixels[bot..bot + row_bytes].copy_from_slice(&tmp);
         }
-
-        crate::sys::munmap(map_ptr, pool_size);
+        crate::sys::munmap(ptr, byte_len);
     }
 
+    // Timestamp: milliseconds since compositor start.
     let now = state.now_ms();
     let tv_sec = now / 1000;
     let tv_nsec = (now % 1000) * 1_000_000;

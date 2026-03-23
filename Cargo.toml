@@ -7,10 +7,6 @@ edition = "2021"
 name = "axiom"
 path = "src/main.rs"
 
-[[bin]]
-name = "axctl"
-path = "src/bin/axiomctl.rs"
-
 [dependencies]
 # ── Wayland ───────────────────────────────────────────────────────────────────
 wayland-server        = "0.31"
@@ -36,22 +32,6 @@ calloop-wayland-source = "0.2"
 # ── Scripting ─────────────────────────────────────────────────────────────────
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 
-# ── XWayland ──────────────────────────────────────────────────────────────────
-# We manage the XWayland process ourselves and speak the XWMCP socket protocol.
-# x11rb gives us a pure-Rust X11 client to pair X windows with Wayland surfaces.
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "composite", "damage", "randr", "render", "shm", "xfixes", "xinput", "xtest"] }
-
-# ── IPC ───────────────────────────────────────────────────────────────────────
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
-
-# ── Screen capture / Portal ───────────────────────────────────────────────────
-# PipeWire 0.8 has a libspa binding bug on some distros — we use zwlr-screencopy
-# directly for grim/wayshot and provide a D-Bus portal via zbus for browser
-# screen-share. PipeWire streaming is stubbed until libspa stabilises.
-zbus  = { version = "4", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "net"] }
-
 # ── Logging ───────────────────────────────────────────────────────────────────
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -60,8 +40,11 @@ log                = "0.4"
 # ── Misc ──────────────────────────────────────────────────────────────────────
 anyhow   = "1"
 bytemuck = "1"
-nix      = { version = "0.28", features = ["process", "signal", "fs", "socket"] }
-rustix   = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "shm"] }
+serde_json = "1.0.149"
+serde = { version = "1.0.228", features = ["derive"] }
+x11rb = "0.13.2"
+nix = { version = "0.31.2", features = ["socket", "fs", "process"] }
+fcntl = "0.1.0"
 
 [build-dependencies]
 pkg-config = "0.3"

@@ -20,13 +20,10 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
+    path::PathBuf,
 };
 
-// axiomctl is a standalone binary — it can't depend on the axiom crate
-// directly. We re-declare only what we need for the wire protocol.
-
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]

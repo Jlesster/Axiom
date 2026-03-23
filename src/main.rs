@@ -3,7 +3,6 @@
 mod backend;
 mod input;
 mod ipc;
-mod portal;
 mod proto;
 mod render;
 mod scripting;
@@ -33,13 +32,11 @@ use wayland_server::{backend::ClientData as WlClientData, Display};
 use crate::{
     backend::Backend,
     input::InputState,
-    ipc::IpcServer,
     proto::seat::SeatState,
     render::RenderState,
     scripting::ScriptEngine,
     state::{Axiom, GrabKind, OutputState},
     wm::{anim::AnimSet, WmConfig, WmState},
-    xwayland::{X11Action, XWaylandState},
 };
 
 struct NoopClientData;
@@ -64,6 +61,7 @@ fn main() -> Result<()> {
     let loop_handle = event_loop.handle();
 
     let session = backend::session::Session::open()?;
+
     let gpu_path = find_primary_gpu()?;
     tracing::info!("GPU: {gpu_path:?}");
     let mut backend = Backend::open(&gpu_path, session)?;
@@ -98,22 +96,7 @@ fn main() -> Result<()> {
     let seat = SeatState::new();
 
     // ── IPC server ────────────────────────────────────────────────────────────
-    let ipc = IpcServer::bind(&socket_name).unwrap_or_else(|e| {
-        tracing::warn!("IPC socket unavailable: {e}");
-        IpcServer::bind("0").expect("IPC fallback bind")
-    });
-
-    // ── XWayland ──────────────────────────────────────────────────────────────
-    let mut xwayland = XWaylandState::new();
-    if let Err(e) = xwayland.start(&socket_name, sw, sh) {
-        tracing::warn!("XWayland unavailable: {e}");
-    }
-
-    // ── Portal ────────────────────────────────────────────────────────────────
-    let portal = portal::spawn_portal().ok();
-    if portal.is_none() {
-        tracing::warn!("xdg-desktop-portal backend failed to start (D-Bus unavailable?)");
-    }
+    let ipc = ipc::IpcServer::bind(&socket_name)?;
 
     let running = Arc::new(AtomicBool::new(true));
     let outputs: Vec<OutputState> = outputs_raw
@@ -145,30 +128,21 @@ fn main() -> Result<()> {
         wm,
         anim: AnimSet::new(),
         script,
+        ipc,
         outputs,
         surface_map: Default::default(),
         toplevel_map: Default::default(),
         pending_windows: Default::default(),
         closing_windows: Default::default(),
         layer_surfaces: Default::default(),
-        ipc,
-        idle_inhibit: crate::proto::idle_inhibit::IdleInhibitState::new(),
-        xwayland,
-        portal,
+        idle_inhibit: proto::idle_inhibit::IdleInhibitState::new(),
+        xwayland: xwayland::XWaylandState::new(),
         running: Arc::clone(&running),
         handle: loop_handle.clone(),
         start_time: Instant::now(),
         needs_redraw: true,
         grab: GrabKind::None,
     };
-
-    // ── Register all monitors with the WM ─────────────────────────────────────
-    for (i, out) in state.outputs.iter().enumerate() {
-        let x_off: i32 = state.outputs[..i].iter().map(|o| o.width as i32).sum();
-        state
-            .wm
-            .add_monitor(out.wl_id, x_off, 0, out.width as i32, out.height as i32);
-    }
 
     // ── Initial modeset ───────────────────────────────────────────────────────
     for out in &mut state.outputs {
@@ -188,23 +162,22 @@ fn main() -> Result<()> {
             Ok(fb) => {
                 if let Ok(res) = state.backend.drm.resource_handles() {
                     let conn = res.connectors().iter().find_map(|&ch| {
-                        state
-                            .backend
-                            .drm
-                            .get_connector(ch, false)
-                            .ok()
-                            .and_then(|c| {
+                        state.backend.drm.get_connector(ch, false).ok().and_then(
+                            |c: ::drm::control::connector::Info| {
                                 let matches = c
                                     .current_encoder()
                                     .and_then(|eh| state.backend.drm.get_encoder(eh).ok())
-                                    .map(|enc| enc.crtc() == Some(out.render_surf.crtc))
+                                    .map(|enc: ::drm::control::encoder::Info| {
+                                        enc.crtc() == Some(out.render_surf.crtc)
+                                    })
                                     .unwrap_or(false);
                                 if matches {
                                     Some(ch)
                                 } else {
                                     None
                                 }
-                            })
+                            },
+                        )
                     });
                     if let Some(conn_h) = conn {
                         let mode = out.render_surf.mode;
@@ -229,19 +202,24 @@ fn main() -> Result<()> {
     // ── Hardware cursor ───────────────────────────────────────────────────────
     match render::cursor::HwCursor::load(&state.backend.drm) {
         Ok(cur) => {
+            tracing::info!("hardware cursor loaded");
             for out in &state.outputs {
                 cur.set_on_crtc(&state.backend.drm, out.render_surf.crtc, 0, 0);
             }
             state.input.hw_cursor_active = true;
             state.render.hw_cursor = Some(cur);
-            tracing::info!("hardware cursor loaded");
         }
         Err(e) => tracing::warn!("hardware cursor unavailable ({e}), using software fallback"),
     }
 
-    // ── Event sources ─────────────────────────────────────────────────────────
+    for (i, out) in state.outputs.iter().enumerate().skip(1) {
+        let x_offset: i32 = state.outputs[..i].iter().map(|o| o.width as i32).sum();
+        state
+            .wm
+            .add_monitor(out.wl_id, x_offset, 0, out.width as i32, out.height as i32);
+    }
 
-    // Wayland display fd.
+    // ── Event sources ─────────────────────────────────────────────────────────
     {
         let poll_fd = display.backend().poll_fd().as_raw_fd();
         event_loop.handle().insert_source(
@@ -253,8 +231,6 @@ fn main() -> Result<()> {
             |_, _, _state| Ok(PostAction::Continue),
         )?;
     }
-
-    // Wayland listener (new client connections).
     {
         let listener_fd = listener.as_raw_fd();
         event_loop.handle().insert_source(
@@ -274,8 +250,6 @@ fn main() -> Result<()> {
             },
         )?;
     }
-
-    // DRM page-flip events.
     {
         let drm_fd = state.backend.drm.as_raw_fd();
         event_loop.handle().insert_source(
@@ -285,12 +259,10 @@ fn main() -> Result<()> {
                 Mode::Level,
             ),
             |_, _, state| {
-                state.backend.drm.handle_events(|crtc| {
+                state.backend.dispatch_drm_events(|crtc| {
                     for out in &mut state.outputs {
                         if out.render_surf.crtc == crtc {
-                            out.render_surf.on_flip_complete(&state.backend.drm);
                             out.frame_pending = false;
-                            tracing::debug!("page-flip complete for crtc {:?}", crtc);
                         }
                     }
                     state.needs_redraw = true;
@@ -299,8 +271,6 @@ fn main() -> Result<()> {
             },
         )?;
     }
-
-    // libinput events.
     {
         let li_fd = state.input.as_raw_fd();
         event_loop.handle().insert_source(
@@ -315,8 +285,6 @@ fn main() -> Result<()> {
             },
         )?;
     }
-
-    // libseat session events.
     {
         let seat_fd = state.backend.session.fd;
         event_loop.handle().insert_source(
@@ -346,68 +314,20 @@ fn main() -> Result<()> {
             },
         )?;
     }
-
-    // XWayland X11 connection fd (if started successfully).
-    if let Some(x11_fd) = state.xwayland.x11_fd() {
+    {
+        let ipc_fd = state.ipc.as_raw_fd();
         event_loop.handle().insert_source(
             Generic::new(
-                unsafe { calloop::generic::FdWrapper::new(x11_fd) },
+                unsafe { calloop::generic::FdWrapper::new(ipc_fd) },
                 Interest::READ,
                 Mode::Level,
             ),
             |_, _, state| {
-                let actions = state.xwayland.dispatch_events();
-                for action in actions {
-                    match action {
-                        X11Action::MapWindow { .. } => state.map_xwayland_window(action),
-                        X11Action::UnmapWindow { x11_win } => state.unmap_xwayland_window(x11_win),
-                        X11Action::ConfigureRequest {
-                            x11_win,
-                            x,
-                            y,
-                            w,
-                            h,
-                        } => {
-                            if let Some(&wl_id) = state.xwayland.x11_to_wl.get(&x11_win) {
-                                if let Some(win) = state.wm.windows.get_mut(&wl_id) {
-                                    if win.floating {
-                                        if let Some(nx) = x {
-                                            win.rect.x = nx;
-                                        }
-                                        if let Some(ny) = y {
-                                            win.rect.y = ny;
-                                        }
-                                        if let Some(nw) = w {
-                                            win.rect.w = nw as i32;
-                                        }
-                                        if let Some(nh) = h {
-                                            win.rect.h = nh as i32;
-                                        }
-                                        win.float_rect = win.rect;
-                                    }
-                                }
-                                state.needs_redraw = true;
-                            }
-                        }
-                        X11Action::TitleChanged { x11_win, title } => {
-                            if let Some(&wl_id) = state.xwayland.x11_to_wl.get(&x11_win) {
-                                state.wm.set_title(wl_id, title);
-                            }
-                        }
-                        X11Action::FocusRequest { x11_win } => {
-                            if let Some(&wl_id) = state.xwayland.x11_to_wl.get(&x11_win) {
-                                state.wm.focus_window(wl_id);
-                                state.sync_keyboard_focus();
-                            }
-                        }
-                    }
-                }
+                ipc::drain_ipc(state);
                 Ok(PostAction::Continue)
             },
         )?;
     }
-
-    // Signals.
     event_loop.handle().insert_source(
         Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap(),
         |_, _, state| {
@@ -428,134 +348,76 @@ fn main() -> Result<()> {
             state.needs_redraw = true;
         }
         state.script.tick(&state.wm);
-        let actions: Vec<_> = std::mem::take(&mut *state.script.queue.lock().unwrap());
-        crate::scripting::lua_api::apply_actions(&mut state, actions);
 
-        if state.idle_inhibit.inhibited() {
-            reset_dpms_timer();
+        // Drain script actions: pull the queue out first to avoid a
+        // simultaneous mutable borrow of both state.script and state.
+        {
+            let actions: Vec<scripting::lua_api::LuaAction> =
+                std::mem::take(&mut *state.script.queue.lock().unwrap());
+            scripting::lua_api::drain_actions(actions, &mut state);
         }
-
-        state.poll_portal_requests();
-        crate::ipc::drain_ipc(&mut state);
 
         if state.needs_redraw {
             render_all(&mut state);
             state.needs_redraw = false;
         }
-
         if let Err(e) = state.display.flush_clients() {
             tracing::warn!("flush_clients: {e}");
         }
     }
 
     tracing::info!("Axiom shutdown");
-
-    if let Some(mut child) = state.xwayland.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
     Ok(())
 }
 
-// ── render_all ────────────────────────────────────────────────────────────────
-
 fn render_all(state: &mut Axiom) {
     let n = state.outputs.len();
-    let (cx, cy) = (state.input.pointer_x as i32, state.input.pointer_y as i32);
+    let cx = state.input.pointer_x as i32;
+    let cy = state.input.pointer_y as i32;
 
     for idx in 0..n {
         if state.outputs[idx].frame_pending {
-            tracing::debug!("render_all: output {} skipped (frame_pending)", idx);
             continue;
         }
 
-        // Make the EGL context current before rendering.
-        // We access render_surf by index each time rather than holding a raw
-        // pointer alias alongside a mutable borrow of state — that was UB.
-        if state.outputs[idx]
-            .render_surf
-            .make_current(&state.backend.egl)
-            .is_err()
-        {
+        let surf_ptr = &state.outputs[idx].render_surf as *const backend::OutputSurface;
+        let surf = unsafe { &*surf_ptr };
+
+        if surf.make_current(&state.backend.egl).is_err() {
             continue;
         }
 
-        // Move hardware cursor before rendering so it's in the right place.
         if let Some(ref hw) = state.render.hw_cursor {
-            let crtc = state.outputs[idx].render_surf.crtc;
-            hw.move_on_crtc(&state.backend.drm, crtc, cx, cy);
+            hw.move_on_crtc(&state.backend.drm, surf.crtc, cx, cy);
         }
 
-        // Collect the output dimensions we need for the portal path.
-        let (out_w, out_h) = (state.outputs[idx].width, state.outputs[idx].height);
+        state.render.render_output(
+            &state.wm,
+            &state.anim,
+            &state.input,
+            &state.outputs,
+            &state.layer_surfaces,
+            surf,
+            idx,
+        );
 
-        // Render. We pass a shared reference to the surface obtained via a
-        // fresh index borrow — no raw pointers needed.
-        {
-            let surf = &state.outputs[idx].render_surf;
-            state.render.render_output(
-                &state.wm,
-                &state.anim,
-                &state.input,
-                &state.outputs,
-                &state.layer_surfaces,
-                surf,
-                idx,
-            );
-        }
-
-        // Portal frame capture (best-effort; errors are non-fatal).
-        let portal_tx = state.portal.as_ref().map(|p| p.tx.clone());
-        if let Some(tx) = portal_tx {
-            if let Some(pixels) = state.read_output_pixels(idx) {
-                let _ = tx.try_send(crate::portal::PortalEvent::Frame {
-                    pixels,
-                    width: out_w,
-                    height: out_h,
-                });
-            }
-        }
-
-        // Present (eglSwapBuffers + lock_front_buffer + add_framebuffer).
-        let fb_id = match state.outputs[idx]
-            .render_surf
-            .present(&state.backend.egl, &state.backend.drm)
-        {
+        let surf_mut = &mut state.outputs[idx].render_surf;
+        let fb_id = match surf_mut.present(&state.backend.egl, &state.backend.drm) {
             Ok(id) => id,
             Err(e) => {
                 tracing::warn!("present: {e}");
                 continue;
             }
         };
-
-        // Queue page flip.
-        match state.outputs[idx]
-            .render_surf
-            .page_flip(&state.backend.drm, fb_id)
-        {
-            Err(e) => tracing::warn!("page_flip: {e}"),
-            Ok(()) => {
-                state.outputs[idx].frame_pending = true;
-                tracing::debug!("render_all: output {} flip submitted", idx);
-            }
+        if let Err(e) = surf_mut.page_flip(&state.backend.drm, fb_id) {
+            tracing::warn!("page_flip: {e}");
+        } else {
+            state.outputs[idx].frame_pending = true;
         }
     }
 }
 
-// ── DPMS idle inhibit ─────────────────────────────────────────────────────────
-
-fn reset_dpms_timer() {}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
 fn find_primary_gpu() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("DRM_DEVICE") {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
     for n in 0..8u32 {
         let p = PathBuf::from(format!("/dev/dri/card{n}"));
         if p.exists() {
