@@ -67,11 +67,15 @@ impl SeatState {
     }
 
     pub fn set_keyboard_focus(&mut self, surface: Option<WlSurface>) {
+        // Send leave to the old surface, but only to keyboards owned by the
+        // same client as that surface — sending cross-client events panics in
+        // wayland-backend ("Attempting to send an event with objects from wrong client").
         if let Some(ref old) = self.keyboard_focus.take() {
             if old.is_alive() {
                 let serial = self.next_serial();
+                let old_client = old.client();
                 for kb in &self.keyboards {
-                    if kb.is_alive() {
+                    if kb.is_alive() && kb.client() == old_client {
                         kb.leave(serial, old);
                     }
                 }
@@ -82,10 +86,11 @@ impl SeatState {
         if let Some(ref surf) = surface {
             if surf.is_alive() {
                 let serial = self.next_serial();
+                let surf_client = surf.client();
                 // keys is a wl_array of currently-pressed keycodes as raw bytes
                 let keys: Vec<u8> = Vec::new();
                 for kb in &self.keyboards {
-                    if kb.is_alive() {
+                    if kb.is_alive() && kb.client() == surf_client {
                         kb.enter(serial, surf, keys.clone());
                         self.send_modifiers_to(kb);
                     }
@@ -97,10 +102,24 @@ impl SeatState {
 
     // ── Key events ────────────────────────────────────────────────────────────
 
-    pub fn send_key(&self, time: u32, keycode: u32, state: wl_keyboard::KeyState) {
+    pub fn send_key(&mut self, time: u32, keycode: u32, state: wl_keyboard::KeyState) {
+        let serial = self.next_serial();
+        // Only forward to the keyboard belonging to the focused surface's client.
+        let focus_client =
+            self.keyboard_focus
+                .as_ref()
+                .and_then(|s| if s.is_alive() { s.client() } else { None });
         for kb in &self.keyboards {
             if kb.is_alive() {
-                kb.key(self.serial, time, keycode, state);
+                // If we have a focused surface, gate on matching client.
+                // If no surface is focused, send to all (e.g. unfocused key release).
+                let client_ok = focus_client
+                    .as_ref()
+                    .map(|fc| kb.client().as_ref() == Some(fc))
+                    .unwrap_or(true);
+                if client_ok {
+                    kb.key(serial, time, keycode, state);
+                }
             }
         }
     }
@@ -130,8 +149,9 @@ impl SeatState {
         if let Some((ref old_surf, _, _)) = self.pointer_focus.take() {
             if old_surf.is_alive() {
                 let serial = self.next_serial();
+                let old_client = old_surf.client();
                 for ptr in &self.pointers {
-                    if ptr.is_alive() {
+                    if ptr.is_alive() && ptr.client() == old_client {
                         ptr.leave(serial, old_surf);
                     }
                 }
@@ -140,8 +160,9 @@ impl SeatState {
         if let Some(ref surf) = surface {
             if surf.is_alive() {
                 let serial = self.next_serial();
+                let surf_client = surf.client();
                 for ptr in &self.pointers {
-                    if ptr.is_alive() {
+                    if ptr.is_alive() && ptr.client() == surf_client {
                         ptr.enter(serial, surf, sx, sy);
                     }
                 }

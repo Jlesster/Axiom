@@ -38,6 +38,7 @@ dependencies = [
  "gl",
  "input",
  "khronos-egl",
+ "libc",
  "libloading",
  "log",
  "mlua",

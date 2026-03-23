@@ -19,19 +19,16 @@ mod sys {
             offset: i64,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
-        pub fn eglGetCurrentDisplay() -> *mut c_void;
+    }
+    #[link(name = "EGL")]
+    extern "C" {
         pub fn eglGetProcAddress(name: *const u8) -> *mut c_void;
     }
     pub const PROT_READ: i32 = 0x1;
     pub const MAP_SHARED: i32 = 0x01;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut _;
-
-    pub unsafe fn egl_get_current_display() -> *mut c_void {
-        eglGetCurrentDisplay()
-    }
 }
 
-/// Look up an EGL/GL extension function by NUL-terminated name.
 unsafe fn egl_proc(name: &[u8]) -> Option<*mut std::ffi::c_void> {
     let p = unsafe { sys::eglGetProcAddress(name.as_ptr()) };
     if p.is_null() {
@@ -40,6 +37,10 @@ unsafe fn egl_proc(name: &[u8]) -> Option<*mut std::ffi::c_void> {
         Some(p)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GlProgram
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct GlProgram {
     pub id: u32,
@@ -113,11 +114,9 @@ unsafe fn compile_shader(kind: u32, src: &str) -> Result<u32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// src/render/gl_util.rs — VAO/VBO for a unit quad.
+// QuadVao
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A VAO+VBO that holds a unit [0,1]² quad.
-/// Vertex layout: vec2 position (a_pos), vec2 uv (a_uv).
 pub struct QuadVao {
     vao: u32,
     vbo: u32,
@@ -125,14 +124,12 @@ pub struct QuadVao {
 
 impl QuadVao {
     pub fn new() -> Self {
-        // Interleaved: pos(2) + uv(2)
         #[rustfmt::skip]
         let verts: [f32; 24] = [
             // pos       uv
             0.0, 0.0,  0.0, 0.0,
             1.0, 0.0,  1.0, 0.0,
             1.0, 1.0,  1.0, 1.0,
-
             0.0, 0.0,  0.0, 0.0,
             1.0, 1.0,  1.0, 1.0,
             0.0, 1.0,  0.0, 1.0,
@@ -151,10 +148,8 @@ impl QuadVao {
                 gl::STATIC_DRAW,
             );
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
-            // a_pos
             gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, stride, 0 as _);
             gl::EnableVertexAttribArray(0);
-            // a_uv
             gl::VertexAttribPointer(
                 1,
                 2,
@@ -188,11 +183,18 @@ impl Drop for QuadVao {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// src/render/texture.rs — GL texture from wl_buffer.
+// GlTexture
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Owns a single GL texture name.
+///
+/// For DMA-BUF surfaces we also keep the `EglImage` alive alongside the
+/// texture — `eglDestroyImageKHR` must NOT be called until the texture is
+/// deleted.
 pub struct GlTexture {
     pub id: u32,
+    /// Kept alive so the driver's EGLImage → texture binding remains valid.
+    _egl_image: Option<crate::backend::egl::EglImage>,
 }
 
 impl GlTexture {
@@ -201,10 +203,21 @@ impl GlTexture {
         unsafe {
             gl::GenTextures(1, &mut id);
         }
-        Self { id }
+        Self {
+            id,
+            _egl_image: None,
+        }
     }
 
-    pub fn upload_buffer(&mut self, buf: &RawBuffer, w: i32, h: i32) {
+    /// Called by the SHM upload path in render/mod.rs after a TexImage2D call
+    /// to invalidate any stale EGLImage from a previous DMA-BUF commit on
+    /// the same texture slot.
+    pub fn clear_egl_image(&mut self) {
+        self._egl_image = None;
+    }
+
+    /// Upload from a SHM or DMA-BUF `RawBuffer`.
+    pub fn upload_buffer(&mut self, buf: &RawBuffer, egl: &crate::backend::egl::EglContext) {
         match buf {
             RawBuffer::Shm {
                 pool_fd,
@@ -214,115 +227,153 @@ impl GlTexture {
                 stride,
                 format: _,
             } => {
-                let size = (*stride * *height) as usize;
-                let ptr = unsafe {
-                    sys::mmap(
-                        std::ptr::null_mut(),
-                        size,
-                        sys::PROT_READ,
-                        sys::MAP_SHARED,
-                        *pool_fd,
-                        *offset as i64,
-                    )
-                };
-                if ptr == sys::MAP_FAILED {
-                    tracing::warn!("mmap SHM pool failed");
-                    return;
-                }
-                unsafe {
-                    gl::BindTexture(gl::TEXTURE_2D, self.id);
-                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
-                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-                    gl::TexImage2D(
-                        gl::TEXTURE_2D,
-                        0,
-                        gl::RGBA as i32,
-                        *width,
-                        *height,
-                        0,
-                        gl::BGRA,
-                        gl::UNSIGNED_BYTE,
-                        ptr,
-                    );
-                    gl::BindTexture(gl::TEXTURE_2D, 0);
-                    sys::munmap(ptr, size);
-                }
+                self.upload_shm(*pool_fd, *width, *height, *stride, *offset);
             }
             RawBuffer::Dmabuf {
                 fds,
+                offsets,
                 strides,
+                modifier,
                 width,
                 height,
                 format,
                 ..
             } => {
-                self.import_dmabuf(fds[0], *width, *height, *format, strides[0]);
+                let mod_hi = (*modifier >> 32) as u32;
+                let mod_lo = (*modifier & 0xFFFF_FFFF) as u32;
+                self.upload_dmabuf(
+                    egl,
+                    fds,
+                    offsets,
+                    strides,
+                    mod_hi,
+                    mod_lo,
+                    *width as u32,
+                    *height as u32,
+                    *format,
+                );
             }
         }
     }
 
-    fn import_dmabuf(&mut self, fd: i32, w: i32, h: i32, fmt: u32, stride: u32) {
-        type V = std::ffi::c_void;
-        type CreateFn = unsafe extern "C" fn(*mut V, *mut V, u32, *mut V, *const i32) -> *mut V;
-        type DestroyFn = unsafe extern "C" fn(*mut V, *mut V);
-        type TargetFn = unsafe extern "C" fn(u32, *mut V);
+    // ── SHM upload ────────────────────────────────────────────────────────────
 
-        const DMA_BUF: u32 = 0x3270;
-        let attribs: [i32; 13] = [
-            0x3057,
-            w,
-            0x3056,
-            h,
-            0x3271,
-            fmt as i32,
-            0x3272,
-            fd,
-            0x3273,
-            0,
-            0x3274,
-            stride as i32,
-            0x3038,
-        ];
-
+    fn upload_shm(&mut self, pool_fd: i32, width: i32, height: i32, stride: i32, offset: i32) {
+        let size = (stride * height) as usize;
+        let ptr = unsafe {
+            sys::mmap(
+                std::ptr::null_mut(),
+                size,
+                sys::PROT_READ,
+                sys::MAP_SHARED,
+                pool_fd,
+                offset as i64,
+            )
+        };
+        if ptr == sys::MAP_FAILED {
+            tracing::warn!("mmap SHM pool failed");
+            return;
+        }
         unsafe {
-            let Some(create) = egl_proc(b"eglCreateImageKHR\0") else {
-                return;
-            };
-            let Some(destroy) = egl_proc(b"eglDestroyImageKHR\0") else {
-                return;
-            };
-            let Some(target) = egl_proc(b"glEGLImageTargetTexture2DOES\0") else {
-                return;
-            };
-            let create: CreateFn = std::mem::transmute(create);
-            let destroy: DestroyFn = std::mem::transmute(destroy);
-            let target: TargetFn = std::mem::transmute(target);
-            let dpy = sys::egl_get_current_display();
-            let img = create(
-                dpy,
-                std::ptr::null_mut(),
-                DMA_BUF,
-                std::ptr::null_mut(),
-                attribs.as_ptr(),
+            gl::BindTexture(gl::TEXTURE_2D, self.id);
+            Self::set_tex_params();
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as i32,
+                width,
+                height,
+                0,
+                gl::BGRA,
+                gl::UNSIGNED_BYTE,
+                ptr,
             );
-            if img.is_null() {
-                tracing::warn!("eglCreateImageKHR failed");
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            sys::munmap(ptr, size);
+        }
+        self._egl_image = None;
+    }
+
+    // ── DMA-BUF upload ───────────────────────────────────────────────────────
+
+    fn upload_dmabuf(
+        &mut self,
+        egl: &crate::backend::egl::EglContext,
+        fds: &[i32],
+        offsets: &[u32],
+        strides: &[u32],
+        modifier_hi: u32,
+        modifier_lo: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) {
+        let n_planes = fds.len().min(offsets.len()).min(strides.len());
+        let planes: Vec<crate::backend::egl::DmaBufPlane> = (0..n_planes)
+            .map(|i| crate::backend::egl::DmaBufPlane {
+                fd: fds[i],
+                offset: offsets[i],
+                stride: strides[i],
+                modifier_hi,
+                modifier_lo,
+            })
+            .collect();
+
+        let egl_image = match egl.import_dmabuf(width, height, format, &planes) {
+            Some(img) => img,
+            None => {
+                tracing::error!(
+                    "DMA-BUF import failed: format={:#010x} {}x{} {} planes",
+                    format,
+                    width,
+                    height,
+                    n_planes
+                );
                 return;
             }
+        };
+
+        type TargetFn = unsafe extern "C" fn(u32, *mut std::ffi::c_void);
+        let target_fn: TargetFn = unsafe {
+            match egl_proc(b"glEGLImageTargetTexture2DOES\0") {
+                Some(p) => std::mem::transmute(p),
+                None => {
+                    tracing::error!("glEGLImageTargetTexture2DOES not available");
+                    return;
+                }
+            }
+        };
+
+        unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.id);
-            target(gl::TEXTURE_2D, img);
+            target_fn(gl::TEXTURE_2D, egl_image.raw());
+            Self::set_tex_params();
             gl::BindTexture(gl::TEXTURE_2D, 0);
-            destroy(dpy, img);
         }
+
+        let gl_err = unsafe { gl::GetError() };
+        if gl_err != gl::NO_ERROR {
+            tracing::error!("GL error 0x{:x} after glEGLImageTargetTexture2DOES", gl_err);
+            return;
+        }
+
+        self._egl_image = Some(egl_image);
+    }
+
+    unsafe fn set_tex_params() {
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
     }
 }
 
 impl Drop for GlTexture {
     fn drop(&mut self) {
+        // Delete the GL texture first so the driver can release internal refs.
         unsafe {
             gl::DeleteTextures(1, &self.id);
         }
+        // _egl_image drops here → eglDestroyImageKHR.
     }
 }

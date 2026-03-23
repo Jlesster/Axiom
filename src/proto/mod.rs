@@ -46,7 +46,11 @@ pub fn register_globals(dh: &DisplayHandle) {
     dh.create_global::<crate::state::Axiom, ZwlrLayerShellV1, _>(4, ());
     dh.create_global::<crate::state::Axiom, ZxdgDecorationManagerV1, _>(1, ());
     dh.create_global::<crate::state::Axiom, ZxdgOutputManagerV1, _>(3, ());
-    dh.create_global::<crate::state::Axiom, ZwpLinuxDmabufV1, _>(4, ());
+    // Version 3 only — v4 adds zwp_linux_dmabuf_feedback_v1 which we don't
+    // implement. Advertising v4 causes clients (waybar, etc.) to request
+    // feedback objects, and wayland-backend panics when the handler doesn't
+    // call init.init() on the new object id.
+    dh.create_global::<crate::state::Axiom, ZwpLinuxDmabufV1, _>(3, ());
     dh.create_global::<crate::state::Axiom, ZwlrScreencopyManagerV1, _>(3, ());
     dh.create_global::<crate::state::Axiom, WpFractionalScaleManagerV1, _>(1, ());
     dh.create_global::<crate::state::Axiom, WpViewporter, _>(1, ());

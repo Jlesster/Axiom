@@ -1,14 +1,9 @@
 // src/proto/dmabuf.rs — zwp_linux_dmabuf_v1 / zwp_linux_buffer_params_v1.
 //
-// Hardware clients (GPU-rendered apps, video players, screen capture) submit
-// buffers as DMA-BUF fds rather than SHM.  We import them as EGLImage and
-// bind as GL textures.
-//
-// The protocol flow is:
-//   1. Client binds zwp_linux_dmabuf_v1 → we advertise supported formats.
-//   2. Client calls create_params → zwp_linux_buffer_params_v1.
-//   3. Client calls add() for each plane, then create()/create_immed().
-//   4. We call eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) → wl_buffer.
+// We advertise version 3 only. Version 4 adds zwp_linux_dmabuf_feedback_v1;
+// without a Dispatch impl for that object wayland-backend panics when a client
+// requests it. Staying at v3 means the feedback requests never appear in the
+// protocol and no client will ask for them.
 
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -22,18 +17,17 @@ use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
-use crate::state::Axiom;
+use crate::{backend::egl::DmaBufPlane as EglPlane, state::Axiom};
 
 // ── Supported DRM formats ─────────────────────────────────────────────────────
-// DRM fourcc codes for formats we can import as EGLImage.
 
 const SUPPORTED_FORMATS: &[(u32, u64)] = &[
     (0x34325241, 0), // DRM_FORMAT_ARGB8888, no modifier
     (0x34325258, 0), // DRM_FORMAT_XRGB8888, no modifier
-    (0x3231564e, 0), // DRM_FORMAT_NV12, no modifier (video)
+    (0x3231564e, 0), // DRM_FORMAT_NV12,     no modifier (video)
 ];
 
-// ── DMA-BUF plane data ────────────────────────────────────────────────────────
+// ── Protocol-level plane data ─────────────────────────────────────────────────
 
 #[derive(Default)]
 pub struct DmaBufPlane {
@@ -58,15 +52,15 @@ impl Default for DmaBufParams {
     }
 }
 
-/// User data on WlBuffers created from DMA-BUF.
+// ── Per-buffer data stored on successfully imported WlBuffers ─────────────────
+
 pub struct DmaBufBuffer {
     pub width: i32,
     pub height: i32,
     pub format: u32,
     pub flags: u32,
     pub planes: Vec<DmaBufPlane>,
-    /// EGLImage handle (opaque usize so we don't pull in egl types here).
-    pub egl_image: Option<usize>,
+    pub egl_image: Arc<crate::backend::egl::EglImage>,
 }
 
 // ── zwp_linux_dmabuf_v1 global ────────────────────────────────────────────────
@@ -82,10 +76,11 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Axiom {
     ) {
         let dmabuf = data_init.init(resource, ());
 
-        // Advertise supported formats + modifiers.
+        // At v3 we advertise via modifier() if available, format() otherwise.
+        // At v3 modifier() exists; format() is the v1/v2 fallback.
         for &(format, modifier) in SUPPORTED_FORMATS {
             let mod_hi = (modifier >> 32) as u32;
-            let mod_lo = (modifier & 0xffffffff) as u32;
+            let mod_lo = (modifier & 0xffff_ffff) as u32;
             if dmabuf.version() >= 3 {
                 dmabuf.modifier(format, mod_hi, mod_lo);
             } else {
@@ -110,7 +105,15 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for Axiom {
                 data_init.init(params_id, Arc::new(Mutex::new(DmaBufParams::default())));
             }
             zwp_linux_dmabuf_v1::Request::Destroy => {}
-            _ => {}
+            // GetDefaultFeedback / GetSurfaceFeedback are v4-only requests.
+            // We advertise v3, so a well-behaved client will never send these.
+            // If one somehow does, just ignore it — the object id is never
+            // initialised so wayland-server will disconnect the client.
+            _ => {
+                tracing::warn!(
+                    "zwp_linux_dmabuf_v1: unexpected request (v4 feedback not supported)"
+                );
+            }
         }
     }
 }
@@ -146,38 +149,22 @@ impl Dispatch<ZwpLinuxBufferParamsV1, Arc<Mutex<DmaBufParams>>> for Axiom {
                         modifier_hi,
                         modifier_lo,
                     };
+                } else {
+                    tracing::warn!("dmabuf add(): plane_idx {} out of range", idx);
                 }
             }
 
             zwp_linux_buffer_params_v1::Request::Create {
-                width,
-                height,
-                format,
-                flags,
+                width: _,
+                height: _,
+                format: _,
+                flags: _,
             } => {
-                let p = data.lock().unwrap();
-                match import_dmabuf(
-                    state,
-                    &p,
-                    width,
-                    height,
-                    format,
-                    flags.into_result().map(|f| f.bits()).unwrap_or(0),
-                ) {
-                    Ok(buf) => {
-                        // Asynchronous path — emit the 'created' event with the buffer.
-                        // We can't easily init a WlBuffer here without an id, so we emit
-                        // 'failed' for the async path and recommend create_immed instead.
-                        // Full impl would use a wl_buffer factory.
-                        log::warn!("zwp_linux_dmabuf create() async path not fully implemented; use create_immed");
-                        drop(buf);
-                        params_resource.failed();
-                    }
-                    Err(e) => {
-                        log::error!("DMA-BUF import failed: {}", e);
-                        params_resource.failed();
-                    }
-                }
+                // Async create path — uncommon; tell client to use create_immed.
+                tracing::warn!(
+                    "zwp_linux_dmabuf create() async path not implemented; sending failed"
+                );
+                params_resource.failed();
             }
 
             zwp_linux_buffer_params_v1::Request::CreateImmed {
@@ -187,16 +174,25 @@ impl Dispatch<ZwpLinuxBufferParamsV1, Arc<Mutex<DmaBufParams>>> for Axiom {
                 format,
                 flags,
             } => {
-                let p = data.lock().unwrap();
+                let mut p = data.lock().unwrap();
+
+                if p.created {
+                    params_resource.post_error(
+                        zwp_linux_buffer_params_v1::Error::AlreadyUsed,
+                        "params object already used",
+                    );
+                    return;
+                }
+                p.created = true;
+
                 let flags_bits = flags.into_result().map(|f| f.bits()).unwrap_or(0);
-                match import_dmabuf(state, &p, width, height, format, flags_bits) {
+
+                match do_import(state, &p, width, height, format, flags_bits) {
                     Ok(buf) => {
                         data_init.init(buffer_id, buf);
                     }
                     Err(e) => {
-                        log::error!("DMA-BUF create_immed failed: {}", e);
-                        // post_error terminates the client connection cleanly
-                        // rather than handing back a silently broken buffer.
+                        tracing::error!("DMA-BUF create_immed failed: {}", e);
                         params_resource.post_error(
                             zwp_linux_buffer_params_v1::Error::InvalidFormat,
                             format!("DMA-BUF import failed: {e}"),
@@ -211,25 +207,47 @@ impl Dispatch<ZwpLinuxBufferParamsV1, Arc<Mutex<DmaBufParams>>> for Axiom {
     }
 }
 
-fn import_dmabuf(
+// ── Import helper ─────────────────────────────────────────────────────────────
+
+fn do_import(
     state: &mut Axiom,
     params: &DmaBufParams,
     width: i32,
     height: i32,
     format: u32,
-    flags: u32,
+    _flags: u32,
 ) -> anyhow::Result<DmaBufBuffer> {
-    // Collect valid planes.
-    let planes: Vec<DmaBufPlane> = params
+    let valid_planes: Vec<&DmaBufPlane> = params.planes.iter().filter(|p| p.fd.is_some()).collect();
+
+    if valid_planes.is_empty() {
+        anyhow::bail!("DMA-BUF params has no planes");
+    }
+
+    let egl_planes: Vec<EglPlane> = valid_planes
+        .iter()
+        .map(|p| {
+            use std::os::unix::io::AsRawFd;
+            EglPlane {
+                fd: p.fd.as_ref().unwrap().as_raw_fd(),
+                offset: p.offset,
+                stride: p.stride,
+                modifier_hi: p.modifier_hi,
+                modifier_lo: p.modifier_lo,
+            }
+        })
+        .collect();
+
+    let egl_image = state
+        .backend
+        .egl
+        .import_dmabuf(width as u32, height as u32, format, &egl_planes)
+        .ok_or_else(|| anyhow::anyhow!("eglCreateImageKHR returned NULL"))?;
+
+    let owned_planes: Vec<DmaBufPlane> = params
         .planes
         .iter()
-        .filter(|p| p.fd.is_some())
         .map(|p| DmaBufPlane {
-            fd: p.fd.as_ref().map(|fd| {
-                use std::os::unix::io::{AsFd, OwnedFd};
-                // Duplicate the fd so DmaBufBuffer owns it independently.
-                fd.try_clone().unwrap()
-            }),
+            fd: p.fd.as_ref().and_then(|fd| fd.try_clone().ok()),
             offset: p.offset,
             stride: p.stride,
             modifier_hi: p.modifier_hi,
@@ -237,20 +255,21 @@ fn import_dmabuf(
         })
         .collect();
 
-    if planes.is_empty() {
-        anyhow::bail!("DMA-BUF params has no planes");
-    }
-
-    // Stub: EGL DMA-BUF import returns opaque handle 0 until fully wired.
-    let egl_image = Some(0usize);
+    tracing::debug!(
+        "DMA-BUF imported: format={:#010x} {}x{} {} planes",
+        format,
+        width,
+        height,
+        egl_planes.len()
+    );
 
     Ok(DmaBufBuffer {
         width,
         height,
         format,
-        flags,
-        planes,
-        egl_image,
+        flags: _flags,
+        planes: owned_planes,
+        egl_image: Arc::new(egl_image),
     })
 }
 

@@ -153,6 +153,9 @@ pub struct InputState {
     pub popup_grab: Option<XdgPopup>,
     pub screen_w: f64,
     pub screen_h: f64,
+    /// Whether any mouse button is currently held — used to avoid dropping
+    /// pointer focus mid-drag.
+    pub button_held: bool,
 }
 
 impl InputState {
@@ -173,6 +176,7 @@ impl InputState {
             popup_grab: None,
             screen_w: 1920.0,
             screen_h: 1080.0,
+            button_held: false,
         })
     }
 
@@ -194,7 +198,6 @@ pub fn dispatch_libinput_events(state: &mut Axiom) {
         tracing::error!("libinput: {e}");
         return;
     }
-    // Process events directly from the iterator — no intermediate Vec allocation.
     loop {
         match state.input.libinput.next() {
             Some(Event::Keyboard(k)) => handle_keyboard(state, k),
@@ -223,13 +226,19 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
     };
     state.seat.xkb_state.update_key(xkb_keycode, dir);
 
+    // Always send modifier-only keys (Shift, Ctrl, Alt, Super) straight
+    // through so clients track modifier state correctly.
+    let sym = state.seat.xkb_state.key_get_one_sym(xkb_keycode);
+    if is_modifier_sym(sym) {
+        let wl_state = wl_key_state(key_state);
+        state.seat.send_key(time, keycode, wl_state);
+        return;
+    }
+
     if key_state == KeyState::Pressed {
-        let sym = state.seat.xkb_state.key_get_one_sym(xkb_keycode);
         let mods = Mods::from_xkb(&state.seat.xkb_state);
 
-        // ── Hard-coded emergency binds (not overridable from Lua) ─────────────
-
-        // Super+Shift+Print → immediate quit (always works, even if Lua is broken)
+        // ── Hard-coded emergency binds ────────────────────────────────────────
         if mods == Mods(Mods::SUPER.0 | Mods::SHIFT.0) && sym == xkb::Keysym::Print {
             tracing::info!("emergency quit (Super+Shift+Print)");
             state
@@ -238,7 +247,6 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
             return;
         }
 
-        // Ctrl+Alt+F1–F8 → VT switch
         if mods == Mods(Mods::CTRL.0 | Mods::ALT.0) {
             if let Some(vt) = vt_from_sym(sym) {
                 vt_switch(state, vt);
@@ -246,16 +254,36 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
             }
         }
 
+        // ── Lua keybinds ──────────────────────────────────────────────────────
+        // fire_keybind returns Err when the combo is not registered in Lua.
+        // We must NOT swallow the key if no bind matched.
+        let combo = combo_string(mods, sym);
+        let lua_matched = match crate::scripting::lua_api::fire_keybind(&state.script.lua, &combo) {
+            Ok(matched) => matched,
+            Err(e) => {
+                // Lua threw — log but don't swallow the key.
+                tracing::error!("keybind '{combo}': {e}");
+                false
+            }
+        };
+
+        if lua_matched {
+            let queue = state.script.queue.clone();
+            crate::scripting::lua_api::drain(&queue, state);
+            return; // key was consumed by a bind
+        }
+
+        // ── Native keybind table ──────────────────────────────────────────────
         if let Some(action) = state.input.keybinds.lookup(mods, sym).cloned() {
             dispatch_action(state, action);
             return;
         }
+
+        // ── No bind matched — fall through to client ──────────────────────────
     }
 
-    let wl_state = match key_state {
-        KeyState::Pressed => wayland_server::protocol::wl_keyboard::KeyState::Pressed,
-        KeyState::Released => wayland_server::protocol::wl_keyboard::KeyState::Released,
-    };
+    // Deliver key press/release to the focused Wayland client.
+    let wl_state = wl_key_state(key_state);
     state.seat.send_key(time, keycode, wl_state);
 }
 
@@ -271,30 +299,57 @@ fn handle_pointer(state: &mut Axiom, event: PointerEvent) {
                 (state.input.pointer_y + m.dy()).clamp(0.0, state.input.screen_h - 1.0);
             state.input.cursor_pos = (state.input.pointer_x, state.input.pointer_y);
             let (px, py) = (state.input.pointer_x, state.input.pointer_y);
+
+            state.update_interactive_grab(px, py);
+
             if let Some((surface, sx, sy)) = state.surface_at(px, py) {
                 state.seat.set_pointer_focus(Some(surface), sx, sy);
                 state.seat.send_pointer_motion(time, sx, sy);
-            } else {
-                state.seat.set_pointer_focus(None, 0.0, 0.0);
+            } else if !state.input.button_held {
+                // Only clear focus when no button is held — avoids dropping
+                // pointer focus during fast drags that leave the surface rect.
+                if matches!(state.grab, crate::state::GrabKind::None) {
+                    state.seat.set_pointer_focus(None, 0.0, 0.0);
+                }
             }
-            state.update_interactive_grab(px, py);
+
+            state.needs_redraw = true;
         }
 
         PointerEvent::Button(b) => {
             let button = b.button();
             let time = b.time();
-            let wl_state = if b.button_state() == input::event::pointer::ButtonState::Pressed {
+            let pressed = b.button_state() == input::event::pointer::ButtonState::Pressed;
+            let wl_state = if pressed {
                 wayland_server::protocol::wl_pointer::ButtonState::Pressed
             } else {
                 wayland_server::protocol::wl_pointer::ButtonState::Released
             };
-            if wl_state == wayland_server::protocol::wl_pointer::ButtonState::Pressed {
-                let (px, py) = (state.input.pointer_x as i32, state.input.pointer_y as i32);
-                if let Some(id) = state.wm.window_at(px, py) {
-                    state.wm.focus_window(id);
-                    state.sync_keyboard_focus();
+
+            state.input.button_held = pressed;
+
+            if pressed {
+                let (px, py) = (state.input.pointer_x, state.input.pointer_y);
+
+                if let Some(id) = state.wm.window_at(px as i32, py as i32) {
+                    if state.wm.focused_window() != Some(id) {
+                        state.wm.focus_window(id);
+                        state.sync_keyboard_focus();
+                        state.needs_redraw = true;
+                    }
                 }
+
+                // Re-establish pointer focus so the click is delivered.
+                if let Some((surface, sx, sy)) = state.surface_at(px, py) {
+                    state.seat.set_pointer_focus(Some(surface), sx, sy);
+                    // Deliver the button event to the now-focused surface.
+                    state.seat.send_pointer_button(time, button, wl_state);
+                    return;
+                }
+            } else {
+                state.end_grab();
             }
+
             state.seat.send_pointer_button(time, button, wl_state);
         }
 
@@ -387,9 +442,37 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
     }
 }
 
-// ── VT switching ──────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Map XKB F1–F8 keysyms to VT numbers 1–8.
+/// Returns true for pure modifier keysyms that should always pass through.
+fn is_modifier_sym(sym: xkb::Keysym) -> bool {
+    matches!(
+        sym,
+        xkb::Keysym::Shift_L
+            | xkb::Keysym::Shift_R
+            | xkb::Keysym::Control_L
+            | xkb::Keysym::Control_R
+            | xkb::Keysym::Alt_L
+            | xkb::Keysym::Alt_R
+            | xkb::Keysym::Super_L
+            | xkb::Keysym::Super_R
+            | xkb::Keysym::Caps_Lock
+            | xkb::Keysym::Num_Lock
+            | xkb::Keysym::ISO_Level3_Shift
+            | xkb::Keysym::Meta_L
+            | xkb::Keysym::Meta_R
+            | xkb::Keysym::Hyper_L
+            | xkb::Keysym::Hyper_R
+    )
+}
+
+fn wl_key_state(ks: KeyState) -> wayland_server::protocol::wl_keyboard::KeyState {
+    match ks {
+        KeyState::Pressed => wayland_server::protocol::wl_keyboard::KeyState::Pressed,
+        KeyState::Released => wayland_server::protocol::wl_keyboard::KeyState::Released,
+    }
+}
+
 fn vt_from_sym(sym: xkb::Keysym) -> Option<u32> {
     match sym {
         xkb::Keysym::F1 => Some(1),
@@ -404,35 +487,37 @@ fn vt_from_sym(sym: xkb::Keysym) -> Option<u32> {
     }
 }
 
-/// Switch to `vt`, pausing DRM rendering first.
-///
-/// Flow:
-///   1. Mark all outputs `frame_pending` so render_all skips them.
-///   2. Ask libseat to switch VT — libseat will call our `disable_seat`
-///      callback asynchronously, which sets `disable_pending`.  We don't
-///      need to do anything extra here; the main-loop session handler
-///      already responds to `take_disable_pending()` by keeping
-///      `frame_pending = true` on all outputs.
-///   3. When the user switches back, libseat calls `enable_seat` → the
-///      session fd becomes readable → the calloop source fires
-///      `session.dispatch()` → libseat re-enables the seat.  At that point
-///      we clear `frame_pending` so rendering resumes.
-///
-/// Resuming is handled in the existing seat-fd calloop source in main.rs
-/// via a new `take_enable_pending()` call (see below).
 fn vt_switch(state: &mut Axiom, vt: u32) {
     tracing::info!("VT switch → vt{vt}");
-
-    // Pause rendering before we lose DRM master.
     for out in &mut state.outputs {
         out.frame_pending = true;
     }
-
     if let Err(e) = state.backend.session.switch_vt(vt) {
         tracing::warn!("VT switch to vt{vt} failed: {e}");
-        // Rendering will remain paused until libseat re-enables us anyway,
-        // so no need to undo frame_pending here.
     }
+}
+
+fn combo_string(mods: Mods, sym: xkb::Keysym) -> String {
+    let sym_name = xkb::keysym_get_name(sym);
+    let mut parts: Vec<&str> = Vec::with_capacity(5);
+    if mods.0 & Mods::SUPER.0 != 0 {
+        parts.push("super");
+    }
+    if mods.0 & Mods::ALT.0 != 0 {
+        parts.push("alt");
+    }
+    if mods.0 & Mods::CTRL.0 != 0 {
+        parts.push("ctrl");
+    }
+    if mods.0 & Mods::SHIFT.0 != 0 {
+        parts.push("shift");
+    }
+    let mut combo = parts.join("+");
+    if !combo.is_empty() {
+        combo.push('+');
+    }
+    combo.push_str(&sym_name);
+    combo
 }
 
 fn spawn(cmd: &str) {

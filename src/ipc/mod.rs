@@ -316,7 +316,8 @@ fn dispatch(req: IpcRequest, state: &mut Axiom) -> IpcResponse {
         },
 
         IpcRequest::Bind { key } => match state.script.fire_keybind(&key) {
-            Ok(()) => IpcResponse::ok_empty(),
+            Ok(true) => IpcResponse::ok_empty(),
+            Ok(false) => IpcResponse::err(format!("no bind registered for '{key}'")),
             Err(e) => IpcResponse::err(format!("{e}")),
         },
     }

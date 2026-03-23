@@ -759,13 +759,10 @@ mod libc {
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
+    path::PathBuf,
 };
 
-// axiomctl is a standalone binary — it can't depend on the axiom crate
-// directly. We re-declare only what we need for the wire protocol.
-
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -1876,11 +1873,14 @@ fn dispatch(req: IpcRequest, state: &mut Axiom) -> IpcResponse {
 
 mod backend;
 mod input;
+mod ipc;
 mod proto;
 mod render;
 mod scripting;
 mod state;
+mod sys;
 mod wm;
+mod xwayland;
 
 use std::{
     os::unix::io::AsRawFd,
@@ -1966,6 +1966,9 @@ fn main() -> Result<()> {
     let input = InputState::new(&backend.session)?;
     let seat = SeatState::new();
 
+    // ── IPC server ────────────────────────────────────────────────────────────
+    let ipc = ipc::IpcServer::bind(&socket_name)?;
+
     let running = Arc::new(AtomicBool::new(true));
     let outputs: Vec<OutputState> = outputs_raw
         .into_iter()
@@ -1996,12 +1999,15 @@ fn main() -> Result<()> {
         wm,
         anim: AnimSet::new(),
         script,
+        ipc,
         outputs,
         surface_map: Default::default(),
         toplevel_map: Default::default(),
         pending_windows: Default::default(),
         closing_windows: Default::default(),
         layer_surfaces: Default::default(),
+        idle_inhibit: proto::idle_inhibit::IdleInhibitState::new(),
+        xwayland: xwayland::XWaylandState::new(),
         running: Arc::clone(&running),
         handle: loop_handle.clone(),
         start_time: Instant::now(),
@@ -2064,7 +2070,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── Hardware cursor + multi-monitor ───────────────────────────────────────
+    // ── Hardware cursor ───────────────────────────────────────────────────────
     match render::cursor::HwCursor::load(&state.backend.drm) {
         Ok(cur) => {
             tracing::info!("hardware cursor loaded");
@@ -2179,6 +2185,20 @@ fn main() -> Result<()> {
             },
         )?;
     }
+    {
+        let ipc_fd = state.ipc.as_raw_fd();
+        event_loop.handle().insert_source(
+            Generic::new(
+                unsafe { calloop::generic::FdWrapper::new(ipc_fd) },
+                Interest::READ,
+                Mode::Level,
+            ),
+            |_, _, state| {
+                ipc::drain_ipc(state);
+                Ok(PostAction::Continue)
+            },
+        )?;
+    }
     event_loop.handle().insert_source(
         Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap(),
         |_, _, state| {
@@ -2199,7 +2219,14 @@ fn main() -> Result<()> {
             state.needs_redraw = true;
         }
         state.script.tick(&state.wm);
-        state.script.drain(&mut state);
+
+        // Drain script actions: pull the queue out first to avoid a
+        // simultaneous mutable borrow of both state.script and state.
+        {
+            let actions: Vec<scripting::lua_api::LuaAction> =
+                std::mem::take(&mut *state.script.queue.lock().unwrap());
+            scripting::lua_api::drain_actions(actions, &mut state);
+        }
 
         if state.needs_redraw {
             render_all(&mut state);
@@ -2596,17 +2623,11 @@ impl PipeWireStream {
 
 ==== src/proto/compositor.rs ====
 // src/proto/compositor.rs — wl_compositor, wl_subcompositor, wl_surface, wl_region.
-//
-// Surface state follows the double-buffered Wayland model:
-//   pending  — accumulates attach/damage/frame/etc requests
-//   current  — applied atomically on wl_surface.commit
-//
-// We deliberately do NOT use smithay's CompositorState. All commit logic
-// is hand-rolled here so we have full control over when textures are uploaded
-// and how subsurfaces are ordered.
 
 use std::sync::{Arc, Mutex};
-use wayland_protocols::wp::fractional_scale;
+
+// fractional_scale lives in crate::proto::fractional_scale, not wayland_protocols
+use crate::proto::fractional_scale::ViewportState;
 
 use wayland_server::{
     protocol::{
@@ -2626,7 +2647,6 @@ use crate::state::Axiom;
 
 // ── Surface user-data ─────────────────────────────────────────────────────────
 
-/// Geometry of committed damage (surface-local coordinates).
 #[derive(Default, Clone)]
 pub struct Rect {
     pub x: i32,
@@ -2635,10 +2655,9 @@ pub struct Rect {
     pub h: i32,
 }
 
-/// The pending (pre-commit) surface state.
 #[derive(Default)]
 pub struct PendingSurfaceState {
-    pub buffer: Option<Option<WlBuffer>>, // None = no change; Some(None) = detach
+    pub buffer: Option<Option<WlBuffer>>,
     pub dx: i32,
     pub dy: i32,
     pub damage_surface: Vec<Rect>,
@@ -2650,7 +2669,6 @@ pub struct PendingSurfaceState {
     pub buffer_transform: Option<wl_output::Transform>,
 }
 
-/// The committed (current) surface state — what the renderer sees.
 #[derive(Default)]
 pub struct CommittedSurfaceState {
     pub buffer: Option<WlBuffer>,
@@ -2661,21 +2679,17 @@ pub struct CommittedSurfaceState {
     pub input_region: Option<RegionData>,
     pub opaque_region: Option<RegionData>,
     pub buffer_scale: i32,
-    /// None means Normal (the default).
     pub buffer_transform: Option<wl_output::Transform>,
     pub needs_upload: bool,
 }
 
-// wl_output::Transform has no Default impl — we inline Normal at construction.
-
-/// Shared surface data stored as WlSurface user data.
 pub struct SurfaceData {
     pub pending: Mutex<PendingSurfaceState>,
     pub current: Mutex<CommittedSurfaceState>,
     pub children: Mutex<Vec<WlSurface>>,
     pub parent: Mutex<Option<WlSurface>>,
     pub role: Mutex<SurfaceRole>,
-    pub viewport: Mutex<Option<crate::proto::fractional_scale::ViewportState>>,
+    pub viewport: Mutex<Option<ViewportState>>,
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -2718,7 +2732,7 @@ impl SurfaceData {
 
 #[derive(Default, Clone)]
 pub struct RegionData {
-    pub rects: Vec<(i32, i32, i32, i32)>, // x, y, w, h (additive union)
+    pub rects: Vec<(i32, i32, i32, i32)>,
 }
 
 impl RegionData {
@@ -2786,7 +2800,6 @@ impl Dispatch<WlSurface, Arc<SurfaceData>> for Axiom {
                 pending.dx = x;
                 pending.dy = y;
             }
-
             wl_surface::Request::Damage {
                 x,
                 y,
@@ -2801,7 +2814,6 @@ impl Dispatch<WlSurface, Arc<SurfaceData>> for Axiom {
                     h: height,
                 });
             }
-
             wl_surface::Request::DamageBuffer {
                 x,
                 y,
@@ -2816,13 +2828,11 @@ impl Dispatch<WlSurface, Arc<SurfaceData>> for Axiom {
                     h: height,
                 });
             }
-
             wl_surface::Request::Frame { callback } => {
                 let cb = data_init.init(callback, ());
                 let mut pending = data.pending.lock().unwrap();
                 pending.frame_callbacks.push(cb);
             }
-
             wl_surface::Request::SetInputRegion { region } => {
                 let region_data = region.as_ref().and_then(|r| {
                     r.data::<std::sync::Mutex<RegionData>>()
@@ -2830,7 +2840,6 @@ impl Dispatch<WlSurface, Arc<SurfaceData>> for Axiom {
                 });
                 data.pending.lock().unwrap().input_region = Some(region_data);
             }
-
             wl_surface::Request::SetOpaqueRegion { region } => {
                 let region_data = region.as_ref().and_then(|r| {
                     r.data::<std::sync::Mutex<RegionData>>()
@@ -2838,38 +2847,30 @@ impl Dispatch<WlSurface, Arc<SurfaceData>> for Axiom {
                 });
                 data.pending.lock().unwrap().opaque_region = Some(region_data);
             }
-
             wl_surface::Request::SetBufferScale { scale } => {
                 data.pending.lock().unwrap().buffer_scale = Some(scale);
             }
-
             wl_surface::Request::SetBufferTransform { transform } => {
                 if let Ok(t) = transform.into_result() {
                     data.pending.lock().unwrap().buffer_transform = Some(t);
                 }
             }
-
             wl_surface::Request::Commit => {
                 commit_surface(state, surface, data);
             }
-
             wl_surface::Request::Destroy => {
                 destroy_surface(state, surface, data);
             }
-
             _ => {}
         }
     }
 }
 
-/// Apply pending → current (the commit transaction).
 fn commit_surface(state: &mut Axiom, surface: &WlSurface, data: &Arc<SurfaceData>) {
     let mut pending = data.pending.lock().unwrap();
     let mut current = data.current.lock().unwrap();
 
-    // Buffer
     if let Some(new_buffer) = pending.buffer.take() {
-        // Release the old buffer back to the client.
         if let Some(old) = current.buffer.take() {
             old.release();
         }
@@ -2877,22 +2878,18 @@ fn commit_surface(state: &mut Axiom, surface: &WlSurface, data: &Arc<SurfaceData
         current.needs_upload = current.buffer.is_some();
     }
 
-    // Offsets
     current.dx = pending.dx;
     current.dy = pending.dy;
 
-    // Damage — accumulate into current
     current
         .damage_buffer
         .extend(pending.damage_buffer.drain(..));
     pending.damage_surface.clear();
 
-    // Frame callbacks — hand off to current so the render loop fires them
     current
         .frame_callbacks
         .extend(pending.frame_callbacks.drain(..));
 
-    // Regions
     if let Some(r) = pending.input_region.take() {
         current.input_region = r;
     }
@@ -2900,7 +2897,6 @@ fn commit_surface(state: &mut Axiom, surface: &WlSurface, data: &Arc<SurfaceData
         current.opaque_region = r;
     }
 
-    // Scale / transform
     if let Some(s) = pending.buffer_scale.take() {
         current.buffer_scale = s;
     }
@@ -2911,7 +2907,6 @@ fn commit_surface(state: &mut Axiom, surface: &WlSurface, data: &Arc<SurfaceData
     drop(pending);
     drop(current);
 
-    // Notify the WM that this surface has new content.
     state.on_surface_commit(surface);
 }
 
@@ -2931,8 +2926,6 @@ impl Dispatch<WlRegion, std::sync::Mutex<RegionData>> for Axiom {
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        // RegionData is passed by reference; we need interior mutability.
-        // Use the Arc<Mutex<>> pattern via a wrapper. For now treat as append-only.
         match request {
             wl_region::Request::Add {
                 x,
@@ -2963,7 +2956,6 @@ impl Dispatch<WlCallback, ()> for Axiom {
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        // wl_callback has no requests; only the done event matters (sent by us).
     }
 }
 
@@ -2998,12 +2990,10 @@ impl Dispatch<WlSubcompositor, ()> for Axiom {
                 surface,
                 parent,
             } => {
-                // Record parent relationship on the child surface.
                 if let Some(child_data) = surface.data::<Arc<SurfaceData>>() {
                     *child_data.parent.lock().unwrap() = Some(parent.clone());
                     *child_data.role.lock().unwrap() = SurfaceRole::Subsurface;
                 }
-                // Record child in parent's child list.
                 if let Some(parent_data) = parent.data::<Arc<SurfaceData>>() {
                     parent_data.children.lock().unwrap().push(surface);
                 }
@@ -3027,8 +3017,6 @@ impl Dispatch<WlSubsurface, ()> for Axiom {
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        // set_position / place_above / place_below / set_sync handled here in
-        // a full implementation. Stubs are sufficient to not crash clients.
     }
 }
 
@@ -3915,7 +3903,11 @@ pub fn compute_usable_area(
 // src/proto/mod.rs — Wayland protocol global registration.
 
 pub mod compositor;
+pub mod dmabuf;
+pub mod fractional_scale;
+pub mod idle_inhibit;
 pub mod layer_shell;
+pub mod screencopy;
 pub mod seat;
 pub mod shm;
 pub mod wl_output;
@@ -3923,25 +3915,44 @@ pub mod xdg_decoration;
 pub mod xdg_output;
 pub mod xdg_shell;
 
+use wayland_protocols::wp::idle_inhibit::zv1::server::zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1;
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+use wayland_protocols::wp::{
+    fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    viewporter::server::wp_viewporter::WpViewporter,
+};
 use wayland_protocols::xdg::{
     decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     shell::server::xdg_wm_base::XdgWmBase,
     xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1,
 };
-use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
+use wayland_protocols_wlr::{
+    layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1,
+    screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+};
 use wayland_server::{
-    protocol::{wl_compositor::WlCompositor, wl_output::WlOutput, wl_shm::WlShm},
+    protocol::{
+        wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat, wl_shm::WlShm,
+        wl_subcompositor::WlSubcompositor,
+    },
     DisplayHandle,
 };
 
 pub fn register_globals(dh: &DisplayHandle) {
     dh.create_global::<crate::state::Axiom, WlCompositor, _>(6, ());
+    dh.create_global::<crate::state::Axiom, WlSubcompositor, _>(1, ());
     dh.create_global::<crate::state::Axiom, WlShm, _>(1, ());
     dh.create_global::<crate::state::Axiom, WlOutput, _>(4, ());
+    dh.create_global::<crate::state::Axiom, WlSeat, _>(7, ());
     dh.create_global::<crate::state::Axiom, XdgWmBase, _>(5, ());
     dh.create_global::<crate::state::Axiom, ZwlrLayerShellV1, _>(4, ());
     dh.create_global::<crate::state::Axiom, ZxdgDecorationManagerV1, _>(1, ());
     dh.create_global::<crate::state::Axiom, ZxdgOutputManagerV1, _>(3, ());
+    dh.create_global::<crate::state::Axiom, ZwpLinuxDmabufV1, _>(4, ());
+    dh.create_global::<crate::state::Axiom, ZwlrScreencopyManagerV1, _>(3, ());
+    dh.create_global::<crate::state::Axiom, WpFractionalScaleManagerV1, _>(1, ());
+    dh.create_global::<crate::state::Axiom, WpViewporter, _>(1, ());
+    dh.create_global::<crate::state::Axiom, ZwpIdleInhibitManagerV1, _>(1, ());
 }
 
 ==== src/proto/output.rs ====
@@ -4641,10 +4652,6 @@ mod libc {
 
 ==== src/proto/shm.rs ====
 // src/proto/shm.rs — wl_shm / wl_shm_pool / wl_buffer (shared-memory buffers).
-//
-// Clients mmap a file descriptor into a pool, then carve wl_buffers out of it.
-// We store the raw mmap pointer + pool metadata as user data so the render
-// thread can read pixel data directly without an extra copy.
 
 use std::ffi::c_void;
 use std::{
@@ -4676,8 +4683,6 @@ const SUPPORTED_FORMATS: &[wl_shm::Format] = &[
 // ── Pool data ─────────────────────────────────────────────────────────────────
 
 pub struct ShmPool {
-    /// mmap base pointer. Protected by a Mutex because the client can
-    /// resize the pool with wl_shm_pool.resize (which remaps).
     inner: Arc<Mutex<ShmPoolInner>>,
 }
 
@@ -4687,7 +4692,6 @@ pub struct ShmPoolInner {
     fd: OwnedFd,
 }
 
-// SAFETY: The pointer lives as long as the mmap; we only read from it.
 unsafe impl Send for ShmPoolInner {}
 unsafe impl Sync for ShmPoolInner {}
 
@@ -4716,33 +4720,34 @@ impl ShmPoolInner {
     }
 
     fn resize(&mut self, new_size: usize) -> anyhow::Result<()> {
-        // Map the new region BEFORE unmapping the old one so that if the new
-        // mmap fails self.ptr is never left dangling.
         let new_ptr = Self::mmap(&self.fd, new_size)?;
-        unsafe { crate::sys::munmap(self.ptr.as_ptr() as *mut std::ffi::c_void, self.size) };
+        unsafe { crate::sys::munmap(self.ptr.as_ptr() as *mut c_void, self.size) };
         self.ptr = new_ptr;
         self.size = new_size;
         Ok(())
     }
 
-    /// Borrow raw bytes for a buffer slice (bounds-checked).
     pub fn data(&self, offset: usize, len: usize) -> Option<&[u8]> {
         if offset.saturating_add(len) > self.size {
             return None;
         }
         Some(unsafe { slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
     }
+
+    pub fn fd_raw(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.fd.as_raw_fd()
+    }
 }
 
 impl Drop for ShmPoolInner {
     fn drop(&mut self) {
-        unsafe { crate::sys::munmap(self.ptr.as_ptr() as *mut std::ffi::c_void, self.size) };
+        unsafe { crate::sys::munmap(self.ptr.as_ptr() as *mut c_void, self.size) };
     }
 }
 
 // ── Buffer data ───────────────────────────────────────────────────────────────
 
-/// User data attached to each WlBuffer created from a SHM pool.
 pub struct ShmBuffer {
     pub pool: Arc<Mutex<ShmPoolInner>>,
     pub offset: i32,
@@ -4753,7 +4758,6 @@ pub struct ShmBuffer {
 }
 
 impl ShmBuffer {
-    /// Read pixel data for this buffer (slice into the pool mmap).
     pub fn with_data<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce(&[u8]) -> R,
@@ -4762,6 +4766,10 @@ impl ShmBuffer {
         let len = (self.stride * self.height) as usize;
         let data = pool.data(self.offset as usize, len)?;
         Some(f(data))
+    }
+
+    pub fn pool_fd_raw(&self) -> std::os::unix::io::RawFd {
+        self.pool.lock().unwrap().fd_raw()
     }
 }
 
@@ -4777,7 +4785,6 @@ impl GlobalDispatch<WlShm, ()> for Axiom {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let shm = data_init.init(resource, ());
-        // Advertise supported formats.
         for &fmt in SUPPORTED_FORMATS {
             shm.format(fmt);
         }
@@ -4805,8 +4812,6 @@ impl Dispatch<WlShm, ()> for Axiom {
                     }
                     Err(e) => {
                         log::error!("wl_shm: failed to create pool: {}", e);
-                        // Protocol error would be appropriate here; for now
-                        // just drop id without initialising (client gets error).
                     }
                 }
             }
@@ -4848,14 +4853,12 @@ impl Dispatch<WlShmPool, ShmPool> for Axiom {
                     data_init.init(id, buf);
                 }
             }
-
             wl_shm_pool::Request::Resize { size } => {
                 let mut inner = data.inner.lock().unwrap();
                 if let Err(e) = inner.resize(size as usize) {
                     log::error!("wl_shm_pool resize failed: {}", e);
                 }
             }
-
             wl_shm_pool::Request::Destroy => {}
             _ => {}
         }
@@ -4875,28 +4878,8 @@ impl Dispatch<WlBuffer, ShmBuffer> for Axiom {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         if let wl_buffer::Request::Destroy = request {
-            // The buffer is being destroyed; release any GL texture cached for it.
             state.render.release_buffer(resource);
         }
-    }
-}
-
-// (libc FFI lives in crate::sys)
-pub const PROT_READ: i32 = 0x1;
-pub const MAP_SHARED: i32 = 0x01;
-pub const MAP_FAILED: *mut c_void = !0usize as *mut _;
-
-impl ShmPoolInner {
-    pub fn fd_raw(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        self.fd.as_raw_fd()
-    }
-}
-
-impl ShmBuffer {
-    /// Expose the pool's file descriptor so screencopy can mmap with PROT_WRITE.
-    pub fn pool_fd_raw(&self) -> std::os::unix::io::RawFd {
-        self.pool.lock().unwrap().fd_raw()
     }
 }
 
@@ -8014,9 +7997,15 @@ pub fn emit_bare(lua: &Lua, event: &str) {
 
 // ── Drain actions ─────────────────────────────────────────────────────────────
 
+/// Called from ScriptEngine::drain — kept for internal use.
 pub fn drain(queue: &ActionQueue, state: &mut crate::state::Axiom) {
     drain_dir_actions(state);
     let actions: Vec<LuaAction> = std::mem::take(&mut *queue.lock().unwrap());
+    drain_actions(actions, state);
+}
+
+pub fn drain_actions(actions: Vec<LuaAction>, state: &mut crate::state::Axiom) {
+    // dir actions still need lua access — call separately before dropping script borrow
     for action in actions {
         apply(state, action);
     }
@@ -8685,8 +8674,10 @@ use wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle, Resource};
 use crate::{
     backend::OutputSurface,
     input::InputState,
+    ipc::IpcServer,
     proto::{
         compositor::{SurfaceData, SurfaceRole},
+        idle_inhibit::IdleInhibitState,
         layer_shell::LayerSurfaceRef,
         seat::SeatState,
         xdg_shell::{ToplevelDataRef, XdgRole, XdgSurfaceDataRef},
@@ -8694,6 +8685,7 @@ use crate::{
     render::RenderState,
     scripting::{signals, ScriptEngine},
     wm::{anim::AnimSet, Window, WindowId, WmState},
+    xwayland::XWaylandState,
 };
 
 // ── Per-output state ──────────────────────────────────────────────────────────
@@ -8794,6 +8786,7 @@ pub struct Axiom {
     pub wm: WmState,
     pub anim: AnimSet,
     pub script: ScriptEngine,
+    pub ipc: IpcServer,
 
     pub outputs: Vec<OutputState>,
 
@@ -8802,6 +8795,9 @@ pub struct Axiom {
     pub pending_windows: HashMap<u32, PendingWindow>,
     pub closing_windows: Vec<ClosingWindow>,
     pub layer_surfaces: Vec<(LayerSurfaceRef, WlSurface)>,
+
+    pub idle_inhibit: IdleInhibitState,
+    pub xwayland: XWaylandState,
 
     pub running: Arc<AtomicBool>,
     pub handle: LoopHandle<'static, Self>,
@@ -8859,9 +8855,9 @@ impl Axiom {
             .wm
             .windows
             .get(&focused)
-            .and_then(|w| w.surface.clone())
+            .and_then(|w| w.surface.as_ref())
         {
-            Some(s) => s,
+            Some(s) => s.clone(),
             None => return,
         };
         self.send_configure_for_surface(&surface, focused);
@@ -8919,7 +8915,7 @@ impl Axiom {
         &mut self,
         surface: WlSurface,
         toplevel: ToplevelDataRef,
-        _xdg_surface_data: crate::proto::xdg_shell::XdgSurfaceDataRef,
+        _xdg_surface_data: XdgSurfaceDataRef,
     ) {
         let surf_id = surface.id().protocol_id();
         let app_id = toplevel.lock().unwrap().app_id.clone().unwrap_or_default();
@@ -8945,7 +8941,6 @@ impl Axiom {
     pub fn on_surface_commit(&mut self, surface: &WlSurface) {
         let surf_id = surface.id().protocol_id();
 
-        // ── First commit: map pending → real window ───────────────────────────
         if let Some(pw) = self.pending_windows.remove(&surf_id) {
             let mut win = Window::new(surf_id, pw.app_id.clone());
             win.title = pw.title.clone();
@@ -8969,7 +8964,7 @@ impl Axiom {
             signals::update_screen_count(&self.script.lua, self.wm.monitors.len());
         }
 
-        // ── Layer-shell surface commit ────────────────────────────────────────
+        // Layer-shell surface commit
         let is_layer = self
             .layer_surfaces
             .iter()
@@ -8996,7 +8991,6 @@ impl Axiom {
             return;
         }
 
-        // ── Every commit: upload window texture ───────────────────────────────
         if let Some(&win_id) = self.surface_map.get(&surf_id) {
             if let Some(sd) = surface.data::<Arc<SurfaceData>>() {
                 let needs_upload = sd.current.lock().unwrap().needs_upload;
@@ -9219,6 +9213,12 @@ impl Axiom {
         }
     }
 
+    // ── XWayland surface pairing ──────────────────────────────────────────────
+
+    pub fn try_pair_xwayland_surface(&mut self, _surface: &WlSurface, _serial: u64) {
+        // Full pairing logic goes here when XWayland serial tracking is wired.
+    }
+
     // ── Config ────────────────────────────────────────────────────────────────
 
     pub fn reload_config(&mut self) {
@@ -9228,6 +9228,28 @@ impl Axiom {
         self.needs_redraw = true;
     }
 }
+
+==== src/sys.rs ====
+// src/sys.rs — raw syscall shims used across the crate.
+
+use std::ffi::c_void;
+
+extern "C" {
+    pub fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> *mut c_void;
+    pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+}
+
+pub const PROT_READ: i32 = 0x1;
+pub const PROT_WRITE: i32 = 0x2;
+pub const MAP_SHARED: i32 = 0x01;
+pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
 ==== src/wm/anim.rs ====
 // src/wm/anim.rs — Window animation system (spring physics).
@@ -10509,10 +10531,11 @@ pub mod atoms;
 pub mod surface;
 pub mod wm;
 
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use std::{
     collections::HashMap,
     os::unix::{
-        io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        io::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         process::CommandExt,
     },
     process::{Child, Command},
@@ -10850,11 +10873,15 @@ fn read_display_number(fd: RawFd) -> Result<u32> {
 }
 
 unsafe fn clear_cloexec(fd: RawFd) {
-    use nix::fcntl::*;
+    let fd = BorrowedFd::borrow_raw(fd);
+
     let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap_or(0);
+
     let _ = fcntl(
         fd,
-        FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags & !1)),
+        FcntlArg::F_SETFD(FdFlag::from_bits_truncate(
+            flags & !FdFlag::FD_CLOEXEC.bits(),
+        )),
     );
 }
 

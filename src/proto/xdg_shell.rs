@@ -124,9 +124,18 @@ impl Dispatch<XdgSurface, XdgSurfaceDataRef> for Axiom {
                 let toplevel = data_init.init(id, Arc::clone(&toplevel_ref));
                 data.lock().unwrap().role = XdgRole::Toplevel(toplevel.clone());
 
-                // Register with the compositor — populates surface_map, pending_windows.
                 let wl_surface = data.lock().unwrap().wl_surface.clone();
                 state.register_toplevel(wl_surface, toplevel_ref, Arc::clone(data));
+
+                // Send an *initial* configure with size (0,0) and no states so the client
+                // knows to proceed. We do NOT send a full WM configure yet — that happens
+                // in on_surface_commit once the window has been added to the WM with a
+                // real rect. Sending size 0,0 here tells the client "you choose your size"
+                // which is correct for the initial negotiation.
+                toplevel.configure(0, 0, vec![]);
+                let serial = state.next_serial();
+                xdg_surface.configure(serial);
+                data.lock().unwrap().configure_serial = serial;
             }
 
             xdg_surface::Request::GetPopup {

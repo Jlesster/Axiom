@@ -12,7 +12,7 @@ mod wm;
 mod xwayland;
 
 use std::{
-    os::unix::io::AsRawFd,
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -37,6 +37,7 @@ use crate::{
     scripting::ScriptEngine,
     state::{Axiom, GrabKind, OutputState},
     wm::{anim::AnimSet, WmConfig, WmState},
+    xwayland::X11Action,
 };
 
 struct NoopClientData;
@@ -50,53 +51,86 @@ impl WlClientData for NoopClientData {
     }
 }
 
+macro_rules! probe {
+    ($msg:expr) => {{
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(concat!("PROBE ", $msg, "\n").as_bytes());
+        let _ = std::io::stderr().flush();
+    }};
+}
+
 fn main() -> Result<()> {
+    probe!("1: main entered");
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(std::env::var("AXIOM_LOG").unwrap_or_else(|_| "axiom=debug,warn".into()))
         .init();
-    tracing::info!("Axiom starting");
+
+    probe!("2: tracing init done");
 
     let mut event_loop: EventLoop<'static, Axiom> = EventLoop::try_new()?;
+    probe!("3: event loop created");
+
     let loop_handle = event_loop.handle();
 
     let session = backend::session::Session::open()?;
+    probe!("4: session opened");
 
     let gpu_path = find_primary_gpu()?;
-    tracing::info!("GPU: {gpu_path:?}");
+    probe!("5: gpu found");
+
     let mut backend = Backend::open(&gpu_path, session)?;
+    probe!("6: backend opened");
+
     let outputs_raw = backend.create_outputs()?;
+    probe!("7: outputs created");
 
     if let Some(out) = outputs_raw.first() {
         out.make_current(&backend.egl)?;
     }
+    probe!("8: egl current");
+
     let render = RenderState::new()?;
+    probe!("9: render state created");
 
     let mut display: Display<Axiom> = Display::new()?;
-    let display_handle = display.handle();
+    probe!("10: wayland display created");
 
+    let display_handle = display.handle();
     let socket_name = "wayland-axiom".to_string();
     let listener =
         wayland_server::ListeningSocket::bind(&socket_name).context("bind Wayland socket")?;
-    tracing::info!("WAYLAND_DISPLAY={socket_name}");
+    probe!("11: wayland socket bound");
+
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     }
 
     proto::register_globals(&display_handle);
+    probe!("12: globals registered");
 
     let (sw, sh) = primary_output_size(&outputs_raw);
     let mut wm = WmState::new(sw, sh, WmConfig::default());
+    probe!("13: wm created");
 
     let config_dir = xdg_config_dir();
     let script = ScriptEngine::new(&config_dir, &wm)?;
-    script.run_rc(&mut wm)?;
+    probe!("14: script engine created");
+
+    if let Err(e) = script.run_rc(&mut wm) {
+        tracing::warn!("RC script error (continuing without config): {e}");
+    }
+    probe!("15: rc script ran");
 
     let input = InputState::new(&backend.session)?;
-    let seat = SeatState::new();
+    probe!("16: input created");
 
-    // ── IPC server ────────────────────────────────────────────────────────────
+    let seat = SeatState::new();
+    probe!("17: seat created");
+
     let ipc = ipc::IpcServer::bind(&socket_name)?;
+    probe!("18: ipc bound");
 
     let running = Arc::new(AtomicBool::new(true));
     let outputs: Vec<OutputState> = outputs_raw
@@ -117,6 +151,7 @@ fn main() -> Result<()> {
             }
         })
         .collect();
+    probe!("19: outputs built");
 
     let mut state = Axiom {
         display: display_handle.clone(),
@@ -143,6 +178,7 @@ fn main() -> Result<()> {
         needs_redraw: true,
         grab: GrabKind::None,
     };
+    probe!("20: state constructed");
 
     // ── Initial modeset ───────────────────────────────────────────────────────
     for out in &mut state.outputs {
@@ -198,6 +234,7 @@ fn main() -> Result<()> {
             Err(e) => tracing::warn!("initial present: {e}"),
         }
     }
+    probe!("21: initial modeset done");
 
     // ── Hardware cursor ───────────────────────────────────────────────────────
     match render::cursor::HwCursor::load(&state.backend.drm) {
@@ -211,6 +248,7 @@ fn main() -> Result<()> {
         }
         Err(e) => tracing::warn!("hardware cursor unavailable ({e}), using software fallback"),
     }
+    probe!("22: hw cursor done");
 
     for (i, out) in state.outputs.iter().enumerate().skip(1) {
         let x_offset: i32 = state.outputs[..i].iter().map(|o| o.width as i32).sum();
@@ -218,8 +256,50 @@ fn main() -> Result<()> {
             .wm
             .add_monitor(out.wl_id, x_offset, 0, out.width as i32, out.height as i32);
     }
+    probe!("23: monitors registered");
 
-    // ── Event sources ─────────────────────────────────────────────────────────
+    // ── XWayland startup (phase 1 — just spawn the process) ──────────────────
+    //
+    // We cannot block here waiting for Xwayland's display number because
+    // Xwayland needs the Wayland event loop to be running in order to complete
+    // its own initialisation. Instead we spawn and hand the pipe fd to calloop;
+    // finish_start() is called from the event loop once the pipe is readable.
+    probe!("24: about to spawn xwayland");
+    match state.xwayland.spawn(&socket_name, sw, sh) {
+        Ok(pipe_fd) => {
+            probe!("25: xwayland spawned, registering pipe fd");
+            // We need the raw fd value to capture it in the closure AND to
+            // wrap it back into an OwnedFd inside the closure. Using into_raw_fd
+            // here gives us a plain integer we can copy into the closure; the
+            // OwnedFd is reconstructed (and therefore dropped/closed) inside
+            // the one-shot handler after finish_start consumes it.
+            let pipe_raw = pipe_fd.into_raw_fd();
+            event_loop.handle().insert_source(
+                Generic::new(
+                    unsafe { calloop::generic::FdWrapper::new(pipe_raw) },
+                    Interest::READ,
+                    Mode::Edge,
+                ),
+                move |_, _, state| {
+                    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pipe_raw) };
+                    match state.xwayland.finish_start(fd) {
+                        Ok(()) => probe!("xwayland: finish_start OK"),
+                        Err(e) => tracing::warn!("XWayland finish_start failed: {e}"),
+                    }
+                    // One-shot — remove this source immediately.
+                    Ok(PostAction::Remove)
+                },
+            )?;
+            probe!("26: xwayland pipe fd registered");
+        }
+        Err(e) => {
+            tracing::warn!("XWayland failed to spawn: {e}");
+            probe!("24a: xwayland spawn FAILED");
+        }
+    }
+
+    // ── Wayland display fd ────────────────────────────────────────────────────
+    probe!("27: registering wayland display fd");
     {
         let poll_fd = display.backend().poll_fd().as_raw_fd();
         event_loop.handle().insert_source(
@@ -231,6 +311,8 @@ fn main() -> Result<()> {
             |_, _, _state| Ok(PostAction::Continue),
         )?;
     }
+    probe!("28: wayland display fd registered");
+
     {
         let listener_fd = listener.as_raw_fd();
         event_loop.handle().insert_source(
@@ -250,6 +332,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
+    probe!("29: listener fd registered");
+
     {
         let drm_fd = state.backend.drm.as_raw_fd();
         event_loop.handle().insert_source(
@@ -271,6 +355,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
+    probe!("30: drm fd registered");
+
     {
         let li_fd = state.input.as_raw_fd();
         event_loop.handle().insert_source(
@@ -285,6 +371,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
+    probe!("31: libinput fd registered");
+
     {
         let seat_fd = state.backend.session.fd;
         event_loop.handle().insert_source(
@@ -314,13 +402,15 @@ fn main() -> Result<()> {
             },
         )?;
     }
+    probe!("32: seat fd registered");
+
     {
         let ipc_fd = state.ipc.as_raw_fd();
         event_loop.handle().insert_source(
             Generic::new(
                 unsafe { calloop::generic::FdWrapper::new(ipc_fd) },
                 Interest::READ,
-                Mode::Level,
+                Mode::Edge,
             ),
             |_, _, state| {
                 ipc::drain_ipc(state);
@@ -328,6 +418,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
+    probe!("33: ipc fd registered");
+
     event_loop.handle().insert_source(
         Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap(),
         |_, _, state| {
@@ -335,22 +427,43 @@ fn main() -> Result<()> {
             state.running.store(false, Ordering::SeqCst);
         },
     )?;
+    probe!("34: signal handler registered");
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     tracing::info!("Axiom running — WAYLAND_DISPLAY={socket_name}");
-    state.script.emit_bare("compositor.ready");
+    probe!("35: entering main loop");
 
     while running.load(Ordering::SeqCst) {
         event_loop.dispatch(Some(Duration::from_millis(2)), &mut state)?;
         display.dispatch_clients(&mut state)?;
+
+        // If finish_start() completed on this iteration, register the X11 fd.
+        if state.xwayland.ready {
+            state.xwayland.ready = false;
+            if let Some(x11_fd) = state.xwayland.x11_fd() {
+                event_loop.handle().insert_source(
+                    Generic::new(
+                        unsafe { calloop::generic::FdWrapper::new(x11_fd) },
+                        Interest::READ,
+                        Mode::Level,
+                    ),
+                    |_, _, state| {
+                        let actions = state.xwayland.dispatch_events();
+                        dispatch_x11_actions(state, actions);
+                        Ok(PostAction::Continue)
+                    },
+                )?;
+                probe!("xwayland: x11 fd registered with calloop");
+            } else {
+                probe!("xwayland: x11_fd() returned None after finish_start");
+            }
+        }
 
         if state.anim.tick() {
             state.needs_redraw = true;
         }
         state.script.tick(&state.wm);
 
-        // Drain script actions: pull the queue out first to avoid a
-        // simultaneous mutable borrow of both state.script and state.
         {
             let actions: Vec<scripting::lua_api::LuaAction> =
                 std::mem::take(&mut *state.script.queue.lock().unwrap());
@@ -369,6 +482,73 @@ fn main() -> Result<()> {
     tracing::info!("Axiom shutdown");
     Ok(())
 }
+
+// ── X11 action dispatch ───────────────────────────────────────────────────────
+
+fn dispatch_x11_actions(state: &mut Axiom, actions: Vec<X11Action>) {
+    for action in actions {
+        match action {
+            X11Action::MapWindow {
+                x11_win,
+                title,
+                app_id,
+                override_redirect,
+                surface_serial,
+            } => {
+                if !override_redirect {
+                    state.try_pair_from_x11(x11_win, title, app_id, surface_serial);
+                }
+            }
+
+            X11Action::UnmapWindow { x11_win } => {
+                state.unpair_x11_window(x11_win);
+            }
+
+            X11Action::TitleChanged { x11_win, title } => {
+                if let Some(&win_id) = state.xwayland.x11_to_wl.get(&x11_win) {
+                    state.wm.set_title(win_id, title);
+                    state.needs_redraw = true;
+                }
+            }
+
+            X11Action::FocusRequest { x11_win } => {
+                if let Some(&win_id) = state.xwayland.x11_to_wl.get(&x11_win) {
+                    state.wm.focus_window(win_id);
+                    state.xwayland.set_focus(x11_win);
+                    state.sync_keyboard_focus();
+                    state.needs_redraw = true;
+                }
+            }
+
+            X11Action::ConfigureRequest {
+                x11_win,
+                x,
+                y,
+                w,
+                h,
+            } => {
+                if let Some(&win_id) = state.xwayland.x11_to_wl.get(&x11_win) {
+                    let r = state.wm.windows.get(&win_id).map(|w| w.rect);
+                    if let Some(r) = r {
+                        state
+                            .xwayland
+                            .configure_window(x11_win, r.x, r.y, r.w as u32, r.h as u32);
+                    }
+                } else {
+                    state.xwayland.configure_window(
+                        x11_win,
+                        x.unwrap_or(0),
+                        y.unwrap_or(0),
+                        w.unwrap_or(320),
+                        h.unwrap_or(240),
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
 
 fn render_all(state: &mut Axiom) {
     let n = state.outputs.len();
@@ -416,6 +596,8 @@ fn render_all(state: &mut Axiom) {
         }
     }
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn find_primary_gpu() -> Result<PathBuf> {
     for n in 0..8u32 {

@@ -153,7 +153,7 @@ impl Default for WmConfig {
         Self {
             border_w: 2,
             gap: 6,
-            bar_height: 0,
+            bar_height: 28, // ← was 0
             bar_at_bottom: false,
             active_border: [0.706, 0.745, 0.996, 1.0],
             inactive_border: [0.271, 0.278, 0.353, 1.0],
@@ -242,8 +242,18 @@ impl WmState {
     pub fn new(screen_w: i32, screen_h: i32, cfg: WmConfig) -> Self {
         let n = cfg.workspaces_count;
         let workspaces = (0..n).map(|i| Workspace::new(i, cfg.gap)).collect();
-        let monitor = Monitor::new(0, 0, 0, screen_w, screen_h, 0);
-        let content = Rect::new(0, 0, screen_w, screen_h);
+
+        // Compute the initial usable rect (bar at top by default).
+        let bh = cfg.bar_height;
+        let usable = if cfg.bar_at_bottom {
+            Rect::new(0, 0, screen_w, screen_h - bh)
+        } else {
+            Rect::new(0, bh, screen_w, screen_h - bh)
+        };
+        let mut monitor = Monitor::new(0, 0, 0, screen_w, screen_h, 0);
+        monitor.usable = usable;
+
+        let content = usable;
         let mut s = Self {
             windows: HashMap::new(),
             workspaces,

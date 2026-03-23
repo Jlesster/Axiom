@@ -20,14 +20,11 @@ impl ScriptEngine {
     pub fn new(config_dir: &Path, wm: &WmState) -> Result<Self> {
         let lua = Lua::new();
 
-        // Set up package.path so require() resolves from the config dir.
-        // Scoped block so the LuaTable borrow is dropped before we move `lua`.
         {
             let package: LuaTable = lua.globals().get("package")?;
             let existing: String = package.get("path").unwrap_or_default();
             let dir = config_dir.to_string_lossy();
-            package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua;{existing}",))?;
-            // Disable C module loading from config dir for safety.
+            package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua;{existing}"))?;
             package.set("cpath", "")?;
         }
 
@@ -35,10 +32,13 @@ impl ScriptEngine {
         let queue =
             lua_api::install(&lua, wm).map_err(|e| anyhow::anyhow!("Lua API install: {e}"))?;
 
+        let rc_path = config_dir.join("axiom.rc.lua");
+        write_default_rc_if_missing(&rc_path);
+
         Ok(Self {
             lua,
             queue,
-            rc_path: config_dir.join("axiom.rc.lua"),
+            rc_path,
         })
     }
 
@@ -76,7 +76,7 @@ impl ScriptEngine {
         self.run_rc(wm)
     }
 
-    pub fn fire_keybind(&self, combo: &str) -> Result<()> {
+    pub fn fire_keybind(&self, combo: &str) -> Result<bool> {
         lua_api::fire_keybind(&self.lua, combo)
             .map_err(|e| anyhow::anyhow!("keybind '{combo}': {e}"))
     }
@@ -140,4 +140,84 @@ impl ScriptEngine {
             }
         }
     }
+}
+
+// ── Default RC ────────────────────────────────────────────────────────────────
+
+fn write_default_rc_if_missing(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Use a high-fence raw string so the Lua code's double-quoted strings
+    // don't accidentally close the Rust raw string literal.
+    let rc = r######"-- axiom.rc.lua  (auto-generated defaults — edit freely)
+
+axiom.set {
+    border_width    = 2,
+    gap             = 6,
+    bar_height      = 28,
+    workspaces      = 9,
+    border_active   = "#7dc4e4",
+    border_inactive = "#45475a",
+}
+
+local mod = "super"
+
+-- Terminal
+axiom.key(mod.."+Return", function() axiom.spawn("foot")      end)
+
+-- Launcher
+axiom.key(mod.."+d", function() axiom.spawn("fuzzel")         end)
+axiom.key(mod.."+p", function() axiom.spawn("rofi -show run") end)
+
+-- Window control
+axiom.key(mod.."+q",       function() axiom.close()      end)
+axiom.key(mod.."+shift+q", function() axiom.quit()       end)
+axiom.key(mod.."+f",       function() axiom.fullscreen() end)
+axiom.key(mod.."+shift+f", function() axiom.float()      end)
+
+-- Focus (vim + arrow keys)
+axiom.key(mod.."+h",     function() axiom.focus("left")  end)
+axiom.key(mod.."+l",     function() axiom.focus("right") end)
+axiom.key(mod.."+k",     function() axiom.focus("up")    end)
+axiom.key(mod.."+j",     function() axiom.focus("down")  end)
+axiom.key(mod.."+Left",  function() axiom.focus("left")  end)
+axiom.key(mod.."+Right", function() axiom.focus("right") end)
+axiom.key(mod.."+Up",    function() axiom.focus("up")    end)
+axiom.key(mod.."+Down",  function() axiom.focus("down")  end)
+
+-- Cycle focus
+axiom.key(mod.."+Tab",       function() axiom.cycle(1)  end)
+axiom.key(mod.."+shift+Tab", function() axiom.cycle(-1) end)
+
+-- Move window in layout
+axiom.key(mod.."+shift+h", function() axiom.move("left")  end)
+axiom.key(mod.."+shift+l", function() axiom.move("right") end)
+axiom.key(mod.."+shift+k", function() axiom.move("up")    end)
+axiom.key(mod.."+shift+j", function() axiom.move("down")  end)
+
+-- Layouts
+axiom.key(mod.."+space",       function() axiom.layout(axiom.ws(), "tile")    end)
+axiom.key(mod.."+shift+space", function() axiom.layout(axiom.ws(), "monocle") end)
+axiom.key(mod.."+b",           function() axiom.layout(axiom.ws(), "bsp")     end)
+axiom.key(mod.."+equal",       function() axiom.inc_master() end)
+axiom.key(mod.."+minus",       function() axiom.dec_master() end)
+
+-- Workspaces 1-9
+for i = 1, 9 do
+    local n = i
+    axiom.key(mod.."+"..n,       function() axiom.workspace(n) end)
+    axiom.key(mod.."+shift+"..n, function() axiom.send(n)      end)
+end
+
+-- Reload / screenshot
+axiom.key(mod.."+shift+r", function() axiom.reload() end)
+axiom.key("Print",         function() axiom.spawn("grim ~/screenshot.png") end)
+axiom.key("shift+Print",   function() axiom.spawn("grim -g \"$(slurp)\" ~/screenshot.png") end)
+"######;
+    let _ = std::fs::write(path, rc);
+    tracing::info!("wrote default axiom.rc.lua to {:?}", path);
 }
