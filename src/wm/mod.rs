@@ -683,8 +683,10 @@ impl WmState {
             sh: i32,
             layout: Layout,
             ratio: f32,
+            master_n: usize,
             gap: i32,
             outer_gap: i32,
+            border_w: i32,
             tiled: Vec<WindowId>,
             all_wins: Vec<WindowId>,
         }
@@ -713,8 +715,10 @@ impl WmState {
                     sh: m.height,
                     layout: ws.layout,
                     ratio: ws.main_ratio,
+                    master_n: ws.master_n,
                     gap: ws.gap,
                     outer_gap: self.config.outer_gap,
+                    border_w: self.config.border_w,
                     tiled,
                     all_wins: ws.windows.clone(),
                 }
@@ -722,17 +726,37 @@ impl WmState {
             .collect();
 
         for task in &tasks {
+            // layout::compute returns tile rects (including the space the border
+            // ring will occupy). We then inset each rect by border_w to get the
+            // content rect — the area the client actually renders into. The border
+            // ring is drawn outside the content rect, expanding back to the tile
+            // boundary. This means:
+            //   tile rect  = layout output  (what the WM owns)
+            //   content rect = tile.inset(border_w)  (what we send in configure)
+            //
+            // The gap between tiles must also account for the two border rings
+            // meeting across the gap. With gap=6 and bw=2, each tile's border
+            // extends 2px outward, leaving 2px of actual gap between borders.
+            // To keep a visually consistent gap, increase inner_gap by 2*border_w
+            // so layout spacing accounts for both rings.
+            let effective_gap = task.gap + task.border_w * 2;
             let rects = layout::compute(
                 task.layout,
                 task.usable,
                 task.tiled.len(),
                 task.ratio,
-                task.gap,
+                task.master_n,
+                effective_gap,
                 task.outer_gap,
             );
             for (i, &id) in task.tiled.iter().enumerate() {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    win.rect = rects.get(i).copied().unwrap_or(task.usable);
+                    // Store the content rect (inset by border_w). The renderer
+                    // draws the border ring outside this rect. The configure sent
+                    // to the client uses win.rect.w × win.rect.h so the client
+                    // renders exactly the content area, not the tile area.
+                    let tile = rects.get(i).copied().unwrap_or(task.usable);
+                    win.rect = tile.inset(task.border_w);
                 }
             }
             for &id in &task.all_wins {

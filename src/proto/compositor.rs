@@ -246,17 +246,27 @@ fn commit_surface(state: &mut Axiom, surface: &WlSurface, data: &Arc<SurfaceData
     let mut pending = data.pending.lock().unwrap();
     let mut current = data.current.lock().unwrap();
 
+    // Only flag a new upload when a new buffer is actually being attached.
+    // Previously needs_upload was set unconditionally on every commit even
+    // when the client committed with no buffer change (e.g. frame callbacks
+    // only), causing spurious re-uploads every frame.
     if let Some(new_buffer) = pending.buffer.take() {
         if let Some(old) = current.buffer.take() {
             old.release();
         }
         current.buffer = new_buffer;
+        // Signal that render should re-upload this surface's texture.
+        // The render path clears this flag after calling upload_surface_texture.
         current.needs_upload = current.buffer.is_some();
     }
 
     current.dx = pending.dx;
     current.dy = pending.dy;
 
+    // Replace damage list rather than accumulating: the render path processes
+    // damage once per commit and then it's stale. Accumulation across commits
+    // without consuming between them inflates the damage list unboundedly.
+    current.damage_buffer.clear();
     current
         .damage_buffer
         .extend(pending.damage_buffer.drain(..));

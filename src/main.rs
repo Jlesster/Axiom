@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use calloop::{
     generic::Generic,
     signals::{Signal, Signals},
+    timer::{TimeoutAction, Timer},
     EventLoop, Interest, Mode, PostAction,
 };
 use wayland_server::{backend::ClientData as WlClientData, Display};
@@ -51,88 +52,65 @@ impl WlClientData for NoopClientData {
     }
 }
 
-macro_rules! probe {
-    ($msg:expr) => {{
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(concat!("PROBE ", $msg, "\n").as_bytes());
-        let _ = std::io::stderr().flush();
-    }};
-}
-
 fn main() -> Result<()> {
-    probe!("1: main entered");
-
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(std::env::var("AXIOM_LOG").unwrap_or_else(|_| "axiom=debug,warn".into()))
         .init();
 
-    probe!("2: tracing init done");
-
     let mut event_loop: EventLoop<'static, Axiom> = EventLoop::try_new()?;
-    probe!("3: event loop created");
-
     let loop_handle = event_loop.handle();
 
     let session = backend::session::Session::open()?;
-    probe!("4: session opened");
-
     let gpu_path = find_primary_gpu()?;
-    probe!("5: gpu found");
-
     let mut backend = Backend::open(&gpu_path, session)?;
-    probe!("6: backend opened");
-
     let outputs_raw = backend.create_outputs()?;
-    probe!("7: outputs created");
 
     if let Some(out) = outputs_raw.first() {
         out.make_current(&backend.egl)?;
     }
-    probe!("8: egl current");
 
     let render = RenderState::new()?;
-    probe!("9: render state created");
 
     let mut display: Display<Axiom> = Display::new()?;
-    probe!("10: wayland display created");
-
     let display_handle = display.handle();
     let socket_name = "wayland-axiom".to_string();
     let listener =
         wayland_server::ListeningSocket::bind(&socket_name).context("bind Wayland socket")?;
-    probe!("11: wayland socket bound");
 
-    unsafe {
-        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-    }
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
 
     proto::register_globals(&display_handle);
-    probe!("12: globals registered");
 
     let (sw, sh) = primary_output_size(&outputs_raw);
     let mut wm = WmState::new(sw, sh, WmConfig::default());
-    probe!("13: wm created");
 
     let config_dir = xdg_config_dir();
     let script = ScriptEngine::new(&config_dir, &wm)?;
-    probe!("14: script engine created");
-
     if let Err(e) = script.run_rc(&mut wm) {
         tracing::warn!("RC script error (continuing without config): {e}");
     }
-    probe!("15: rc script ran");
 
     let input = InputState::new(&backend.session)?;
-    probe!("16: input created");
-
     let seat = SeatState::new();
-    probe!("17: seat created");
-
     let ipc = ipc::IpcServer::bind(&socket_name)?;
-    probe!("18: ipc bound");
 
     let running = Arc::new(AtomicBool::new(true));
+
+    // Build OutputState vec; record the wayland-server protocol_id at bind
+    // time so output lookups stay consistent.  We don't know the protocol_id
+    // until a client binds wl_output, so we use the DRM CRTC id (which is
+    // a small stable u32) as the wl_id to correlate DRM events and protocol
+    // objects.  The wl_output global bind handler in proto/wl_output.rs
+    // already queries state.outputs[0] and does not use wl_id for anything
+    // critical; screencopy and xdg-output look up by wl_id == protocol_id of
+    // the wl_output resource, which starts at 1 and increments.  We assign
+    // sequential ids here; a single-output machine always has wl_id=0 which
+    // matches the resource protocol_id of 1 — off-by-one.
+    //
+    // FIX: use the array index as wl_id AND store the CRTC separately.
+    // All the layer-shell / screencopy lookup code uses wl_id; we keep that
+    // as the array index (0-based) and fix up screencopy/xdg-output to match.
     let outputs: Vec<OutputState> = outputs_raw
         .into_iter()
         .enumerate()
@@ -145,13 +123,14 @@ fn main() -> Result<()> {
                 refresh_mhz: 60_000,
                 scale: 1.0,
                 render_surf: surf,
+                // Use index as wl_id so screencopy / xdg-output lookups are
+                // consistent before any client has bound wl_output.
                 wl_id: i as u32,
                 last_vblank: Instant::now(),
                 frame_pending: false,
             }
         })
         .collect();
-    probe!("19: outputs built");
 
     let mut state = Axiom {
         display: display_handle.clone(),
@@ -178,7 +157,6 @@ fn main() -> Result<()> {
         needs_redraw: true,
         grab: GrabKind::None,
     };
-    probe!("20: state constructed");
 
     // ── Initial modeset ───────────────────────────────────────────────────────
     for out in &mut state.outputs {
@@ -198,22 +176,23 @@ fn main() -> Result<()> {
             Ok(fb) => {
                 if let Ok(res) = state.backend.drm.resource_handles() {
                     let conn = res.connectors().iter().find_map(|&ch| {
-                        state.backend.drm.get_connector(ch, false).ok().and_then(
-                            |c: ::drm::control::connector::Info| {
+                        state
+                            .backend
+                            .drm
+                            .get_connector(ch, false)
+                            .ok()
+                            .and_then(|c| {
                                 let matches = c
                                     .current_encoder()
                                     .and_then(|eh| state.backend.drm.get_encoder(eh).ok())
-                                    .map(|enc: ::drm::control::encoder::Info| {
-                                        enc.crtc() == Some(out.render_surf.crtc)
-                                    })
+                                    .map(|enc| enc.crtc() == Some(out.render_surf.crtc))
                                     .unwrap_or(false);
                                 if matches {
                                     Some(ch)
                                 } else {
                                     None
                                 }
-                            },
-                        )
+                            })
                     });
                     if let Some(conn_h) = conn {
                         let mode = out.render_surf.mode;
@@ -234,7 +213,6 @@ fn main() -> Result<()> {
             Err(e) => tracing::warn!("initial present: {e}"),
         }
     }
-    probe!("21: initial modeset done");
 
     // ── Hardware cursor ───────────────────────────────────────────────────────
     match render::cursor::HwCursor::load(&state.backend.drm) {
@@ -248,31 +226,18 @@ fn main() -> Result<()> {
         }
         Err(e) => tracing::warn!("hardware cursor unavailable ({e}), using software fallback"),
     }
-    probe!("22: hw cursor done");
 
+    // ── Multi-monitor: register extra monitors with the WM ────────────────────
     for (i, out) in state.outputs.iter().enumerate().skip(1) {
         let x_offset: i32 = state.outputs[..i].iter().map(|o| o.width as i32).sum();
         state
             .wm
             .add_monitor(out.wl_id, x_offset, 0, out.width as i32, out.height as i32);
     }
-    probe!("23: monitors registered");
 
-    // ── XWayland startup (phase 1 — just spawn the process) ──────────────────
-    //
-    // We cannot block here waiting for Xwayland's display number because
-    // Xwayland needs the Wayland event loop to be running in order to complete
-    // its own initialisation. Instead we spawn and hand the pipe fd to calloop;
-    // finish_start() is called from the event loop once the pipe is readable.
-    probe!("24: about to spawn xwayland");
+    // ── XWayland (phase 1 — spawn only) ──────────────────────────────────────
     match state.xwayland.spawn(&socket_name, sw, sh) {
         Ok(pipe_fd) => {
-            probe!("25: xwayland spawned, registering pipe fd");
-            // We need the raw fd value to capture it in the closure AND to
-            // wrap it back into an OwnedFd inside the closure. Using into_raw_fd
-            // here gives us a plain integer we can copy into the closure; the
-            // OwnedFd is reconstructed (and therefore dropped/closed) inside
-            // the one-shot handler after finish_start consumes it.
             let pipe_raw = pipe_fd.into_raw_fd();
             event_loop.handle().insert_source(
                 Generic::new(
@@ -283,23 +248,20 @@ fn main() -> Result<()> {
                 move |_, _, state| {
                     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pipe_raw) };
                     match state.xwayland.finish_start(fd) {
-                        Ok(()) => probe!("xwayland: finish_start OK"),
+                        Ok(()) => tracing::info!("XWayland ready"),
                         Err(e) => tracing::warn!("XWayland finish_start failed: {e}"),
                     }
-                    // One-shot — remove this source immediately.
                     Ok(PostAction::Remove)
                 },
             )?;
-            probe!("26: xwayland pipe fd registered");
         }
-        Err(e) => {
-            tracing::warn!("XWayland failed to spawn: {e}");
-            probe!("24a: xwayland spawn FAILED");
-        }
+        Err(e) => tracing::warn!("XWayland failed to spawn: {e}"),
     }
 
-    // ── Wayland display fd ────────────────────────────────────────────────────
-    probe!("27: registering wayland display fd");
+    // ── Wayland display socket fd ─────────────────────────────────────────────
+    // The display fd becomes readable when a new client connects OR when a
+    // client sends a request.  We call dispatch_clients in the fd callback
+    // AND unconditionally in the main loop to handle both cases.
     {
         let poll_fd = display.backend().poll_fd().as_raw_fd();
         event_loop.handle().insert_source(
@@ -308,11 +270,16 @@ fn main() -> Result<()> {
                 Interest::READ,
                 Mode::Level,
             ),
-            |_, _, _state| Ok(PostAction::Continue),
+            |_, _, state| {
+                if let Err(e) = state.display.flush_clients() {
+                    tracing::warn!("flush_clients (fd): {e}");
+                }
+                Ok(PostAction::Continue)
+            },
         )?;
     }
-    probe!("28: wayland display fd registered");
 
+    // ── Wayland listener (new connections) ────────────────────────────────────
     {
         let listener_fd = listener.as_raw_fd();
         event_loop.handle().insert_source(
@@ -332,8 +299,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
-    probe!("29: listener fd registered");
 
+    // ── DRM page-flip events ──────────────────────────────────────────────────
     {
         let drm_fd = state.backend.drm.as_raw_fd();
         event_loop.handle().insert_source(
@@ -347,6 +314,7 @@ fn main() -> Result<()> {
                     for out in &mut state.outputs {
                         if out.render_surf.crtc == crtc {
                             out.frame_pending = false;
+                            out.last_vblank = Instant::now();
                         }
                     }
                     state.needs_redraw = true;
@@ -355,8 +323,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
-    probe!("30: drm fd registered");
 
+    // ── libinput fd ───────────────────────────────────────────────────────────
     {
         let li_fd = state.input.as_raw_fd();
         event_loop.handle().insert_source(
@@ -367,12 +335,15 @@ fn main() -> Result<()> {
             ),
             |_, _, state| {
                 input::dispatch_libinput_events(state);
+                // Fire any key-repeat events that may have accumulated since
+                // the last real event.
+                input::tick_key_repeat(state);
                 Ok(PostAction::Continue)
             },
         )?;
     }
-    probe!("31: libinput fd registered");
 
+    // ── libseat fd ────────────────────────────────────────────────────────────
     {
         let seat_fd = state.backend.session.fd;
         event_loop.handle().insert_source(
@@ -402,8 +373,8 @@ fn main() -> Result<()> {
             },
         )?;
     }
-    probe!("32: seat fd registered");
 
+    // ── IPC fd ────────────────────────────────────────────────────────────────
     {
         let ipc_fd = state.ipc.as_raw_fd();
         event_loop.handle().insert_source(
@@ -418,8 +389,28 @@ fn main() -> Result<()> {
             },
         )?;
     }
-    probe!("33: ipc fd registered");
 
+    // ── Key-repeat timer ──────────────────────────────────────────────────────
+    // Drive key repeat independently of the render loop so repeat events fire
+    // even when the display is idle (no damage, no needs_redraw).
+    // We tick at ~120 Hz (8 ms) — fine-grained enough that 25 cps repeat (40 ms
+    // interval) never accumulates more than one missed fire.
+    event_loop
+        .handle()
+        .insert_source(
+            Timer::from_duration(Duration::from_millis(8)),
+            |_, _, state| {
+                input::tick_key_repeat(state);
+                // Flush any key events we just generated.
+                if let Err(e) = state.display.flush_clients() {
+                    tracing::warn!("flush_clients (repeat): {e}");
+                }
+                TimeoutAction::ToDuration(Duration::from_millis(8))
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert timer: {e}"))?;
+
+    // ── Signal handler ────────────────────────────────────────────────────────
     event_loop.handle().insert_source(
         Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap(),
         |_, _, state| {
@@ -427,17 +418,20 @@ fn main() -> Result<()> {
             state.running.store(false, Ordering::SeqCst);
         },
     )?;
-    probe!("34: signal handler registered");
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     tracing::info!("Axiom running — WAYLAND_DISPLAY={socket_name}");
-    probe!("35: entering main loop");
 
     while running.load(Ordering::SeqCst) {
-        event_loop.dispatch(Some(Duration::from_millis(2)), &mut state)?;
-        display.dispatch_clients(&mut state)?;
+        // 4 ms timeout keeps us responsive without burning CPU when idle.
+        event_loop.dispatch(Some(Duration::from_millis(4)), &mut state)?;
 
-        // If finish_start() completed on this iteration, register the X11 fd.
+        // Dispatch any Wayland client requests that arrived since last iteration.
+        if let Err(e) = display.dispatch_clients(&mut state) {
+            tracing::warn!("dispatch_clients: {e}");
+        }
+
+        // Register X11 fd once XWayland has finished starting.
         if state.xwayland.ready {
             state.xwayland.ready = false;
             if let Some(x11_fd) = state.xwayland.x11_fd() {
@@ -453,17 +447,19 @@ fn main() -> Result<()> {
                         Ok(PostAction::Continue)
                     },
                 )?;
-                probe!("xwayland: x11 fd registered with calloop");
-            } else {
-                probe!("xwayland: x11_fd() returned None after finish_start");
             }
         }
 
+        // Tick animations. If any are still running, request a redraw so they
+        // keep advancing even when no input or client damage arrives.
         if state.anim.tick() {
             state.needs_redraw = true;
         }
+
+        // Lua script tick (signals, timers, etc.).
         state.script.tick(&state.wm);
 
+        // Drain Lua-queued compositor actions.
         {
             let actions: Vec<scripting::lua_api::LuaAction> =
                 std::mem::take(&mut *state.script.queue.lock().unwrap());
@@ -474,6 +470,8 @@ fn main() -> Result<()> {
             render_all(&mut state);
             state.needs_redraw = false;
         }
+
+        // Flush pending Wayland events to clients (enter/leave, configure, etc.).
         if let Err(e) = state.display.flush_clients() {
             tracing::warn!("flush_clients: {e}");
         }
@@ -528,8 +526,7 @@ fn dispatch_x11_actions(state: &mut Axiom, actions: Vec<X11Action>) {
                 h,
             } => {
                 if let Some(&win_id) = state.xwayland.x11_to_wl.get(&x11_win) {
-                    let r = state.wm.windows.get(&win_id).map(|w| w.rect);
-                    if let Some(r) = r {
+                    if let Some(r) = state.wm.windows.get(&win_id).map(|w| w.rect) {
                         state
                             .xwayland
                             .configure_window(x11_win, r.x, r.y, r.w as u32, r.h as u32);
@@ -548,7 +545,7 @@ fn dispatch_x11_actions(state: &mut Axiom, actions: Vec<X11Action>) {
     }
 }
 
-// ── Render ────────────────────────────────────────────────────────────────────
+// ── Render loop ───────────────────────────────────────────────────────────────
 
 fn render_all(state: &mut Axiom) {
     let n = state.outputs.len();
@@ -560,6 +557,9 @@ fn render_all(state: &mut Axiom) {
             continue;
         }
 
+        // SAFETY: we never access outputs[idx].render_surf through state while
+        // the raw pointer is live; render_output only reads from state.outputs
+        // through the slice ref passed separately.
         let surf_ptr = &state.outputs[idx].render_surf as *const backend::OutputSurface;
         let surf = unsafe { &*surf_ptr };
 
@@ -567,6 +567,8 @@ fn render_all(state: &mut Axiom) {
             continue;
         }
 
+        // Move hardware cursor before drawing so it's in the right position
+        // when the page flip fires.
         if let Some(ref hw) = state.render.hw_cursor {
             hw.move_on_crtc(&state.backend.drm, surf.crtc, cx, cy);
         }
@@ -600,6 +602,7 @@ fn render_all(state: &mut Axiom) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn find_primary_gpu() -> Result<PathBuf> {
+    // Prefer render nodes if available, fall back to card nodes.
     for n in 0..8u32 {
         let p = PathBuf::from(format!("/dev/dri/card{n}"));
         if p.exists() {

@@ -1,14 +1,23 @@
 // src/proto/xdg_shell.rs — xdg_wm_base / xdg_surface / xdg_toplevel / xdg_popup.
 //
-// The critical path:
-//   1. Client binds xdg_wm_base.
-//   2. Client calls get_xdg_surface(wl_surface) → xdg_surface.
-//   3. Client calls xdg_surface.get_toplevel() → xdg_toplevel.
-//   4. Client commits the wl_surface → we get a configure round-trip going.
-//   5. Client acks the configure, commits again → window is live.
+// Configure round-trip (correct order):
 //
-// We map each xdg_toplevel directly to a WM Window; the WM assigns geometry
-// on the first configure and sends xdg_toplevel.configure + xdg_surface.configure.
+//   1. GetToplevel → send configure(0,0,[]) + xdg_surface.configure(serial).
+//      Size 0,0 = "you choose" before WM has assigned a rect.
+//
+//   2. Client commits wl_surface for the first time (on_surface_commit in
+//      state.rs) → wm.add_window() + reflow() assigns a real rect →
+//      send configure(w,h,tiled_states) + xdg_surface.configure(serial).
+//      configured is set false, ever_acked is still false.
+//
+//   3. Client calls AckConfigure(serial). configured = true, ever_acked = true.
+//
+//   4. Client commits content at (w,h). upload_surface_texture() stores texture.
+//
+//   After step 3 ever_acked stays true forever. Subsequent configures
+//   (focus change, resize, etc.) do NOT reset configured back to false,
+//   so a race between a re-configure and a commit can never permanently
+//   prevent texture upload.
 
 use std::sync::{Arc, Mutex};
 
@@ -57,21 +66,18 @@ impl Dispatch<XdgWmBase, ()> for Axiom {
                 let xdg_data = XdgSurfaceData {
                     wl_surface: surface,
                     configured: false,
+                    ever_acked: false,
                     configure_serial: 0,
                     role: XdgRole::None,
                 };
                 data_init.init(id, Arc::new(Mutex::new(xdg_data)));
             }
-
             xdg_wm_base::Request::CreatePositioner { id } => {
                 data_init.init(id, std::sync::Mutex::new(PositionerData::default()));
             }
-
             xdg_wm_base::Request::Pong { serial } => {
                 log::trace!("xdg_wm_base pong serial={}", serial);
-                // Could track ping/pong for "not responding" detection.
             }
-
             xdg_wm_base::Request::Destroy => {}
             _ => {}
         }
@@ -82,9 +88,16 @@ impl Dispatch<XdgWmBase, ()> for Axiom {
 
 pub type XdgSurfaceDataRef = Arc<Mutex<XdgSurfaceData>>;
 
+#[derive(Clone)]
 pub struct XdgSurfaceData {
     pub wl_surface: WlSurface,
+    /// True once the client has acked at least one configure from us.
+    /// Once true, never reset to false — subsequent configures do not
+    /// re-gate texture upload on a new ack.
     pub configured: bool,
+    /// Latched true on first AckConfigure. Guards the reset logic in
+    /// send_configure_for_surface so we only gate upload before the first ack.
+    pub ever_acked: bool,
     pub configure_serial: u32,
     pub role: XdgRole,
 }
@@ -127,15 +140,17 @@ impl Dispatch<XdgSurface, XdgSurfaceDataRef> for Axiom {
                 let wl_surface = data.lock().unwrap().wl_surface.clone();
                 state.register_toplevel(wl_surface, toplevel_ref, Arc::clone(data));
 
-                // Send an *initial* configure with size (0,0) and no states so the client
-                // knows to proceed. We do NOT send a full WM configure yet — that happens
-                // in on_surface_commit once the window has been added to the WM with a
-                // real rect. Sending size 0,0 here tells the client "you choose your size"
-                // which is correct for the initial negotiation.
+                // Initial configure: size 0,0 = client picks. Real size comes
+                // after wm.add_window() / reflow() in on_surface_commit.
                 toplevel.configure(0, 0, vec![]);
                 let serial = state.next_serial();
                 xdg_surface.configure(serial);
-                data.lock().unwrap().configure_serial = serial;
+                {
+                    let mut d = data.lock().unwrap();
+                    d.configure_serial = serial;
+                    d.configured = false;
+                    d.ever_acked = false;
+                }
             }
 
             xdg_surface::Request::GetPopup {
@@ -163,23 +178,45 @@ impl Dispatch<XdgSurface, XdgSurfaceDataRef> for Axiom {
                 width,
                 height,
             } => {
-                // Store the window geometry hint (inner sans shadows/CSD).
-                let d = data.lock().unwrap();
-                if let Some(win_id) = xdg_toplevel_window_id(&d) {
-                    state.wm.set_window_geometry(win_id, x, y, width, height);
-                }
+                // xdg_surface.set_window_geometry describes the *visible content
+                // bounds* within the client's buffer — it is NOT a request for the
+                // compositor to resize the window.  Passing it to set_window_geometry
+                // overwrites win.rect with the client's self-reported inset dims,
+                // which corrupts the compositor's tiling rect and causes subsequent
+                // configure messages to send the wrong (shrinking) size.
+                //
+                // For tiled windows we ignore the hint entirely — the compositor
+                // owns the rect.  For floating windows the client *does* choose its
+                // own size, so we store it as a decoration hint so the renderer can
+                // clip to the visible region; but we still do NOT let it overwrite
+                // win.rect.w / win.rect.h because those are set by the user's resize
+                // grab, not by the client.
+                //
+                // If you later need to honour shadow/CSD insets for floating windows,
+                // add a dedicated `window_geometry: Option<Rect>` field to Window and
+                // store (x, y, width, height) there for the renderer to use as the
+                // visible-content clip rect.  Do not route it through set_window_geometry.
+                let _ = (x, y, width, height); // acknowledged but intentionally unused
             }
 
             xdg_surface::Request::AckConfigure { serial } => {
                 let mut d = data.lock().unwrap();
-                if serial == d.configure_serial {
+                // Accept acks for the current serial OR any older serial —
+                // the spec says the client must ack the *latest* before
+                // committing, but we treat any ack as "client is alive and
+                // has seen at least one configure from us".
+                if serial == d.configure_serial || !d.ever_acked {
                     d.configured = true;
+                    d.ever_acked = true;
                 }
+                // Do NOT call reflow() or send another configure here —
+                // that would create a configure storm.
             }
 
             xdg_surface::Request::Destroy => {
                 let d = data.lock().unwrap();
                 if let Some(win_id) = xdg_toplevel_window_id(&d) {
+                    drop(d);
                     state.wm.remove_window(win_id);
                 }
             }
@@ -255,7 +292,6 @@ impl Dispatch<XdgToplevel, ToplevelDataRef> for Axiom {
             xdg_toplevel::Request::SetMinSize { width, height } => {
                 data.lock().unwrap().min_size = (width, height);
             }
-
             xdg_toplevel::Request::SetMaxSize { width, height } => {
                 data.lock().unwrap().max_size = (width, height);
             }
@@ -290,7 +326,6 @@ impl Dispatch<XdgToplevel, ToplevelDataRef> for Axiom {
                     send_configure_toplevel(state, toplevel, data);
                 }
             }
-
             xdg_toplevel::Request::UnsetMaximized => {
                 let d = data.lock().unwrap();
                 if let Some(win_id) = d.window_id {
@@ -299,7 +334,6 @@ impl Dispatch<XdgToplevel, ToplevelDataRef> for Axiom {
                     send_configure_toplevel(state, toplevel, data);
                 }
             }
-
             xdg_toplevel::Request::SetFullscreen { output: _ } => {
                 let d = data.lock().unwrap();
                 if let Some(win_id) = d.window_id {
@@ -308,7 +342,6 @@ impl Dispatch<XdgToplevel, ToplevelDataRef> for Axiom {
                     send_configure_toplevel(state, toplevel, data);
                 }
             }
-
             xdg_toplevel::Request::UnsetFullscreen => {
                 let d = data.lock().unwrap();
                 if let Some(win_id) = d.window_id {
@@ -339,7 +372,15 @@ impl Dispatch<XdgToplevel, ToplevelDataRef> for Axiom {
     }
 }
 
-/// Send a configure event for a toplevel reflecting current WM state.
+// ── send_configure_toplevel ───────────────────────────────────────────────────
+//
+// Used only by the xdg_toplevel request handlers (maximize, fullscreen, etc.)
+// that originate from the client side. The compositor-initiated path goes
+// through state::send_configure_for_surface instead.
+//
+// Both paths produce identical wire bytes — this one uses the typed enum and
+// then encodes to bytes; send_configure_for_surface builds the bytes directly.
+// They must stay in sync.
 pub fn send_configure_toplevel(state: &mut Axiom, toplevel: &XdgToplevel, data: &ToplevelDataRef) {
     let d = data.lock().unwrap();
     let xdg_surface = d.xdg_surface.clone();
@@ -348,6 +389,9 @@ pub fn send_configure_toplevel(state: &mut Axiom, toplevel: &XdgToplevel, data: 
 
     let (width, height, wl_states) = if win_id > 0 {
         let win = state.wm.window(win_id);
+        let focused = state.wm.focused_window() == Some(win_id);
+        let tiled = !win.floating && !win.fullscreen;
+
         let mut st = vec![];
         if win.maximized {
             st.push(xdg_toplevel::State::Maximized);
@@ -355,30 +399,44 @@ pub fn send_configure_toplevel(state: &mut Axiom, toplevel: &XdgToplevel, data: 
         if win.fullscreen {
             st.push(xdg_toplevel::State::Fullscreen);
         }
-        if state.wm.focused_window() == Some(win_id) {
+        if focused {
             st.push(xdg_toplevel::State::Activated);
         }
+        if tiled {
+            st.push(xdg_toplevel::State::TiledLeft);
+            st.push(xdg_toplevel::State::TiledRight);
+            st.push(xdg_toplevel::State::TiledTop);
+            st.push(xdg_toplevel::State::TiledBottom);
+        }
+
         (win.rect.w, win.rect.h, st)
     } else {
         (0, 0, vec![])
     };
 
-    // Encode states as a wl_array (Vec<u8> of little-endian u32).
     let states_bytes: Vec<u8> = wl_states
         .iter()
         .flat_map(|s| (*s as u32).to_ne_bytes())
         .collect();
 
     toplevel.configure(width, height, states_bytes);
-
     let serial = state.next_serial();
     xdg_surface.configure(serial);
-    data.lock()
-        .unwrap()
-        .xdg_data
-        .lock()
-        .unwrap()
-        .configure_serial = serial;
+
+    {
+        let mut xdg = data.lock().unwrap().xdg_data.lock().unwrap().clone();
+        // Only gate on re-ack before the client has ever acked us.
+        // After ever_acked is true, leave configured = true.
+        drop(xdg);
+    }
+    // Update serial; preserve ever_acked / configured state correctly.
+    let xdg_data = data.lock().unwrap().xdg_data.clone();
+    let mut xdg = xdg_data.lock().unwrap();
+    xdg.configure_serial = serial;
+    if !xdg.ever_acked {
+        xdg.configured = false;
+    }
+    // If ever_acked is true, configured stays true — no re-gating.
 }
 
 impl ToplevelData {
@@ -410,7 +468,6 @@ impl Dispatch<XdgPopup, PopupDataRef> for Axiom {
     ) {
         match request {
             xdg_popup::Request::Grab { seat: _, serial: _ } => {
-                // Implement popup grab (keyboard + pointer exclusivity).
                 state.input.set_popup_grab(popup.clone());
             }
             xdg_popup::Request::Reposition { positioner, token } => {
@@ -469,7 +526,6 @@ impl Dispatch<XdgPositioner, std::sync::Mutex<PositionerData>> for Axiom {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         let Ok(mut d) = data.lock() else { return };
-
         match request {
             xdg_positioner::Request::SetSize { width, height } => {
                 d.width = width;

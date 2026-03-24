@@ -22,6 +22,7 @@ pub fn compute(
     area: Rect,
     n: usize,
     ratio: f32,
+    master_n: usize,
     inner_gap: i32,
     outer_gap: i32,
 ) -> Vec<Rect> {
@@ -37,7 +38,7 @@ pub fn compute(
         area
     };
     match layout {
-        Layout::MasterStack => master_stack(padded, n, ratio, inner_gap),
+        Layout::MasterStack => master_stack(padded, n, ratio, master_n.max(1), inner_gap),
         Layout::Bsp => bsp(padded, n, inner_gap),
         // Monocle: all windows occupy the full padded area, stacked.
         Layout::Monocle => vec![padded; n],
@@ -48,13 +49,32 @@ pub fn compute(
 
 // ── Master-Stack ──────────────────────────────────────────────────────────────
 
-fn master_stack(area: Rect, n: usize, ratio: f32, gap: i32) -> Vec<Rect> {
-    // Single window always fills the padded area — no master/slave split.
-    // This path is taken for n==1 but also naturally handles the transition
-    // back from 2→1 windows without any size jump because the outer_gap
-    // padding is applied identically in compute() above.
+fn master_stack(area: Rect, n: usize, ratio: f32, master_n: usize, gap: i32) -> Vec<Rect> {
     if n == 1 {
         return vec![area];
+    }
+
+    // Clamp master_n so there's always at least one slave unless all windows
+    // are masters (degenerate case: treat as evenly-divided columns).
+    let master_n = master_n.min(n);
+    let slave_n = n - master_n;
+
+    // If everything is in the master column, divide it evenly in a single column.
+    if slave_n == 0 {
+        let total_gap = gap * (master_n as i32 - 1);
+        let avail = (area.h - total_gap).max(master_n as i32);
+        return (0..master_n)
+            .map(|i| {
+                let y_off = (avail * i as i32) / master_n as i32 + gap * i as i32;
+                let y_next = if i + 1 == master_n {
+                    area.h
+                } else {
+                    (avail * (i as i32 + 1)) / master_n as i32 + gap * (i as i32 + 1)
+                };
+                let h = (y_next - y_off - if i + 1 == master_n { 0 } else { gap }).max(1);
+                Rect::new(area.x, area.y + y_off, area.w, h)
+            })
+            .collect();
     }
 
     // Master column width — clamped so neither column collapses.
@@ -62,33 +82,40 @@ fn master_stack(area: Rect, n: usize, ratio: f32, gap: i32) -> Vec<Rect> {
         .max(80)
         .min(area.w - gap - 80);
     let slave_w = (area.w - master_w - gap).max(80);
-    let slave_n = n - 1;
+    let slave_x = area.x + master_w + gap;
 
     let mut rects = Vec::with_capacity(n);
 
-    // Master: full height of the padded area.
-    rects.push(Rect::new(area.x, area.y, master_w, area.h));
+    // Master panes: divide the full height among master_n windows.
+    {
+        let total_gap = gap * (master_n as i32 - 1);
+        let avail = (area.h - total_gap).max(master_n as i32);
+        for i in 0..master_n {
+            let y_off = (avail * i as i32) / master_n as i32 + gap * i as i32;
+            let y_next = if i + 1 == master_n {
+                area.h
+            } else {
+                (avail * (i as i32 + 1)) / master_n as i32 + gap * (i as i32 + 1)
+            };
+            let h = (y_next - y_off - if i + 1 == master_n { 0 } else { gap }).max(1);
+            rects.push(Rect::new(area.x, area.y + y_off, master_w, h));
+        }
+    }
 
-    // Stack: divide remaining height evenly among slave_n windows.
-    // Use integer arithmetic that avoids cumulative rounding error:
-    // compute each window's top edge from the total available height
-    // rather than by adding individual heights in a loop.
-    let total_h = area.h;
-    let total_gap = gap * (slave_n as i32 - 1);
-    let available_h = (total_h - total_gap).max(slave_n as i32);
-    let slave_x = area.x + master_w + gap;
-
-    for i in 0..slave_n {
-        // Distribute height fairly: each slot gets floor(available_h / slave_n)
-        // and the remainder pixels go to the last slot.
-        let y_off = (available_h * i as i32) / slave_n as i32 + gap * i as i32;
-        let y_next = if i + 1 == slave_n {
-            total_h
-        } else {
-            (available_h * (i as i32 + 1)) / slave_n as i32 + gap * (i as i32 + 1)
-        };
-        let h = (y_next - y_off - if i + 1 == slave_n { 0 } else { gap }).max(1);
-        rects.push(Rect::new(slave_x, area.y + y_off, slave_w, h));
+    // Slave panes: divide remaining height among slave_n windows.
+    {
+        let total_gap = gap * (slave_n as i32 - 1);
+        let avail = (area.h - total_gap).max(slave_n as i32);
+        for i in 0..slave_n {
+            let y_off = (avail * i as i32) / slave_n as i32 + gap * i as i32;
+            let y_next = if i + 1 == slave_n {
+                area.h
+            } else {
+                (avail * (i as i32 + 1)) / slave_n as i32 + gap * (i as i32 + 1)
+            };
+            let h = (y_next - y_off - if i + 1 == slave_n { 0 } else { gap }).max(1);
+            rects.push(Rect::new(slave_x, area.y + y_off, slave_w, h));
+        }
     }
 
     rects

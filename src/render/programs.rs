@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Result};
 use std::ffi::CString;
+use std::sync::OnceLock;
 
 use crate::state::RawBuffer;
 
@@ -38,6 +39,19 @@ unsafe fn egl_proc(name: &[u8]) -> Option<*mut std::ffi::c_void> {
     }
 }
 
+// BUG FIX #15: resolve glEGLImageTargetTexture2DOES exactly once at first use.
+// Calling eglGetProcAddress on every upload is both slow and unreliable on
+// some drivers (Mesa, old NVIDIA) where the returned pointer may differ per
+// call or return NULL after the first successful resolution.
+type TargetFn = unsafe extern "C" fn(u32, *mut std::ffi::c_void);
+
+fn egl_image_target_texture() -> Option<TargetFn> {
+    static FN: OnceLock<Option<TargetFn>> = OnceLock::new();
+    *FN.get_or_init(|| unsafe {
+        egl_proc(b"glEGLImageTargetTexture2DOES\0").map(|p| std::mem::transmute(p))
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GlProgram
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,12 +65,10 @@ impl GlProgram {
         unsafe {
             let vert = compile_shader(gl::VERTEX_SHADER, vert_src)?;
             let frag = compile_shader(gl::FRAGMENT_SHADER, frag_src)?;
-
             let prog = gl::CreateProgram();
             gl::AttachShader(prog, vert);
             gl::AttachShader(prog, frag);
             gl::LinkProgram(prog);
-
             let mut status = 0i32;
             gl::GetProgramiv(prog, gl::LINK_STATUS, &mut status);
             if status == 0 {
@@ -66,10 +78,8 @@ impl GlProgram {
                 gl::GetProgramInfoLog(prog, len, std::ptr::null_mut(), buf.as_mut_ptr() as _);
                 bail!("program link: {}", String::from_utf8_lossy(&buf));
             }
-
             gl::DeleteShader(vert);
             gl::DeleteShader(frag);
-
             Ok(Self { id: prog })
         }
     }
@@ -100,7 +110,6 @@ unsafe fn compile_shader(kind: u32, src: &str) -> Result<u32> {
     let ptr = c.as_ptr();
     gl::ShaderSource(shader, 1, &ptr, std::ptr::null());
     gl::CompileShader(shader);
-
     let mut status = 0i32;
     gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status);
     if status == 0 {
@@ -126,7 +135,6 @@ impl QuadVao {
     pub fn new() -> Self {
         #[rustfmt::skip]
         let verts: [f32; 24] = [
-            // pos       uv
             0.0, 0.0,  0.0, 0.0,
             1.0, 0.0,  1.0, 0.0,
             1.0, 1.0,  1.0, 1.0,
@@ -134,7 +142,6 @@ impl QuadVao {
             1.0, 1.0,  1.0, 1.0,
             0.0, 1.0,  0.0, 1.0,
         ];
-
         let (mut vao, mut vbo) = (0u32, 0u32);
         unsafe {
             gl::GenVertexArrays(1, &mut vao);
@@ -186,14 +193,8 @@ impl Drop for QuadVao {
 // GlTexture
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Owns a single GL texture name.
-///
-/// For DMA-BUF surfaces we also keep the `EglImage` alive alongside the
-/// texture — `eglDestroyImageKHR` must NOT be called until the texture is
-/// deleted.
 pub struct GlTexture {
     pub id: u32,
-    /// Kept alive so the driver's EGLImage → texture binding remains valid.
     _egl_image: Option<crate::backend::egl::EglImage>,
 }
 
@@ -209,14 +210,10 @@ impl GlTexture {
         }
     }
 
-    /// Called by the SHM upload path in render/mod.rs after a TexImage2D call
-    /// to invalidate any stale EGLImage from a previous DMA-BUF commit on
-    /// the same texture slot.
     pub fn clear_egl_image(&mut self) {
         self._egl_image = None;
     }
 
-    /// Upload from a SHM or DMA-BUF `RawBuffer`.
     pub fn upload_buffer(&mut self, buf: &RawBuffer, egl: &crate::backend::egl::EglContext) {
         match buf {
             RawBuffer::Shm {
@@ -259,7 +256,11 @@ impl GlTexture {
     // ── SHM upload ────────────────────────────────────────────────────────────
 
     fn upload_shm(&mut self, pool_fd: i32, width: i32, height: i32, stride: i32, offset: i32) {
-        let size = (stride * height) as usize;
+        // BUG FIX #16: mmap the WHOLE pool at offset 0, then advance the
+        // data pointer by `offset` bytes before passing to GL.
+        // The previous code passed `offset as i64` directly to mmap which
+        // maps the wrong file region when offset > 0.
+        let size = (stride * height) as usize + offset as usize;
         let ptr = unsafe {
             sys::mmap(
                 std::ptr::null_mut(),
@@ -267,27 +268,45 @@ impl GlTexture {
                 sys::PROT_READ,
                 sys::MAP_SHARED,
                 pool_fd,
-                offset as i64,
+                0, // always map from file start
             )
         };
         if ptr == sys::MAP_FAILED {
             tracing::warn!("mmap SHM pool failed");
             return;
         }
+        // Advance into the mapped region by `offset` bytes.
+        let data_ptr = unsafe { (ptr as *mut u8).add(offset as usize) };
+
+        // UNPACK_ROW_LENGTH is in *pixels*, not bytes.  For BGRA (4 bytes/px)
+        // this is stride/4.  We restore it to 0 (= tightly packed) afterwards
+        // on every path, including the early-return after mmap failure above.
+        let row_len_px = stride / 4; // valid for ARGB8888 / XRGB8888 / ABGR8888 / XBGR8888
+
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.id);
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 4);
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, row_len_px);
             Self::set_tex_params();
+            // BUG FIX #17: use UNSIGNED_BYTE consistently. The previous code
+            // used UNSIGNED_BYTE here but UNSIGNED_INT_8_8_8_8_REV in
+            // render/mod.rs upload_surface — they must match. BGRA +
+            // UNSIGNED_BYTE is the correct combo for wl_shm ARGB8888 on
+            // little-endian (wayland bytes are BGRA in memory order).
             gl::TexImage2D(
                 gl::TEXTURE_2D,
                 0,
-                gl::RGBA as i32,
+                gl::RGBA8 as i32,
                 width,
                 height,
                 0,
                 gl::BGRA,
                 gl::UNSIGNED_BYTE,
-                ptr,
+                data_ptr as *const _,
             );
+            // Always restore UNPACK_ROW_LENGTH to 0 (tightly-packed default)
+            // so subsequent texture uploads are not affected.
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
             gl::BindTexture(gl::TEXTURE_2D, 0);
             sys::munmap(ptr, size);
         }
@@ -333,14 +352,12 @@ impl GlTexture {
             }
         };
 
-        type TargetFn = unsafe extern "C" fn(u32, *mut std::ffi::c_void);
-        let target_fn: TargetFn = unsafe {
-            match egl_proc(b"glEGLImageTargetTexture2DOES\0") {
-                Some(p) => std::mem::transmute(p),
-                None => {
-                    tracing::error!("glEGLImageTargetTexture2DOES not available");
-                    return;
-                }
+        // BUG FIX #15 (cont.): use the cached function pointer.
+        let target_fn = match egl_image_target_texture() {
+            Some(f) => f,
+            None => {
+                tracing::error!("glEGLImageTargetTexture2DOES not available");
+                return;
             }
         };
 
@@ -370,7 +387,6 @@ impl GlTexture {
 
 impl Drop for GlTexture {
     fn drop(&mut self) {
-        // Delete the GL texture first so the driver can release internal refs.
         unsafe {
             gl::DeleteTextures(1, &self.id);
         }

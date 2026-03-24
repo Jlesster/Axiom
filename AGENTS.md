@@ -254,23 +254,26 @@ AXIOM_LOG=debug,axiom=trace cargo run --release
 ## Known Implementation Status
 
 ### Complete
-- DRM/GBM/EGL rendering pipeline
+- DRM/GBM/EGL rendering pipeline with proper page flipping
 - Multi-monitor with automatic detection
 - Tiling layouts: MasterStack, BSP, Monocle, Float
-- Lua configuration engine
-- Status bar with Catppuccin theme
-- libinput keyboard/pointer handling
-- Workspace management (9 workspaces)
+- Lua configuration engine with AwesomeWM-compatible API
+- Status bar with Catppuccin theme using layer shell
+- libinput keyboard/pointer handling with keybinds
+- Workspace management (9 workspaces per output)
 - Window rules engine with float/workspace/size/position effects
-- Spring-based animations
+- Spring-based animations for window focus/movement
 - VT switching via libseat
-- XWayland integration (spawn, surface pairing, event handling)
-- IPC server for external tools
+- XWayland integration (spawn, surface pairing, event handling, EWMH)
+- IPC server with control commands (axiomctl)
 - xdg-desktop-portal integration (screenshots via zwp_linux_dmabuf_v1)
 - Idle inhibit protocol (zwp-idle-inhibit-v1)
 - Scratchpad support
-- Window decorations with rounded corners and shadows
+- Window decorations with rounded corners and drop shadows
 - EWMH support (_NET_WM_STATE, window types, etc.)
+- xdg-decoration protocol (server-side decorations)
+- Pointer constraints protocol
+- Relative pointer protocol
 
 ### Partial/Incomplete
 - DMABuf rendering (implemented but may have issues with some clients)
@@ -281,63 +284,79 @@ AXIOM_LOG=debug,axiom=trace cargo run --release
 
 ---
 
-## Current Working Topic: Window Tiling and Chrome Issues
+## Current Working Topic: Window Content and Chrome Rendering Issues
 
-### Issue: Windows Not Properly Fitting Tiles or Missing Chrome
+### Issue: No Window Content Rendering + Partial Chrome Rendering
 
 **Problem Description:**
-Some windows do not fit properly within their assigned tiles, and/or lack proper window chrome (borders, shadows, title area). This manifests as:
-- Windows rendering at wrong sizes or positions
-- Missing or incorrect window decorations
-- Client-side decorated (CSD) applications not rendering correctly
-- Configure round-trip issues causing thrashing
+Windows are being assigned correct tiles and chrome decorations are being drawn, but:
+- Window content (client buffers) is not rendering at all
+- Only half the window chrome is rendering (likely missing bottom half or one side)
+- Textures from clients appear to not be uploading correctly or at all
+
+**Current Symptoms:**
+- Window borders/shadows may render but client content is invisible
+- Some chrome elements visible, others missing
+- Likely a texture upload or shader sampling issue
 
 **Root Causes (Suspected):**
 
-1. **Configure Sequencing**: When a new window is added:
+1. **Texture Upload Failure**: Client buffer textures are not being correctly uploaded to OpenGL:
+   - SHM buffers may not be properly mapped to textures
+   - DMAbuf textures may be incorrectly configured
+   - Texture sampling coordinates may be inverted or misaligned
+
+2. **Chrome Fragment Shader Issues**: Half the chrome rendering suggests:
+   - Vertex data may be incomplete or using wrong winding order
+   - Fragment shader may have incorrect alpha blending
+   - Corner radius or shadow calculations may be clipping incorrectly
+
+3. **Configure Sequencing**: When a new window is added:
    - Initial 0×0 configure is sent to let client pick size
    - Client responds with its preferred size
    - Layout assigns a rect based on tiling
    - Second configure is sent with the layout rect
    - This can cause a race condition if the client commits before receiving the second configure
 
-2. **Surface Pairing Timing**: For XWayland:
+4. **Surface Pairing Timing**: For XWayland:
    - X11 window appears and must be paired with a Wayland surface
    - WL_SURFACE_SERIAL mechanism requires careful synchronization
    - Late pairing can cause geometry issues
 
-3. **Client-Size vs Compositor-Size Mismatch**:
+5. **Client-Size vs Compositor-Size Mismatch**:
    - Clients with CSD (GTK4, Qt6) report inner content size, not including decorations
    - The compositor expects surface size to match the assigned rect
    - `set_window_geometry` is called but may not handle CSD apps correctly
 
-4. **Texture Upload Timing**:
-   - Texture uploads happen on surface commit
-   - Layout changes may happen before texture is ready
-   - Results in wrong-size rendering or missing content
-
 **Affected Files:**
+- `src/render/mod.rs` — texture upload, chrome rendering, fragment shaders
+- `src/render/programs.rs` — shader compilation, VAO/VBO setup
 - `src/wm/mod.rs` — `set_window_geometry`, `reflow`
 - `src/state.rs` — `on_surface_commit`, `send_configure_for_surface`
 - `src/proto/xdg_shell.rs` — configure sequencing, geometry handling
-- `src/render/mod.rs` — texture handling, chrome rendering
+- `src/proto/shm.rs` — SHM buffer to texture conversion
 
 **Potential Fixes:**
 
-1. **For CSD Apps**: Implement proper handling of `xdg_toplevel.set_window_geometry` to account for client-reported inner geometry vs assigned outer geometry.
+1. **Debug Texture Upload**: Add logging to verify texture dimensions and data after upload.
 
-2. **Configure Coalescing**: Combine the initial and layout-based configures into a single configure sent after the window is added to the WM.
+2. **Chrome Shader Inspection**: Review corner radius SDF calculations and shadow offset math in fragment shader.
 
-3. **Texture Size Validation**: Ensure texture dimensions match expected window rect before rendering.
+3. **Vertex Data Validation**: Ensure all 4 corners of chrome quad are being rendered, check for degenerate triangles.
 
-4. **XWayland Surface Pairing**: Improve serial tracking and pairing logic to ensure windows are properly matched before geometry assignment.
+4. **For CSD Apps**: Implement proper handling of `xdg_toplevel.set_window_geometry` to account for client-reported inner geometry vs assigned outer geometry.
+
+5. **Configure Coalescing**: Combine the initial and layout-based configures into a single configure sent after the window is added to the WM.
+
+6. **XWayland Surface Pairing**: Improve serial tracking and pairing logic to ensure windows are properly matched before geometry assignment.
 
 ---
 
 ## Future Direction
 
 ### Short-term
-- [ ] Fix window tiling geometry issues (see Current Working Topic)
+- [ ] Fix window content rendering (client buffers not appearing)
+- [ ] Fix chrome rendering (only half visible)
 - [ ] Fix CSD application handling
 - [ ] Implement DMABuf for hardware-accelerated client buffers
 - [ ] Add fractional scaling support

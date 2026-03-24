@@ -187,8 +187,6 @@ impl Axiom {
         }
     }
 
-    /// Focus a window by clicking into it. Handles the full focus transition:
-    /// WM focus, keyboard seat update, configure to old+new, and XWayland.
     pub fn focus_window_by_click(&mut self, win_id: WindowId) {
         let prev_focused = self.wm.focused_window();
         if prev_focused == Some(win_id) {
@@ -197,8 +195,6 @@ impl Axiom {
 
         self.wm.focus_window(win_id);
 
-        // Send unfocused configure to the previously focused window so it
-        // redraws its titlebar/decorations in the unfocused state.
         if let Some(prev_id) = prev_focused {
             if let Some(surf) = self
                 .wm
@@ -209,13 +205,10 @@ impl Axiom {
                 self.send_configure_for_surface(&surf, prev_id);
             }
         }
-
-        // Send focused configure to newly focused window.
         if let Some(surf) = self.wm.windows.get(&win_id).and_then(|w| w.surface.clone()) {
             self.send_configure_for_surface(&surf, win_id);
         }
 
-        // Update XWayland focus if applicable.
         if let Some(&x11_win) = self.xwayland.wl_to_x11.get(&win_id) {
             self.xwayland.set_focus(x11_win);
         }
@@ -242,8 +235,6 @@ impl Axiom {
         self.needs_redraw = true;
     }
 
-    /// Send configure to every live mapped window. Call this after layout
-    /// changes (workspace switch, tiling re-tile) so all clients are in sync.
     pub fn send_configure_all(&mut self) {
         let ids: Vec<WindowId> = self.wm.windows.keys().copied().collect();
         for win_id in ids {
@@ -254,55 +245,93 @@ impl Axiom {
         self.needs_redraw = true;
     }
 
+    /// Send xdg_toplevel.configure + xdg_surface.configure for `win_id`.
+    ///
+    /// IMPORTANT: we do NOT reset `configured = false` here anymore.
+    /// Resetting it on every configure caused a race where a second configure
+    /// fired between the client's AckConfigure and its next commit, permanently
+    /// preventing texture upload. Instead:
+    ///
+    ///   - `configured` starts false (set in register_toplevel path).
+    ///   - It flips true in AckConfigure.
+    ///   - It is NEVER reset to false again after the first ack — subsequent
+    ///     configures do NOT require a new ack before we accept the commit.
+    ///     The client is required by the xdg-shell spec to ack the *latest*
+    ///     serial before committing, but we don't need to gate texture upload
+    ///     on that; we just need the client to have acked at least once so we
+    ///     know it understood our initial geometry.
     pub fn send_configure_for_surface(&mut self, surface: &WlSurface, win_id: WindowId) {
-        let surf_data = match surface.data::<Arc<SurfaceData>>() {
-            Some(d) => d.clone(),
-            None => return,
+        let surf_id = surface.id().protocol_id();
+
+        let Some(toplevel_ref) = self.toplevel_map.get(&surf_id).cloned() else {
+            return;
         };
-        let role = surf_data.role.lock().unwrap().clone();
-        if let SurfaceRole::XdgToplevel = role {
-            let surf_id = surface.id().protocol_id();
-            if let Some(toplevel_ref) = self.toplevel_for_surface(surf_id) {
-                let tl = toplevel_ref.lock().unwrap();
-                let xdg_surface = tl.xdg_surface.clone();
-                let xdg_data = tl.xdg_data.clone();
-                drop(tl);
 
-                let win = self.wm.window(win_id);
-                let (w, h) = (win.rect.w, win.rect.h);
+        let (xdg_surface, xdg_data) = {
+            let tl = toplevel_ref.lock().unwrap();
+            (tl.xdg_surface.clone(), tl.xdg_data.clone())
+        };
 
-                // Never send a zero-size configure to an existing window.
-                if w == 0 || h == 0 {
-                    return;
-                }
+        let role_snap = xdg_data.lock().unwrap().role.clone();
+        let XdgRole::Toplevel(ref tl_obj) = role_snap else {
+            return;
+        };
 
-                let focused = self.wm.focused_window() == Some(win_id);
+        let win = self.wm.window(win_id);
+        let (mut w, mut h) = (win.rect.w, win.rect.h);
+        let focused = self.wm.focused_window() == Some(win_id);
+        let maximized = win.maximized;
+        let fullscreen = win.fullscreen;
+        let tiled = !win.floating && !win.fullscreen;
 
-                let mut states: Vec<u8> = Vec::new();
-                let mut push = |v: u32| states.extend_from_slice(&v.to_le_bytes());
-                if win.maximized {
-                    push(2);
-                }
-                if win.fullscreen {
-                    push(5);
-                }
-                if focused {
-                    push(4); // XDG_TOPLEVEL_STATE_ACTIVATED
-                }
-
-                let role = xdg_data.lock().unwrap().role.clone();
-                if let XdgRole::Toplevel(ref tl_obj) = role {
-                    tl_obj.configure(w, h, states);
-                    let serial = self.next_serial();
-                    xdg_surface.configure(serial);
-                    xdg_data.lock().unwrap().configure_serial = serial;
-                }
+        if w == 0 || h == 0 {
+            if let Some(mon) = self.wm.monitors.first() {
+                w = mon.usable.w;
+                h = mon.usable.h;
             }
         }
-    }
+        if w == 0 || h == 0 {
+            return;
+        }
 
-    fn toplevel_for_surface(&self, surf_id: u32) -> Option<ToplevelDataRef> {
-        self.toplevel_map.get(&surf_id).cloned()
+        // Build the states byte array (native-endian u32 per state).
+        //   1 = Maximized   2 = Fullscreen  4 = Resizing
+        //   8 = Activated   9 = TiledLeft  10 = TiledRight
+        //  11 = TiledTop   12 = TiledBottom
+        let mut states: Vec<u8> = Vec::new();
+        let mut push = |v: u32| states.extend_from_slice(&v.to_ne_bytes());
+
+        if maximized {
+            push(1);
+        }
+        if fullscreen {
+            push(2);
+        }
+        if focused {
+            push(8);
+        }
+        if tiled {
+            push(9);
+            push(10);
+            push(11);
+            push(12);
+        }
+
+        tl_obj.configure(w, h, states);
+        let serial = self.next_serial();
+        xdg_surface.configure(serial);
+
+        {
+            let mut xdg = xdg_data.lock().unwrap();
+            xdg.configure_serial = serial;
+            // Only reset configured→false if this is the very first configure
+            // (configured is still false from init). After the client has acked
+            // once we leave it true so uploads are never gated on a re-ack.
+            // We track this via a separate `ever_acked` flag in XdgSurfaceData.
+            if !xdg.ever_acked {
+                xdg.configured = false;
+            }
+        }
     }
 
     // ── Window lifecycle ──────────────────────────────────────────────────────
@@ -332,145 +361,162 @@ impl Axiom {
         if let Some(sd) = surface.data::<Arc<SurfaceData>>() {
             *sd.role.lock().unwrap() = SurfaceRole::XdgToplevel;
         }
-
-        // Send initial 0×0 configure so the client knows it can pick its own
-        // size. Without this many clients (GTK4, Qt6) will never commit a
-        // buffer.
-        self.send_initial_configure(&surface);
-    }
-
-    /// Send the very first configure (size=0×0, no states) so the client
-    /// starts the configure/ack/commit round-trip.
-    fn send_initial_configure(&mut self, surface: &WlSurface) {
-        let surf_id = surface.id().protocol_id();
-        let toplevel_ref = match self.toplevel_map.get(&surf_id) {
-            Some(r) => r.clone(),
-            None => return,
-        };
-        let tl = toplevel_ref.lock().unwrap();
-        let xdg_surface = tl.xdg_surface.clone();
-        let xdg_data = tl.xdg_data.clone();
-        drop(tl);
-
-        let role = xdg_data.lock().unwrap().role.clone();
-        if let XdgRole::Toplevel(ref tl_obj) = role {
-            tl_obj.configure(0, 0, vec![]); // let client choose size
-            let serial = self.next_serial();
-            xdg_surface.configure(serial);
-            xdg_data.lock().unwrap().configure_serial = serial;
-        }
     }
 
     pub fn on_surface_commit(&mut self, surface: &WlSurface) {
         let surf_id = surface.id().protocol_id();
 
-        // ── Pending window: promote only when a real buffer has arrived ───────
-        if let Some(pw) = self.pending_windows.get(&surf_id) {
-            let has_buffer = surface
-                .data::<Arc<SurfaceData>>()
-                .map(|sd| sd.current.lock().unwrap().buffer.is_some())
-                .unwrap_or(false);
+        // ── xdg_toplevel path ─────────────────────────────────────────────────
+        if let Some(tl_ref) = self.toplevel_map.get(&surf_id).cloned() {
+            let win_id_opt = tl_ref.lock().unwrap().window_id;
 
-            if !has_buffer {
-                // Still in configure round-trip — keep it alive.
+            if win_id_opt.is_none() {
+                let pw = match self.pending_windows.remove(&surf_id) {
+                    Some(pw) => pw,
+                    None => return,
+                };
+
+                let mut win = Window::new(surf_id, pw.app_id.clone());
+                win.title = pw.title.clone();
+                win.surface = Some(surface.clone());
+                let win_id = self.wm.add_window(win);
+
+                tl_ref.lock().unwrap().window_id = Some(win_id);
+                self.surface_map.insert(surf_id, win_id);
+
+                let rect = self.wm.window(win_id).rect;
+                self.anim
+                    .set_geometry(win_id, rect.x, rect.y, rect.w, rect.h);
+
+                if let Some(win) = self.wm.windows.get(&win_id) {
+                    self.script.emit_client(signals::SIG_MANAGE, win);
+                }
+                signals::update_client_list(&self.script.lua, &self.wm);
+
+                // Set focus BEFORE sending configures so all configure messages
+                // correctly include/exclude the Activated state. Previously focus
+                // was set after configure, so the new window's first configure
+                // never carried Activated and prev window's deactivation configure
+                // was sent without knowing the new focused id.
+                let prev_focused = self.wm.focused_window();
+                self.wm.set_focused(win_id);
+
+                // Send configure for the new window (now correctly Activated).
+                self.send_configure_for_surface(surface, win_id);
+
+                // Reconfigure siblings whose tile rects changed after reflow.
+                let aws = self.wm.active_ws();
+                let sibling_ids: Vec<WindowId> = self.wm.workspaces[aws]
+                    .windows
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        id != win_id
+                            && self
+                                .wm
+                                .windows
+                                .get(&id)
+                                .map(|w| !w.floating && !w.fullscreen)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                for sib_id in sibling_ids {
+                    if let Some(surf) = self.wm.windows.get(&sib_id).and_then(|w| w.surface.clone())
+                    {
+                        self.send_configure_for_surface(&surf, sib_id);
+                    }
+                }
+
+                // Deactivate the previously focused window.
+                if let Some(prev_id) = prev_focused {
+                    if prev_id != win_id {
+                        if let Some(s) = self
+                            .wm
+                            .windows
+                            .get(&prev_id)
+                            .and_then(|w| w.surface.clone())
+                        {
+                            self.send_configure_for_surface(&s, prev_id);
+                        }
+                    }
+                }
+                self.sync_keyboard_focus();
+
+                // Upload whatever the client sent in this first commit. Size may not
+                // match our configure yet, but it prevents a blank window flash.
+                self.render
+                    .upload_surface_texture(win_id, surface, &self.backend.egl);
+
+                // Fire frame callbacks so the client unblocks and re-renders at the
+                // correct size after it acks our configure. Without this the client
+                // stalls forever waiting for a wl_callback::done that never arrives.
+                self.fire_frame_callbacks(surface);
+
+                self.needs_redraw = true;
                 return;
             }
 
-            let pw = self.pending_windows.remove(&surf_id).unwrap();
+            // ── SUBSEQUENT COMMITS ────────────────────────────────────────────
+            let win_id = win_id_opt.unwrap();
 
-            // Upload texture under temporary key.
-            self.render
-                .upload_surface_texture(surf_id, surface, &self.backend.egl);
-            if let Some(sd) = surface.data::<Arc<SurfaceData>>() {
-                sd.current.lock().unwrap().needs_upload = false;
+            let (is_configured, xdg_data_ref) = {
+                let tl = tl_ref.lock().unwrap();
+                let xdg = tl.xdg_data.lock().unwrap();
+                (xdg.configured, tl.xdg_data.clone())
+            };
+
+            if is_configured {
+                // Upload the texture — client has acked our configure and
+                // committed content at the correct size.
+                self.render
+                    .upload_surface_texture(win_id, surface, &self.backend.egl);
+            } else {
+                // Client committed before acking. This can happen legitimately
+                // on the very first round-trip. Upload anyway — the size might
+                // not match yet but it's better than showing nothing. The next
+                // commit after the ack will overwrite with correctly-sized content.
+                tracing::debug!(
+                    "on_surface_commit: win {win_id} committed before ack — uploading optimistically"
+                );
+                self.render
+                    .upload_surface_texture(win_id, surface, &self.backend.egl);
             }
 
-            // Add to WM.
-            let mut win = Window::new(surf_id, pw.app_id.clone());
-            win.title = pw.title.clone();
-            win.surface = Some(surface.clone());
-            let win_id = self.wm.add_window(win);
-            pw.toplevel.lock().unwrap().window_id = Some(win_id);
-            self.surface_map.insert(surf_id, win_id);
-
-            // Re-key texture surf_id → win_id.
-            if surf_id != win_id {
-                if let Some(tex) = self.render.textures.remove(&surf_id) {
-                    self.render.textures.insert(win_id, tex);
-                }
-            }
-
-            let rect = self.wm.window(win_id).rect;
-            self.anim
-                .set_geometry(win_id, rect.x, rect.y, rect.w, rect.h);
-
-            // Fire frame callbacks for this commit.
+            // Always fire frame callbacks so the client keeps its render loop running.
             self.fire_frame_callbacks(surface);
-
-            // Send correct sized configure now that we know the layout rect.
-            self.send_configure_for_surface(surface, win_id);
-
-            // ── Critical: sync focus AFTER the window is in the WM so
-            // the seat correctly sends wl_keyboard.enter to the new surface.
-            self.sync_keyboard_focus();
-
-            if let Some(win) = self.wm.windows.get(&win_id) {
-                self.script.emit_client(signals::SIG_MANAGE, win);
-            }
-            signals::update_client_list(&self.script.lua, &self.wm);
-            signals::update_screen_count(&self.script.lua, self.wm.monitors.len());
-
             self.needs_redraw = true;
             return;
         }
 
-        // ── Layer-shell surface commit ─────────────────────────────────────────
+        // ── Layer shell / cursor path ─────────────────────────────────────────
         let is_layer = self
             .layer_surfaces
             .iter()
             .any(|(_, s)| s.id().protocol_id() == surf_id);
-        if is_layer {
-            if let Some(sd) = surface.data::<Arc<SurfaceData>>() {
-                let needs_upload = sd.current.lock().unwrap().needs_upload;
-                if needs_upload {
-                    self.render
-                        .upload_layer_texture(surf_id, surface, &self.backend.egl);
-                    sd.current.lock().unwrap().needs_upload = false;
-                    self.needs_redraw = true;
-                }
-                self.fire_frame_callbacks(surface);
-            }
-            return;
-        }
 
-        // ── Live window commit ─────────────────────────────────────────────────
-        if let Some(&win_id) = self.surface_map.get(&surf_id) {
-            if let Some(sd) = surface.data::<Arc<SurfaceData>>() {
-                let needs_upload = sd.current.lock().unwrap().needs_upload;
-                if needs_upload {
-                    self.render
-                        .upload_surface_texture(win_id, surface, &self.backend.egl);
-                    sd.current.lock().unwrap().needs_upload = false;
-                }
-                self.fire_frame_callbacks(surface);
-            }
+        if is_layer {
+            self.render
+                .upload_layer_texture(surf_id, surface, &self.backend.egl);
+            self.fire_frame_callbacks(surface);
             self.needs_redraw = true;
         }
     }
 
     fn fire_frame_callbacks(&self, surface: &WlSurface) {
-        if let Some(sd) = surface.data::<Arc<SurfaceData>>() {
-            let cbs: Vec<_> = sd
-                .current
-                .lock()
-                .unwrap()
-                .frame_callbacks
-                .drain(..)
-                .collect();
-            let now = self.now_ms();
-            for cb in cbs {
-                cb.done(now);
-            }
+        let cbs: Vec<_> = surface
+            .data::<Arc<SurfaceData>>()
+            .map(|sd| {
+                sd.current
+                    .lock()
+                    .unwrap()
+                    .frame_callbacks
+                    .drain(..)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let now = self.now_ms();
+        for cb in cbs {
+            cb.done(now);
         }
     }
 
@@ -513,7 +559,15 @@ impl Axiom {
             }
         }
 
-        self.wm.remove_window(id);
+        let aws = self.wm.active_ws();
+        {
+            let ws = &mut self.wm.workspaces[aws];
+            ws.windows.retain(|&w| w != id);
+            if ws.focused == Some(id) {
+                ws.focused = ws.windows.last().copied();
+            }
+        }
+        self.wm.reflow();
         self.anim.begin_close(id);
 
         if let Some(sid) = surface_id {
@@ -526,8 +580,8 @@ impl Axiom {
             self.finalize_window_removal(id);
         }
 
-        // Re-focus whatever is now on top and send configure to it.
         self.sync_keyboard_focus();
+
         if let Some(new_focused) = self.wm.focused_window() {
             if let Some(surf) = self
                 .wm
@@ -544,6 +598,19 @@ impl Axiom {
     }
 
     fn finalize_window_removal(&mut self, id: WindowId) {
+        self.wm.windows.remove(&id);
+        for ws in &mut self.wm.workspaces {
+            ws.windows.retain(|&w| w != id);
+            if ws.focused == Some(id) {
+                ws.focused = ws.windows.last().copied();
+            }
+        }
+        for sp in self.wm.scratchpads.values_mut() {
+            if sp.win_id == Some(id) {
+                sp.win_id = None;
+                sp.visible = false;
+            }
+        }
         self.anim.remove(id);
         self.render.remove_window_texture(id);
         self.needs_redraw = true;
@@ -551,15 +618,38 @@ impl Axiom {
 
     // ── Hit-testing ───────────────────────────────────────────────────────────
 
-    pub fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, f64, f64)> {
+    fn draw_order_for_hit(&self) -> Vec<WindowId> {
         let aws = self.wm.active_ws();
         let ws = &self.wm.workspaces[aws];
-        // Iterate in reverse draw order so topmost window wins.
-        for &win_id in ws.windows.iter().rev() {
-            let win = match self.wm.windows.get(&win_id) {
-                Some(w) => w,
-                None => continue,
-            };
+        let focused_id = self.wm.focused_window();
+
+        let (mut tiled, mut floating): (Vec<_>, Vec<_>) = ws
+            .windows
+            .iter()
+            .copied()
+            .filter(|&id| Some(id) != focused_id)
+            .partition(|&id| {
+                self.wm
+                    .windows
+                    .get(&id)
+                    .map(|w| !w.floating)
+                    .unwrap_or(true)
+            });
+
+        let mut order = Vec::with_capacity(ws.windows.len());
+        order.append(&mut tiled);
+        order.append(&mut floating);
+        if let Some(fid) = focused_id {
+            if ws.windows.contains(&fid) {
+                order.push(fid);
+            }
+        }
+        order
+    }
+
+    pub fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, f64, f64)> {
+        for &win_id in self.draw_order_for_hit().iter().rev() {
+            let win = self.wm.windows.get(&win_id)?;
             let r = self.anim.get_rect(win_id, win.rect);
             if r.contains(px as i32, py as i32) {
                 if let Some(ref surf) = win.surface {
@@ -570,15 +660,9 @@ impl Axiom {
         None
     }
 
-    /// Returns the WindowId of whichever window the pointer is currently over.
     pub fn window_at(&self, px: f64, py: f64) -> Option<WindowId> {
-        let aws = self.wm.active_ws();
-        let ws = &self.wm.workspaces[aws];
-        for &win_id in ws.windows.iter().rev() {
-            let win = match self.wm.windows.get(&win_id) {
-                Some(w) => w,
-                None => continue,
-            };
+        for &win_id in self.draw_order_for_hit().iter().rev() {
+            let win = self.wm.windows.get(&win_id)?;
             let r = self.anim.get_rect(win_id, win.rect);
             if r.contains(px as i32, py as i32) {
                 return Some(win_id);
@@ -804,9 +888,7 @@ impl Axiom {
         let mut win = Window::new(surf_id, app_id);
         win.title = title;
         win.surface = Some(surface);
-
         let win_id = self.wm.add_window(win);
-
         self.surface_map.insert(surf_id, win_id);
         self.xwayland.x11_to_wl.insert(x11_win, win_id);
         self.xwayland.wl_to_x11.insert(win_id, x11_win);
@@ -820,9 +902,7 @@ impl Axiom {
             self.script.emit_client(signals::SIG_MANAGE, win);
         }
         signals::update_client_list(&self.script.lua, &self.wm);
-
         self.needs_redraw = true;
-        tracing::debug!("xwayland paired: x11={x11_win} surf={surf_id} win={win_id}");
     }
 
     pub fn unpair_x11_window(&mut self, x11_win: u32) {
@@ -837,7 +917,6 @@ impl Axiom {
             .get(&win_id)
             .and_then(|w| w.surface.as_ref())
             .map(|s| s.id().protocol_id());
-
         if let Some(sid) = surf_id {
             self.surface_map.remove(&sid);
         }
@@ -845,8 +924,15 @@ impl Axiom {
         if let Some(win) = self.wm.windows.get(&win_id) {
             self.script.emit_client(signals::SIG_UNMANAGE, win);
         }
+        self.wm.windows.remove(&win_id);
+        for ws in &mut self.wm.workspaces {
+            ws.windows.retain(|&w| w != win_id);
+            if ws.focused == Some(win_id) {
+                ws.focused = ws.windows.last().copied();
+            }
+        }
+        self.wm.reflow();
 
-        self.wm.remove_window(win_id);
         self.anim.remove(win_id);
         self.render.remove_window_texture(win_id);
 

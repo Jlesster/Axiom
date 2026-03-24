@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use input::{
     event::{
@@ -13,6 +14,8 @@ use input::{
 };
 use wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup;
 use xkbcommon::xkb::{self, Keycode};
+
+use wayland_server::Resource as _;
 
 use crate::state::Axiom;
 
@@ -64,9 +67,7 @@ impl LibinputInterface for LibinputUdev {
     fn close_restricted(&mut self, fd: OwnedFd) {
         let raw = fd.as_raw_fd();
         if let Some(device_id) = self.open_ids.remove(&raw) {
-            unsafe {
-                libseat_close_device(self.seat, device_id);
-            }
+            unsafe { libseat_close_device(self.seat, device_id) };
         }
         drop(fd);
     }
@@ -99,6 +100,72 @@ impl Mods {
             m |= 1 << 3;
         }
         Self(m)
+    }
+}
+
+// ── Key-repeat state ──────────────────────────────────────────────────────────
+
+/// Compositor-driven key repeat (wl_keyboard.repeat_info was advertised, so
+/// we must actually deliver repeated key events).
+pub struct RepeatState {
+    /// The raw evdev keycode (libinput keycode, NOT xkb keycode) being repeated.
+    pub keycode: u32,
+    pub time_ms: u32,
+    /// Wall-clock time of the last repeat fire.
+    pub last_fire: Instant,
+    /// Wall-clock time when repeat should first start (after the delay).
+    pub start_at: Instant,
+    pub active: bool,
+}
+
+impl Default for RepeatState {
+    fn default() -> Self {
+        Self {
+            keycode: 0,
+            time_ms: 0,
+            last_fire: Instant::now(),
+            start_at: Instant::now(),
+            active: false,
+        }
+    }
+}
+
+impl RepeatState {
+    // 600 ms initial delay, then 25 cps = 40 ms between repeats.
+    const DELAY_MS: u64 = 600;
+    const INTERVAL_MS: u64 = 40; // 1000 / 25
+
+    pub fn press(&mut self, keycode: u32, time_ms: u32) {
+        self.keycode = keycode;
+        self.time_ms = time_ms;
+        let now = Instant::now();
+        self.last_fire = now;
+        self.start_at = now + Duration::from_millis(Self::DELAY_MS);
+        self.active = true;
+    }
+
+    pub fn release(&mut self) {
+        self.active = false;
+    }
+
+    /// Returns a list of (time_ms) values for any repeat events that should fire
+    /// right now. Advances internal state accordingly.
+    pub fn drain_pending(&mut self) -> Vec<u32> {
+        if !self.active {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        if now < self.start_at {
+            return Vec::new();
+        }
+        let interval = Duration::from_millis(Self::INTERVAL_MS);
+        let mut events = Vec::new();
+        while self.last_fire + interval <= now {
+            self.last_fire += interval;
+            self.time_ms = self.time_ms.wrapping_add(Self::INTERVAL_MS as u32);
+            events.push(self.time_ms);
+        }
+        events
     }
 }
 
@@ -150,10 +217,13 @@ pub struct InputState {
     pub cursor_pos: (f64, f64),
     pub hw_cursor_active: bool,
     pub cursor_surface: Option<wayland_server::protocol::wl_surface::WlSurface>,
+    /// Hotspot in surface-local pixels for the current cursor surface.
+    pub cursor_hotspot: (i32, i32),
     pub popup_grab: Option<XdgPopup>,
     pub screen_w: f64,
     pub screen_h: f64,
     pub button_held: bool,
+    pub repeat: RepeatState,
 }
 
 impl InputState {
@@ -171,10 +241,12 @@ impl InputState {
             cursor_pos: (0.0, 0.0),
             hw_cursor_active: false,
             cursor_surface: None,
+            cursor_hotspot: (0, 0),
             popup_grab: None,
             screen_w: 1920.0,
             screen_h: 1080.0,
             button_held: false,
+            repeat: RepeatState::default(),
         })
     }
 
@@ -206,6 +278,31 @@ pub fn dispatch_libinput_events(state: &mut Axiom) {
     }
 }
 
+/// Called once per frame tick to fire any pending key-repeat events.
+/// Must be called from the main loop before rendering.
+pub fn tick_key_repeat(state: &mut Axiom) {
+    // Snapshot pending repeat times without holding any locks.
+    let times: Vec<u32> = state.input.repeat.drain_pending();
+    if times.is_empty() {
+        return;
+    }
+    let keycode = state.input.repeat.keycode;
+
+    // BUG FIX #9: popup grab suppresses repeat delivery to the base window,
+    // same as it does for initial key presses.
+    if state.input.popup_grab.is_some() {
+        return;
+    }
+
+    for time in times {
+        state.seat.send_key(
+            time,
+            keycode,
+            wayland_server::protocol::wl_keyboard::KeyState::Pressed,
+        );
+    }
+}
+
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
 fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
@@ -222,20 +319,30 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
         KeyState::Pressed => xkb::KeyDirection::Down,
         KeyState::Released => xkb::KeyDirection::Up,
     };
-    state.seat.xkb_state.update_key(xkb_keycode, dir);
+    let mod_changed = state.seat.xkb_state.update_key(xkb_keycode, dir);
 
-    // Always forward modifier-only keys so clients track modifier state.
     let sym = state.seat.xkb_state.key_get_one_sym(xkb_keycode);
+
+    // Always forward modifier keys and always send updated modifier state.
     if is_modifier_sym(sym) {
         let wl_state = wl_key_state(key_state);
         state.seat.send_key(time, keycode, wl_state);
+        // BUG FIX #10: send modifiers after every modifier key event, not just
+        // on keyboard enter. Without this clients see stale modifier state.
+        state.seat.send_modifiers();
         return;
+    }
+
+    // BUG FIX #11: send modifiers whenever xkb says state changed, even for
+    // non-modifier keys (e.g. Caps Lock as a tap).
+    if mod_changed != 0 {
+        state.seat.send_modifiers();
     }
 
     if key_state == KeyState::Pressed {
         let mods = Mods::from_xkb(&state.seat.xkb_state);
 
-        // Hard-coded emergency quit.
+        // Emergency quit — always fires regardless of grabs.
         if mods == Mods(Mods::SUPER.0 | Mods::SHIFT.0) && sym == xkb::Keysym::Print {
             tracing::info!("emergency quit (Super+Shift+Print)");
             state
@@ -244,7 +351,7 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
             return;
         }
 
-        // VT switching.
+        // VT switching — always fires regardless of grabs.
         if mods == Mods(Mods::CTRL.0 | Mods::ALT.0) {
             if let Some(vt) = vt_from_sym(sym) {
                 vt_switch(state, vt);
@@ -252,7 +359,19 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
             }
         }
 
-        // Lua keybinds first.
+        // BUG FIX #12: if a popup has an exclusive grab, deliver to the popup's
+        // surface rather than the compositor keybind table or the base window.
+        if state.input.popup_grab.is_some() {
+            let wl_state = wl_key_state(key_state);
+            state.seat.send_key(time, keycode, wl_state);
+            // Start repeat for the grabbed key too.
+            if !is_non_repeating(sym) {
+                state.input.repeat.press(keycode, time);
+            }
+            return;
+        }
+
+        // Compositor keybinds (Lua first, then native table).
         let combo = combo_string(mods, sym);
         let lua_matched = match crate::scripting::lua_api::fire_keybind(&state.script.lua, &combo) {
             Ok(matched) => matched,
@@ -261,23 +380,31 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
                 false
             }
         };
-
         if lua_matched {
             let queue = state.script.queue.clone();
             crate::scripting::lua_api::drain(&queue, state);
+            state.input.repeat.release(); // compositor consumed the key — no repeat
             return;
         }
 
-        // Native keybind table.
         if let Some(action) = state.input.keybinds.lookup(mods, sym).cloned() {
             dispatch_action(state, action);
+            state.input.repeat.release(); // compositor consumed
             return;
         }
-    }
 
-    // No bind matched — deliver to focused client.
-    let wl_state = wl_key_state(key_state);
-    state.seat.send_key(time, keycode, wl_state);
+        // Not a compositor keybind — pass through and start repeat.
+        state.seat.send_key(time, keycode, wl_key_state(key_state));
+        if !is_non_repeating(sym) {
+            state.input.repeat.press(keycode, time);
+        }
+    } else {
+        // Key release — stop repeat and forward to client.
+        if state.input.repeat.active && state.input.repeat.keycode == keycode {
+            state.input.repeat.release();
+        }
+        state.seat.send_key(time, keycode, wl_key_state(key_state));
+    }
 }
 
 // ── Pointer ───────────────────────────────────────────────────────────────────
@@ -293,20 +420,21 @@ fn handle_pointer(state: &mut Axiom, event: PointerEvent) {
             state.input.cursor_pos = (state.input.pointer_x, state.input.pointer_y);
             let (px, py) = (state.input.pointer_x, state.input.pointer_y);
 
-            // Active grab takes priority — don't update pointer focus mid-drag.
             if !matches!(state.grab, crate::state::GrabKind::None) {
                 state.update_interactive_grab(px, py);
                 state.needs_redraw = true;
                 return;
             }
 
-            // Update pointer focus: send enter/leave as the surface under the
-            // cursor changes, and send motion to the current surface.
+            // BUG FIX #13: use surface_at for pointer focus, which correctly
+            // handles the draw order (topmost/focused window on top).
             if let Some((surface, sx, sy)) = state.surface_at(px, py) {
-                state.seat.set_pointer_focus(Some(surface), sx, sy);
-                state.seat.send_pointer_motion(time, sx, sy);
+                state.seat.set_pointer_focus(Some(surface.clone()), sx, sy);
+                // Only send motion if the surface is still focused after set.
+                if state.seat.pointer_focus_surface().map(|s| s.id()) == Some(surface.id()) {
+                    state.seat.send_pointer_motion(time, sx, sy);
+                }
             } else if !state.input.button_held {
-                // Don't drop focus mid-drag even if the cursor leaves the rect.
                 state.seat.set_pointer_focus(None, 0.0, 0.0);
             }
 
@@ -328,33 +456,50 @@ fn handle_pointer(state: &mut Axiom, event: PointerEvent) {
             if pressed {
                 let (px, py) = (state.input.pointer_x, state.input.pointer_y);
 
-                // ── Click-to-focus ─────────────────────────────────────────────
-                // Use state.window_at (on Axiom, searches the anim rects) not
-                // state.wm.window_at — that method doesn't exist on WmState and
-                // was silently doing nothing before.
+                // BUG FIX #14: close popup grab on click outside the popup.
+                // If a popup grab is active and the click is outside its surface,
+                // dismiss the popup first (xdg_popup.popup_done), then fall
+                // through to normal focus handling.
+                if let Some(ref popup) = state.input.popup_grab.clone() {
+                    let popup_alive = popup.is_alive();
+                    let click_in_popup = popup_alive && {
+                        // Find the popup surface in our surface map and check hit.
+                        let hit = state.surface_at(px, py);
+                        // If the surface under cursor is the popup's wl_surface, allow.
+                        // Otherwise dismiss.
+                        hit.map(|(surf, _, _)| -> bool {
+                            // Compare against popup's underlying wl_surface via xdg_data.
+                            use crate::proto::xdg_shell::PopupDataRef;
+                            popup
+                                .data::<PopupDataRef>()
+                                .and_then(|pd| pd.lock().ok())
+                                .map(|pd| pd.xdg_data.lock().unwrap().wl_surface.id() == surf.id())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                    };
+
+                    if !click_in_popup {
+                        popup.popup_done();
+                        state.input.clear_popup_grab();
+                        // Don't process click further — the dismiss IS the interaction.
+                        return;
+                    }
+                }
+
                 if let Some(win_id) = state.window_at(px, py) {
                     if state.wm.focused_window() != Some(win_id) {
-                        // focus_window_by_click handles:
-                        //   - wm.focus_window()
-                        //   - send_configure to old + new (so decorations update)
-                        //   - XWayland focus if applicable
-                        //   - sync_keyboard_focus (sends wl_keyboard.enter)
                         state.focus_window_by_click(win_id);
                     }
                 }
 
-                // Re-query surface_at after focus change — the window order
-                // may have changed (focused window moves to top of draw list).
                 if let Some((surface, sx, sy)) = state.surface_at(px, py) {
                     state.seat.set_pointer_focus(Some(surface), sx, sy);
                     state.seat.send_pointer_button(time, button, wl_state);
                     return;
                 }
-                // Click landed on the wallpaper / no window — still deliver
-                // the button event (some clients watch for release without press).
                 state.seat.send_pointer_button(time, button, wl_state);
             } else {
-                // Button release: end any active grab, then forward event.
                 state.end_grab();
                 state.seat.send_pointer_button(time, button, wl_state);
             }
@@ -391,17 +536,13 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
                 tracing::error!("Lua keybind '{fn_name}': {e}");
             }
         }
-
         Action::Close => {
             if let Some(id) = state.wm.focused_window() {
                 state.close_window(id);
             }
         }
-
         Action::FocusDir(dir) => {
             state.wm.focus_direction(dir);
-            // Keyboard enter goes to the new focus; the previously focused
-            // window needs a configure so its activated state clears.
             state.sync_keyboard_focus();
             if let Some(id) = state.wm.focused_window() {
                 if let Some(surf) = state.wm.windows.get(&id).and_then(|w| w.surface.clone()) {
@@ -410,21 +551,15 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
             }
             state.needs_redraw = true;
         }
-
         Action::MoveDir(dir) => {
             state.wm.move_direction(dir);
-            // Re-tile changes every window's rect — tell all clients.
             state.send_configure_all();
         }
-
         Action::SwitchWorkspace(idx) => {
             state.wm.switch_workspace(idx);
-            // Windows on the newly visible workspace need configures so they
-            // know their current size (they may have been tiled while hidden).
             state.send_configure_all();
             state.sync_keyboard_focus();
         }
-
         Action::MoveToWorkspace(idx) => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.move_to_workspace(id, idx);
@@ -432,15 +567,12 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
                 state.sync_keyboard_focus();
             }
         }
-
         Action::ToggleFloat => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.toggle_float(id);
-                // Toggling float re-tiles everyone else too.
                 state.send_configure_all();
             }
         }
-
         Action::ToggleFullscreen => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.toggle_fullscreen(id);
@@ -450,27 +582,22 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
                 state.needs_redraw = true;
             }
         }
-
         Action::IncMaster => {
             state.wm.inc_master();
             state.send_configure_all();
         }
-
         Action::DecMaster => {
             state.wm.dec_master();
             state.send_configure_all();
         }
-
         Action::Reload => {
             state.reload_config();
         }
-
         Action::Quit => {
             state
                 .running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
-
         Action::Spawn(cmd) => {
             spawn(&cmd);
         }
@@ -498,6 +625,13 @@ fn is_modifier_sym(sym: xkb::Keysym) -> bool {
             | xkb::Keysym::Hyper_L
             | xkb::Keysym::Hyper_R
     )
+}
+
+/// Keys that should not generate repeat events (function keys used as
+/// compositor actions are already consumed before reaching this check; this
+/// covers protocol-level non-repeating keys).
+fn is_non_repeating(sym: xkb::Keysym) -> bool {
+    is_modifier_sym(sym)
 }
 
 fn wl_key_state(ks: KeyState) -> wayland_server::protocol::wl_keyboard::KeyState {
