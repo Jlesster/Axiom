@@ -24,9 +24,9 @@ src/
 │   ├── mod.rs
 │   └── commands.rs
 ├── portal/              # xdg-desktop-portal integration
-│   ├── mod.rs
-│   ├── dbus.rs
-│   └── pipewire_stream.rs
+│   ├── mod.rs           # Portal orchestration
+│   ├── dbus.rs          # D-Bus communication
+│   └── pipewire_stream.rs # PipeWire stream handling
 ├── backend/             # Hardware abstraction layer
 │   ├── mod.rs           # Backend orchestration
 │   ├── drm.rs           # DRM device, CRTC, page flipping
@@ -35,16 +35,19 @@ src/
 │   └── session.rs       # libseat session management (VT switching)
 ├── proto/               # Wayland protocol implementations
 │   ├── mod.rs           # Global registry
-│   ├── compositor.rs    # wl_compositor, wl_surface
-│   ├── xdg_shell.rs     # xdg_wm_base, xdg_surface, xdg_toplevel
+│   ├── compositor.rs    # wl_compositor, wl_surface, wl_subcompositor
+│   ├── xdg_shell.rs     # xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup
 │   ├── seat.rs          # wl_seat, wl_keyboard, wl_pointer
-│   ├── shm.rs           # wl_shm
+│   ├── shm.rs           # wl_shm, wl_shm_pool
 │   ├── layer_shell.rs   # zwlr_layer_shell_v1
 │   ├── wl_output.rs     # wl_output
+│   ├── output.rs        # wl_output per-output state
 │   ├── xdg_output.rs   # zxdg_output_manager_v1
 │   ├── xdg_decoration.rs # zxdg_decoration_manager_v1
 │   ├── idle_inhibit.rs  # zwp_idle_inhibit_v1
-│   └── dmabuf.rs        # zwp_linux_dmabuf_v1
+│   ├── dmabuf.rs        # zwp_linux_dmabuf_v1
+│   ├── screencopy.rs    # zwlr_screencopy_manager_v1
+│   └── fractional_scale.rs # wp_fractional_scale_manager_v1
 ├── render/              # OpenGL compositing
 │   ├── mod.rs           # Render loop, output rendering
 │   ├── programs.rs      # Shader compilation, VAO/VBO
@@ -68,7 +71,7 @@ src/
     ├── mod.rs           # XWayland manager, X11 event handling
     ├── atoms.rs         # X11 atom definitions
     ├── surface.rs       # XwaylandSurface wrapper
-    └── wm.rs            # (NOTE: This file contains a duplicate WmState copy - see Errors below)
+    └── wm.rs            # X11WmState with EWMH, size hints, decorations
 ```
 
 ### Module Responsibilities
@@ -248,59 +251,6 @@ AXIOM_LOG=debug,axiom=trace cargo run --release
 
 ---
 
-## ERRORS TO FIX
-
-The following compilation errors must be resolved:
-
-### 1. `src/main.rs:37` - Duplicate module declaration
-```rust
-mod portal;     // Line 6 - declares portal module
-    portal,     // Line 37 - tries to re-declare it
-```
-**Fix:** Change line 37 from `mod portal;` to `use portal;` or remove entirely if not needed.
-
-### 2. `src/xwayland/wm.rs:3-5` - Missing submodules
-```rust
-pub mod anim;    // File doesn't exist
-pub mod layout;  // File doesn't exist  
-pub mod rules;   // File doesn't exist
-```
-**Fix:** Either:
-- Remove these lines and re-export from `crate::wm` instead
-- Or change to `pub use crate::wm::{anim, layout, rules};`
-
-### 3. `src/xwayland/mod.rs:32` - Missing export
-```rust
-pub use wm::X11WmState;  // X11WmState doesn't exist in xwayland/wm.rs
-```
-**Fix:** The file `xwayland/wm.rs` contains a full copy of `WmState` (not `X11WmState`). Options:
-- Change `pub use wm::X11WmState;` to `pub use wm::WmState;` (if X11-specific state is needed)
-- Or remove if not needed and fix downstream usages
-
-### 4. `src/xwayland/mod.rs:255,280,300` - Type inference needed
-```rust
-let wm = match self.wm.as_mut() { ... }  // Type annotation needed
-let _ = conn.set_input_focus(...)          // conn type needed
-let _ = conn.send_event(...)               // conn type needed
-```
-**Fix:** Add explicit type annotations:
-```rust
-let wm: &mut Option<X11WmState> = self.wm.as_mut();
-```
-Or use the `use x11rb::connection::Connection;` import that's already there.
-
-### 5. `src/proto/shm.rs:244` - Missing `c_void` import
-```rust
-pub const MAP_FAILED: *mut c_void = !0usize as *mut _;
-```
-**Fix:** Add import at top of file:
-```rust
-use crate::sys::c_void;
-// Or use std::ffi::c_void;
-```
-
----
-
 ## Known Implementation Status
 
 ### Complete
@@ -311,31 +261,84 @@ use crate::sys::c_void;
 - Status bar with Catppuccin theme
 - libinput keyboard/pointer handling
 - Workspace management (9 workspaces)
-- Window rules
+- Window rules engine with float/workspace/size/position effects
 - Spring-based animations
 - VT switching via libseat
-- XWayland integration (in progress - see errors)
+- XWayland integration (spawn, surface pairing, event handling)
 - IPC server for external tools
-- xdg-desktop-portal integration (screenshots)
+- xdg-desktop-portal integration (screenshots via zwp_linux_dmabuf_v1)
 - Idle inhibit protocol (zwp-idle-inhibit-v1)
 - Scratchpad support
+- Window decorations with rounded corners and shadows
+- EWMH support (_NET_WM_STATE, window types, etc.)
 
 ### Partial/Incomplete
-- XWayland integration (errors need fixing)
-- Screen capture/PipeWire (portal integration stub)
-- DMABuf rendering (stub)
-- Fractional scaling (protocol exists, unused import warning)
+- DMABuf rendering (implemented but may have issues with some clients)
+- Fractional scaling (protocol registered, not fully utilized)
 - Drag-and-drop (DnDIcon exists, no handler)
 - Plugin ABI (stub only)
 - Xcursor loading (returns generated arrow)
 
 ---
 
+## Current Working Topic: Window Tiling and Chrome Issues
+
+### Issue: Windows Not Properly Fitting Tiles or Missing Chrome
+
+**Problem Description:**
+Some windows do not fit properly within their assigned tiles, and/or lack proper window chrome (borders, shadows, title area). This manifests as:
+- Windows rendering at wrong sizes or positions
+- Missing or incorrect window decorations
+- Client-side decorated (CSD) applications not rendering correctly
+- Configure round-trip issues causing thrashing
+
+**Root Causes (Suspected):**
+
+1. **Configure Sequencing**: When a new window is added:
+   - Initial 0×0 configure is sent to let client pick size
+   - Client responds with its preferred size
+   - Layout assigns a rect based on tiling
+   - Second configure is sent with the layout rect
+   - This can cause a race condition if the client commits before receiving the second configure
+
+2. **Surface Pairing Timing**: For XWayland:
+   - X11 window appears and must be paired with a Wayland surface
+   - WL_SURFACE_SERIAL mechanism requires careful synchronization
+   - Late pairing can cause geometry issues
+
+3. **Client-Size vs Compositor-Size Mismatch**:
+   - Clients with CSD (GTK4, Qt6) report inner content size, not including decorations
+   - The compositor expects surface size to match the assigned rect
+   - `set_window_geometry` is called but may not handle CSD apps correctly
+
+4. **Texture Upload Timing**:
+   - Texture uploads happen on surface commit
+   - Layout changes may happen before texture is ready
+   - Results in wrong-size rendering or missing content
+
+**Affected Files:**
+- `src/wm/mod.rs` — `set_window_geometry`, `reflow`
+- `src/state.rs` — `on_surface_commit`, `send_configure_for_surface`
+- `src/proto/xdg_shell.rs` — configure sequencing, geometry handling
+- `src/render/mod.rs` — texture handling, chrome rendering
+
+**Potential Fixes:**
+
+1. **For CSD Apps**: Implement proper handling of `xdg_toplevel.set_window_geometry` to account for client-reported inner geometry vs assigned outer geometry.
+
+2. **Configure Coalescing**: Combine the initial and layout-based configures into a single configure sent after the window is added to the WM.
+
+3. **Texture Size Validation**: Ensure texture dimensions match expected window rect before rendering.
+
+4. **XWayland Surface Pairing**: Improve serial tracking and pairing logic to ensure windows are properly matched before geometry assignment.
+
+---
+
 ## Future Direction
 
 ### Short-term
-- [ ] Fix XWayland compilation errors
-- [ ] Complete XWayland integration
+- [ ] Fix window tiling geometry issues (see Current Working Topic)
+- [ ] Fix CSD application handling
 - [ ] Implement DMABuf for hardware-accelerated client buffers
 - [ ] Add fractional scaling support
 - [ ] Improve screen capture integration

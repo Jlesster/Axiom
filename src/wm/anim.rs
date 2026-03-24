@@ -1,5 +1,4 @@
 // src/wm/anim.rs — Window animation system (spring physics).
-// See previous session for Spring implementation details.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -39,6 +38,7 @@ impl Spring {
     pub fn bouncy(v: f64) -> Self {
         Self::new(v, 200.0, 18.0)
     }
+
     pub fn set_target(&mut self, t: f64) {
         self.target = t;
     }
@@ -80,11 +80,18 @@ pub struct WindowAnim {
     pub y: Spring,
     pub w: Spring,
     pub h: Spring,
+    /// Fade-in/out opacity (0 → 1 on open, 1 → 0 on close).
     pub opacity: Spring,
-    pub scale: Spring,
+    /// True while the close animation is running — renderer skips the window
+    /// once opacity reaches zero.
+    pub closing: bool,
 }
 
 impl WindowAnim {
+    /// Create a new animation **already at the correct geometry**.
+    /// Opacity starts at 0 and springs to 1 for a smooth fade-in.
+    /// Geometry springs are snapped to the real values so the window never
+    /// slides in from (0,0).
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         let mut a = Self {
             x: Spring::snappy(x as f64),
@@ -92,25 +99,43 @@ impl WindowAnim {
             w: Spring::snappy(w as f64),
             h: Spring::snappy(h as f64),
             opacity: Spring::smooth(0.0),
-            scale: Spring::snappy(0.9),
+            closing: false,
         };
-        a.show();
+        // Geometry is already at the target — snap so springs are settled.
+        a.x.snap(x as f64);
+        a.y.snap(y as f64);
+        a.w.snap(w as f64);
+        a.h.snap(h as f64);
+        // Kick off the fade-in.
+        a.opacity.set_target(1.0);
         a
     }
+
     pub fn set_geometry(&mut self, x: i32, y: i32, w: i32, h: i32) {
         self.x.set_target(x as f64);
         self.y.set_target(y as f64);
         self.w.set_target(w as f64);
         self.h.set_target(h as f64);
     }
-    pub fn show(&mut self) {
-        self.opacity.set_target(1.0);
-        self.scale.set_target(1.0);
+
+    /// Snap geometry instantly (no spring travel) — use when a window first
+    /// appears so it doesn't slide from its old position.
+    pub fn snap_geometry(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.x.snap(x as f64);
+        self.y.snap(y as f64);
+        self.w.snap(w as f64);
+        self.h.snap(h as f64);
     }
+
     pub fn close(&mut self) {
+        self.closing = true;
         self.opacity.set_target(0.0);
-        self.scale.set_target(0.92);
     }
+
+    pub fn is_done_closing(&self) -> bool {
+        self.closing && self.opacity.value < 0.01
+    }
+
     pub fn tick(&mut self, dt: f64) -> bool {
         let mut m = false;
         m |= self.x.tick(dt);
@@ -118,9 +143,9 @@ impl WindowAnim {
         m |= self.w.tick(dt);
         m |= self.h.tick(dt);
         m |= self.opacity.tick(dt);
-        m |= self.scale.tick(dt);
         m
     }
+
     pub fn current_rect(&self) -> (i32, i32, i32, i32) {
         (
             self.x.as_i32(),
@@ -135,7 +160,6 @@ impl WindowAnim {
 pub struct AnimSet {
     pub windows: HashMap<WindowId, WindowAnim>,
     pub workspace_offset: Spring,
-    /// Tracks when the last tick happened so tick() can compute dt internally.
     last_tick: Instant,
 }
 
@@ -168,20 +192,35 @@ impl AnimSet {
         }
     }
 
+    /// Update geometry target.  If the window has no anim entry yet, create
+    /// one snapped to the given rect (no slide-from-origin).
     pub fn set_geometry(&mut self, id: WindowId, x: i32, y: i32, w: i32, h: i32) {
-        if let Some(a) = self.windows.get_mut(&id) {
-            a.set_geometry(x, y, w, h);
-        } else {
-            self.insert(id, x, y, w, h);
+        match self.windows.get_mut(&id) {
+            Some(a) => {
+                // If the anim was previously at (0,0,0,0) — i.e. the window
+                // was just created and reflow fired before set_geometry —
+                // snap rather than spring so it doesn't fly across the screen.
+                if a.w.target < 1.0 && a.h.target < 1.0 {
+                    a.snap_geometry(x, y, w, h);
+                } else {
+                    a.set_geometry(x, y, w, h);
+                }
+            }
+            None => {
+                self.insert(id, x, y, w, h);
+            }
         }
     }
 
-    /// No-arg tick — computes dt from wall clock. Returns true if still animating.
-    /// Called by main.rs as `state.anim.tick()`.
+    /// Returns true if any animation is still running.
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
         self.last_tick = now;
+
+        // Remove windows whose close animation has fully faded out.
+        self.windows.retain(|_, a| !a.is_done_closing());
+
         let mut any = false;
         for anim in self.windows.values_mut() {
             any |= anim.tick(dt);
@@ -190,8 +229,8 @@ impl AnimSet {
         any
     }
 
-    /// Explicit-dt tick for tests.
     pub fn tick_dt(&mut self, dt: f64) -> bool {
+        self.windows.retain(|_, a| !a.is_done_closing());
         let mut any = false;
         for anim in self.windows.values_mut() {
             any |= anim.tick(dt);
@@ -200,15 +239,25 @@ impl AnimSet {
         any
     }
 
-    /// Get the current animated rect for a window, falling back to the WM rect.
-    /// Called by renderer as `state.anim.get_rect(win_id, win.rect)`.
+    /// Get the current animated rect, falling back to the WM rect.
     pub fn get_rect(&self, id: WindowId, fallback: Rect) -> Rect {
         if let Some(a) = self.windows.get(&id) {
             let (x, y, w, h) = a.current_rect();
-            Rect::new(x, y, w, h)
-        } else {
-            fallback
+            // Never return a degenerate rect — fall back if the anim hasn't
+            // settled to a valid size yet.
+            if w > 0 && h > 0 {
+                return Rect::new(x, y, w, h);
+            }
         }
+        fallback
+    }
+
+    /// Current opacity for a window (0.0–1.0).
+    pub fn get_opacity(&self, id: WindowId) -> f32 {
+        self.windows
+            .get(&id)
+            .map(|a| a.opacity.as_f32_clamped())
+            .unwrap_or(1.0)
     }
 
     pub fn begin_workspace_switch(&mut self, dx: f64) {

@@ -111,6 +111,7 @@ pub fn install(lua: &Lua, wm: &WmState) -> LuaResult<ActionQueue> {
                 }
                 maybe!("border_width", border_w);
                 maybe!("gap", gap);
+                maybe!("outer_gap", outer_gap);
                 maybe!("bar_height", bar_height);
                 maybe!("workspaces", workspaces_count);
                 maybe!("bar_at_bottom", bar_at_bottom);

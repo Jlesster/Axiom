@@ -27,19 +27,18 @@ const QUAD_VERT: &str = r#"
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
 out vec2 v_uv;
-out vec2 v_pos;      // pixel position within the rect
+out vec2 v_pos;
 uniform mat3 u_proj;
-uniform vec4 u_rect; // x, y, w, h  (pixels)
+uniform vec4 u_rect;
 void main() {
     v_uv  = a_uv;
-    v_pos = a_pos * u_rect.zw;          // 0..w, 0..h
+    v_pos = a_pos * u_rect.zw;
     vec2 world  = a_pos * u_rect.zw + u_rect.xy;
     vec3 ndc    = u_proj * vec3(world, 1.0);
     gl_Position = vec4(ndc.xy, 0.0, 1.0);
 }
 "#;
 
-// Textured quad with rounded corners and per-pixel alpha.
 const TEX_FRAG: &str = r#"
 #version 330 core
 in  vec2 v_uv;
@@ -47,22 +46,22 @@ in  vec2 v_pos;
 out vec4 frag;
 uniform sampler2D u_tex;
 uniform float     u_alpha;
-uniform vec2      u_size;   // rect pixel size
-uniform float     u_radius; // corner radius in pixels
+uniform vec2      u_size;
+uniform float     u_radius;
 
 float rounded_alpha(vec2 pos, vec2 sz, float r) {
     vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
     float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-    return clamp(-d, 0.0, 1.0);           // anti-aliased edge
+    return clamp(-d + 0.5, 0.0, 1.0);
 }
 
 void main() {
     float mask = rounded_alpha(v_pos, u_size, u_radius);
-    frag = texture(u_tex, v_uv) * vec4(1.0, 1.0, 1.0, u_alpha * mask);
+    vec4 c = texture(u_tex, v_uv);
+    frag = vec4(c.rgb, c.a * u_alpha * mask);
 }
 "#;
 
-// Solid colour quad with rounded corners.
 const SOLID_FRAG: &str = r#"
 #version 330 core
 in  vec2 v_pos;
@@ -74,7 +73,7 @@ uniform float u_radius;
 float rounded_alpha(vec2 pos, vec2 sz, float r) {
     vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
     float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-    return clamp(-d, 0.0, 1.0);
+    return clamp(-d + 0.5, 0.0, 1.0);
 }
 
 void main() {
@@ -83,16 +82,52 @@ void main() {
 }
 "#;
 
-// Drop-shadow — a blurred dark rectangle offset behind the window.
-// We approximate a gaussian shadow with a smooth falloff.
+const BORDER_FRAG: &str = r#"
+#version 330 core
+in  vec2 v_pos;
+out vec4 frag;
+
+uniform vec2  u_size;
+uniform float u_radius;
+uniform float u_thickness;
+uniform vec4  u_col_a;
+uniform vec4  u_col_b;
+uniform float u_focused;
+
+float rounded_sdf(vec2 pos, vec2 sz, float r) {
+    vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+void main() {
+    float outer = rounded_sdf(v_pos, u_size, u_radius);
+    float inner = rounded_sdf(v_pos, u_size, max(u_radius - u_thickness, 0.0));
+
+    float outer_mask = clamp(-outer + 0.5, 0.0, 1.0);
+    float inner_mask = clamp( inner + 0.5, 0.0, 1.0);
+    float ring = outer_mask * inner_mask;
+
+    if (ring < 0.001) discard;
+
+    vec2 c = v_pos - u_size * 0.5;
+    float t = (atan(c.y, c.x) / 3.14159265 + 1.0) * 0.5;
+
+    vec4 col = mix(u_col_a, u_col_b, t);
+    if (u_focused < 0.5) {
+        col = mix(col, vec4(0.0), 0.45);
+    }
+    frag = vec4(col.rgb * col.a, col.a) * ring;
+}
+"#;
+
 const SHADOW_FRAG: &str = r#"
 #version 330 core
 in  vec2 v_pos;
 out vec4 frag;
-uniform vec4  u_color;   // shadow colour (pre-multiplied alpha target)
-uniform vec2  u_size;    // shadow rect size
-uniform float u_radius;  // corner radius
-uniform float u_blur;    // blur spread in pixels
+uniform vec4  u_color;
+uniform vec2  u_size;
+uniform float u_radius;
+uniform float u_blur;
 
 float rounded_sdf(vec2 pos, vec2 sz, float r) {
     vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
@@ -103,7 +138,7 @@ void main() {
     float d    = rounded_sdf(v_pos, u_size, u_radius);
     float blur = max(u_blur, 0.001);
     float a    = smoothstep(blur, 0.0, d) * u_color.a;
-    frag = vec4(u_color.rgb * a, a);   // pre-multiplied
+    frag = vec4(u_color.rgb * a, a);
 }
 "#;
 
@@ -136,21 +171,18 @@ void main() {
 }
 "#;
 
-// ── Chrome config (tweak here to taste) ──────────────────────────────────────
+// ── Chrome config ─────────────────────────────────────────────────────────────
 
 pub struct ChromeConfig {
-    /// Window corner radius in pixels.
     pub corner_radius: f32,
-    /// Drop-shadow spread (blur radius) in pixels.
     pub shadow_spread: f32,
-    /// Shadow offset from the window edge (extra padding each side).
     pub shadow_offset: f32,
-    /// Focused border width (the ring drawn outside the rounded window).
     pub border_width: f32,
-    /// Focused shadow colour (RGBA).
     pub shadow_focused: [f32; 4],
-    /// Unfocused shadow colour (RGBA).
     pub shadow_unfocused: [f32; 4],
+    pub border_active_a: [f32; 4],
+    pub border_active_b: [f32; 4],
+    pub border_inactive: [f32; 4],
 }
 
 impl Default for ChromeConfig {
@@ -162,6 +194,9 @@ impl Default for ChromeConfig {
             border_width: 2.0,
             shadow_focused: [0.0, 0.0, 0.0, 0.72],
             shadow_unfocused: [0.0, 0.0, 0.0, 0.38],
+            border_active_a: [0.706, 0.745, 0.996, 1.0],
+            border_active_b: [0.804, 0.651, 0.969, 1.0],
+            border_inactive: [0.239, 0.247, 0.322, 0.7],
         }
     }
 }
@@ -171,6 +206,7 @@ impl Default for ChromeConfig {
 pub struct RenderState {
     pub prog_tex: GlProgram,
     pub prog_solid: GlProgram,
+    pub prog_border: GlProgram,
     pub prog_shadow: GlProgram,
     pub prog_glyph_gray: GlProgram,
     pub prog_glyph_lcd: GlProgram,
@@ -188,6 +224,7 @@ impl RenderState {
     pub fn new() -> Result<Self> {
         let prog_tex = GlProgram::compile(QUAD_VERT, TEX_FRAG)?;
         let prog_solid = GlProgram::compile(QUAD_VERT, SOLID_FRAG)?;
+        let prog_border = GlProgram::compile(QUAD_VERT, BORDER_FRAG)?;
         let prog_shadow = GlProgram::compile(QUAD_VERT, SHADOW_FRAG)?;
         let prog_glyph_gray = GlProgram::compile(QUAD_VERT, GLYPH_GRAY_FRAG)?;
         let prog_glyph_lcd = GlProgram::compile(QUAD_VERT, GLYPH_LCD_FRAG)?;
@@ -196,9 +233,6 @@ impl RenderState {
 
         unsafe {
             gl::Enable(gl::BLEND);
-            // Standard straight-alpha blending — used by textures and glyphs.
-            // The shadow draw call temporarily switches to pre-multiplied and
-            // restores this afterwards.
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
             gl::Disable(gl::DEPTH_TEST);
             gl::Disable(gl::STENCIL_TEST);
@@ -219,6 +253,7 @@ impl RenderState {
         Ok(Self {
             prog_tex,
             prog_solid,
+            prog_border,
             prog_shadow,
             prog_glyph_gray,
             prog_glyph_lcd,
@@ -271,32 +306,40 @@ impl RenderState {
 
         let focused_id = wm.focused_window();
 
-        let (tiled, floating): (Vec<WindowId>, Vec<WindowId>) = wm.workspaces[aws]
-            .windows
-            .iter()
-            .copied()
-            .partition(|&id| wm.windows.get(&id).map(|w| !w.floating).unwrap_or(true));
+        // Build draw order: tiled first (back), floating on top, focused last
+        // (so it always renders above everything else on its workspace).
+        let draw_order = build_draw_order(wm, aws, focused_id);
 
-        // Draw in z-order: tiled first, then floating, focused window last.
-        let mut draw_order: Vec<WindowId> = tiled.iter().chain(floating.iter()).copied().collect();
-        // Ensure focused window is painted on top (in its group).
-        if let Some(fid) = focused_id {
-            if let Some(pos) = draw_order.iter().position(|&id| id == fid) {
-                draw_order.remove(pos);
-                draw_order.push(fid);
-            }
-        }
-
+        // Pass 1: shadows (back to front, skip windows with no texture yet)
         for &id in &draw_order {
             let Some(win) = wm.windows.get(&id) else {
                 continue;
             };
+            if !self.textures.contains_key(&id) {
+                continue;
+            }
             let rect = anim.get_rect(id, win.rect);
-            let focused = focused_id == Some(id);
-            // Shadow pass.
-            self.draw_shadow(&proj, rect, focused);
-            // Window pass.
-            self.draw_window(wm, &proj, id, rect, focused);
+            let opacity = anim.get_opacity(id);
+            if opacity < 0.01 {
+                continue;
+            }
+            self.draw_shadow(&proj, rect, focused_id == Some(id), opacity);
+        }
+
+        // Pass 2: window content + border ring (back to front)
+        for &id in &draw_order {
+            let Some(win) = wm.windows.get(&id) else {
+                continue;
+            };
+            if !self.textures.contains_key(&id) {
+                continue;
+            }
+            let rect = anim.get_rect(id, win.rect);
+            let opacity = anim.get_opacity(id);
+            if opacity < 0.01 {
+                continue;
+            }
+            self.draw_window(wm, &proj, id, rect, focused_id == Some(id), opacity);
         }
 
         self.draw_layers(&proj, layer_surfaces, w as i32, h as i32, Layer::Top);
@@ -312,9 +355,9 @@ impl RenderState {
             self.draw_bar(&proj, wm, w as f32, mon_idx);
         }
 
+        // Software cursor fallback.
         if self.hw_cursor.is_none() && !input.hw_cursor_active {
-            let (cx, cy) = (input.cursor_pos.0 as f32, input.cursor_pos.1 as f32);
-            // Software cursor: small rounded dot
+            let (cx, cy) = (input.pointer_x as f32, input.pointer_y as f32);
             self.fill_rounded(
                 &proj,
                 cx - 4.0,
@@ -329,25 +372,26 @@ impl RenderState {
 
     // ── Shadow ────────────────────────────────────────────────────────────────
 
-    fn draw_shadow(&self, proj: &[f32; 9], rect: Rect, focused: bool) {
+    fn draw_shadow(&self, proj: &[f32; 9], rect: Rect, focused: bool, opacity: f32) {
         let so = self.chrome.shadow_offset;
         let sr = self.chrome.shadow_spread;
         let cr = self.chrome.corner_radius;
-        let sx = rect.x as f32 - so;
-        let sy = rect.y as f32 - so * 0.5;
-        let sw = rect.w as f32 + so * 2.0;
-        let sh = rect.h as f32 + so * 2.5;
-        let col = if focused {
+        let bw = self.chrome.border_width;
+
+        let sx = rect.x as f32 - so - bw;
+        let sy = rect.y as f32 - so * 0.5 - bw;
+        let sw = rect.w as f32 + (so + bw) * 2.0;
+        let sh = rect.h as f32 + (so + bw) * 2.5;
+
+        let base = if focused {
             self.chrome.shadow_focused
         } else {
             self.chrome.shadow_unfocused
         };
+        let col = [base[0], base[1], base[2], base[3] * opacity];
 
         unsafe {
-            // Shadow shader outputs pre-multiplied alpha — switch blend mode
-            // just for this draw call, then restore straight-alpha.
             gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
-
             self.prog_shadow.bind();
             gl::UniformMatrix3fv(self.prog_shadow.loc("u_proj"), 1, gl::FALSE, proj.as_ptr());
             gl::Uniform4f(self.prog_shadow.loc("u_rect"), sx, sy, sw, sh);
@@ -359,13 +403,74 @@ impl RenderState {
                 col[3],
             );
             gl::Uniform2f(self.prog_shadow.loc("u_size"), sw, sh);
-            gl::Uniform1f(self.prog_shadow.loc("u_radius"), cr + so * 0.5);
+            gl::Uniform1f(self.prog_shadow.loc("u_radius"), cr + bw + so * 0.5);
             gl::Uniform1f(self.prog_shadow.loc("u_blur"), sr);
             self.quad_vao.draw();
-
-            // Restore standard straight-alpha for everything else.
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
         }
+    }
+
+    // ── Window + border ring ──────────────────────────────────────────────────
+
+    fn draw_window(
+        &self,
+        wm: &WmState,
+        proj: &[f32; 9],
+        id: WindowId,
+        rect: Rect,
+        focused: bool,
+        opacity: f32,
+    ) {
+        let cr = self.chrome.corner_radius;
+        let bw = self.chrome.border_width;
+
+        if bw > 0.0 {
+            let bx = rect.x as f32 - bw;
+            let by = rect.y as f32 - bw;
+            let bw2 = rect.w as f32 + bw * 2.0;
+            let bh2 = rect.h as f32 + bw * 2.0;
+            let br = cr + bw;
+
+            let (ca, cb) = if focused {
+                (self.chrome.border_active_a, self.chrome.border_active_b)
+            } else {
+                (self.chrome.border_inactive, self.chrome.border_inactive)
+            };
+            let mut ca = ca;
+            ca[3] *= opacity;
+            let mut cb = cb;
+            cb[3] *= opacity;
+
+            unsafe {
+                self.prog_border.bind();
+                gl::UniformMatrix3fv(self.prog_border.loc("u_proj"), 1, gl::FALSE, proj.as_ptr());
+                gl::Uniform4f(self.prog_border.loc("u_rect"), bx, by, bw2, bh2);
+                gl::Uniform2f(self.prog_border.loc("u_size"), bw2, bh2);
+                gl::Uniform1f(self.prog_border.loc("u_radius"), br);
+                gl::Uniform1f(self.prog_border.loc("u_thickness"), bw);
+                gl::Uniform4f(self.prog_border.loc("u_col_a"), ca[0], ca[1], ca[2], ca[3]);
+                gl::Uniform4f(self.prog_border.loc("u_col_b"), cb[0], cb[1], cb[2], cb[3]);
+                gl::Uniform1f(
+                    self.prog_border.loc("u_focused"),
+                    if focused { 1.0 } else { 0.0 },
+                );
+                self.quad_vao.draw();
+            }
+        }
+
+        let Some(tex) = self.textures.get(&id) else {
+            return;
+        };
+        self.blit_rounded(
+            proj,
+            rect.x as f32,
+            rect.y as f32,
+            rect.w as f32,
+            rect.h as f32,
+            cr,
+            tex,
+            opacity,
+        );
     }
 
     // ── Bar ───────────────────────────────────────────────────────────────────
@@ -389,7 +494,7 @@ impl RenderState {
             gl::Uniform4f(p.loc("u_rect"), x, y, w, h);
             gl::Uniform4f(p.loc("u_color"), c[0], c[1], c[2], c[3]);
             gl::Uniform2f(p.loc("u_size"), w, h);
-            gl::Uniform1f(p.loc("u_radius"), 0.0); // bar uses no rounding
+            gl::Uniform1f(p.loc("u_radius"), 0.0);
             (*qv).draw();
         };
 
@@ -425,52 +530,6 @@ impl RenderState {
         self.bar.draw(&mut ctx, wm, out_w, mon_idx);
     }
 
-    // ── Window ────────────────────────────────────────────────────────────────
-
-    fn draw_window(&self, wm: &WmState, proj: &[f32; 9], id: WindowId, rect: Rect, focused: bool) {
-        let Some(tex) = self.textures.get(&id) else {
-            return;
-        };
-
-        let cr = self.chrome.corner_radius;
-        let bw = self.chrome.border_width;
-
-        // Focused border ring drawn as a slightly larger rounded fill underneath.
-        if bw > 0.0 {
-            let bc = if focused {
-                wm.config.active_border
-            } else {
-                wm.config.inactive_border
-            };
-            // Make inactive border almost transparent so it's subtle.
-            let bc = if focused {
-                bc
-            } else {
-                [bc[0], bc[1], bc[2], bc[3] * 0.4]
-            };
-            self.fill_rounded(
-                proj,
-                rect.x as f32 - bw,
-                rect.y as f32 - bw,
-                rect.w as f32 + bw * 2.0,
-                rect.h as f32 + bw * 2.0,
-                cr + bw,
-                bc,
-            );
-        }
-
-        self.blit_rounded(
-            proj,
-            rect.x as f32,
-            rect.y as f32,
-            rect.w as f32,
-            rect.h as f32,
-            cr,
-            tex,
-            1.0,
-        );
-    }
-
     // ── Layer surfaces ────────────────────────────────────────────────────────
 
     fn draw_layers(
@@ -494,7 +553,6 @@ impl RenderState {
             let (x, y, lw, lh) = layer_geom(&ls, ow, oh);
             drop(ls);
             if let Some(tex) = self.layer_textures.get(&sid) {
-                // Layer surfaces: no rounding (they're typically bars/docks)
                 self.blit(proj, x as f32, y as f32, lw as f32, lh as f32, tex, 1.0);
             }
         }
@@ -512,10 +570,6 @@ impl RenderState {
             gl::Uniform1f(self.prog_solid.loc("u_radius"), r);
             self.quad_vao.draw();
         }
-    }
-
-    fn fill(&self, proj: &[f32; 9], x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) {
-        self.fill_rounded(proj, x, y, w, h, 0.0, c);
     }
 
     fn blit(&self, proj: &[f32; 9], x: f32, y: f32, w: f32, h: f32, tex: &GlTexture, alpha: f32) {
@@ -570,12 +624,36 @@ impl RenderState {
     pub fn remove_window_texture(&mut self, id: WindowId) {
         self.textures.remove(&id);
     }
-
     pub fn remove_layer_texture(&mut self, id: u32) {
         self.layer_textures.remove(&id);
     }
-
     pub fn release_buffer(&mut self, _buf: &wayland_server::protocol::wl_buffer::WlBuffer) {}
+}
+
+// ── Draw order helper ─────────────────────────────────────────────────────────
+//
+// Correct order: tiled windows back-to-front, then floating windows, then the
+// focused window last (always on top regardless of tiled/floating status).
+
+fn build_draw_order(wm: &WmState, aws: usize, focused_id: Option<WindowId>) -> Vec<WindowId> {
+    let ws = &wm.workspaces[aws];
+
+    let (mut tiled, mut floating): (Vec<WindowId>, Vec<WindowId>) = ws
+        .windows
+        .iter()
+        .copied()
+        .filter(|&id| focused_id != Some(id)) // focused goes last
+        .partition(|&id| wm.windows.get(&id).map(|w| !w.floating).unwrap_or(true));
+
+    let mut order = Vec::with_capacity(ws.windows.len());
+    order.append(&mut tiled);
+    order.append(&mut floating);
+    if let Some(fid) = focused_id {
+        if ws.windows.contains(&fid) {
+            order.push(fid);
+        }
+    }
+    order
 }
 
 // ── Surface texture upload ────────────────────────────────────────────────────
@@ -600,7 +678,7 @@ fn upload_surface<K: std::hash::Hash + Eq + Copy>(
         None => return,
     };
 
-    // ── DMA-BUF path ─────────────────────────────────────────────────────────
+    // ── DMA-BUF path ──────────────────────────────────────────────────────────
     if let Some(dmabuf) = buf.data::<DmaBufBuffer>() {
         let tex = map.entry(key).or_insert_with(GlTexture::new_empty);
 
@@ -618,9 +696,8 @@ fn upload_surface<K: std::hash::Hash + Eq + Copy>(
             .collect();
         let offsets: Vec<u32> = active.iter().map(|p| p.offset).collect();
         let strides: Vec<u32> = active.iter().map(|p| p.stride).collect();
-
         let first = active[0];
-        let modifier: u64 = ((first.modifier_hi as u64) << 32) | (first.modifier_lo as u64);
+        let modifier = ((first.modifier_hi as u64) << 32) | (first.modifier_lo as u64);
 
         let raw = crate::state::RawBuffer::Dmabuf {
             fds,
@@ -631,37 +708,31 @@ fn upload_surface<K: std::hash::Hash + Eq + Copy>(
             height: dmabuf.height,
             format: dmabuf.format,
         };
-
         tex.upload_buffer(&raw, egl);
         return;
     }
 
-    // ── SHM path — delegate to GlTexture::upload_shm so EglImage is cleared ──
+    // ── SHM path ──────────────────────────────────────────────────────────────
     if let Some(shm) = buf.data::<ShmBuffer>() {
         let tex = map.entry(key).or_insert_with(GlTexture::new_empty);
-        // Re-use the same raw-fd + mmap path inside GlTexture so we don't
-        // duplicate the upload logic and correctly drop any stale EglImage.
         shm.with_data(|bytes| {
-            // Build a temporary RawBuffer::Shm from the ShmBuffer metadata.
-            // This avoids duplicating the mmap/TexImage2D logic.
-            // ShmBuffer guarantees the data is valid for the duration of this closure.
             unsafe {
+                gl::PixelStorei(gl::UNPACK_ALIGNMENT, 4);
                 gl::BindTexture(gl::TEXTURE_2D, tex.id);
-                set_tex_params();
                 gl::TexImage2D(
                     gl::TEXTURE_2D,
                     0,
-                    gl::RGBA as i32,
+                    gl::RGBA8 as i32,
                     shm.width,
                     shm.height,
                     0,
                     gl::BGRA,
-                    gl::UNSIGNED_BYTE,
+                    gl::UNSIGNED_INT_8_8_8_8_REV,
                     bytes.as_ptr() as *const _,
                 );
+                set_tex_params();
                 gl::BindTexture(gl::TEXTURE_2D, 0);
             }
-            // Invalidate any stale EglImage from a previous DMA-BUF commit.
             tex.clear_egl_image();
         });
     }
@@ -677,8 +748,6 @@ unsafe fn set_tex_params() {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn ortho(w: f32, h: f32) -> [f32; 9] {
-    // Column-major 3×3 orthographic: maps [0,w]×[0,h] → [-1,1]×[1,-1]
-    // (Y flipped so pixel (0,0) is top-left)
     [2.0 / w, 0.0, 0.0, 0.0, -2.0 / h, 0.0, -1.0, 1.0, 1.0]
 }
 
@@ -724,13 +793,13 @@ fn layer_geom(
 
 fn find_font() -> Option<String> {
     [
+        "/usr/share/fonts/TTF/IosevkaJlessBrainsNerdFont-Regular.ttf",
         "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
         "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/TTF/Hack-Regular.ttf",
     ]
     .iter()
     .find(|p| std::path::Path::new(p).exists())

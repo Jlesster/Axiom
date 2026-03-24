@@ -153,8 +153,6 @@ pub struct InputState {
     pub popup_grab: Option<XdgPopup>,
     pub screen_w: f64,
     pub screen_h: f64,
-    /// Whether any mouse button is currently held — used to avoid dropping
-    /// pointer focus mid-drag.
     pub button_held: bool,
 }
 
@@ -226,8 +224,7 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
     };
     state.seat.xkb_state.update_key(xkb_keycode, dir);
 
-    // Always send modifier-only keys (Shift, Ctrl, Alt, Super) straight
-    // through so clients track modifier state correctly.
+    // Always forward modifier-only keys so clients track modifier state.
     let sym = state.seat.xkb_state.key_get_one_sym(xkb_keycode);
     if is_modifier_sym(sym) {
         let wl_state = wl_key_state(key_state);
@@ -238,7 +235,7 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
     if key_state == KeyState::Pressed {
         let mods = Mods::from_xkb(&state.seat.xkb_state);
 
-        // ── Hard-coded emergency binds ────────────────────────────────────────
+        // Hard-coded emergency quit.
         if mods == Mods(Mods::SUPER.0 | Mods::SHIFT.0) && sym == xkb::Keysym::Print {
             tracing::info!("emergency quit (Super+Shift+Print)");
             state
@@ -247,6 +244,7 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
             return;
         }
 
+        // VT switching.
         if mods == Mods(Mods::CTRL.0 | Mods::ALT.0) {
             if let Some(vt) = vt_from_sym(sym) {
                 vt_switch(state, vt);
@@ -254,14 +252,11 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
             }
         }
 
-        // ── Lua keybinds ──────────────────────────────────────────────────────
-        // fire_keybind returns Err when the combo is not registered in Lua.
-        // We must NOT swallow the key if no bind matched.
+        // Lua keybinds first.
         let combo = combo_string(mods, sym);
         let lua_matched = match crate::scripting::lua_api::fire_keybind(&state.script.lua, &combo) {
             Ok(matched) => matched,
             Err(e) => {
-                // Lua threw — log but don't swallow the key.
                 tracing::error!("keybind '{combo}': {e}");
                 false
             }
@@ -270,19 +265,17 @@ fn handle_keyboard(state: &mut Axiom, event: KeyboardEvent) {
         if lua_matched {
             let queue = state.script.queue.clone();
             crate::scripting::lua_api::drain(&queue, state);
-            return; // key was consumed by a bind
+            return;
         }
 
-        // ── Native keybind table ──────────────────────────────────────────────
+        // Native keybind table.
         if let Some(action) = state.input.keybinds.lookup(mods, sym).cloned() {
             dispatch_action(state, action);
             return;
         }
-
-        // ── No bind matched — fall through to client ──────────────────────────
     }
 
-    // Deliver key press/release to the focused Wayland client.
+    // No bind matched — deliver to focused client.
     let wl_state = wl_key_state(key_state);
     state.seat.send_key(time, keycode, wl_state);
 }
@@ -300,17 +293,21 @@ fn handle_pointer(state: &mut Axiom, event: PointerEvent) {
             state.input.cursor_pos = (state.input.pointer_x, state.input.pointer_y);
             let (px, py) = (state.input.pointer_x, state.input.pointer_y);
 
-            state.update_interactive_grab(px, py);
+            // Active grab takes priority — don't update pointer focus mid-drag.
+            if !matches!(state.grab, crate::state::GrabKind::None) {
+                state.update_interactive_grab(px, py);
+                state.needs_redraw = true;
+                return;
+            }
 
+            // Update pointer focus: send enter/leave as the surface under the
+            // cursor changes, and send motion to the current surface.
             if let Some((surface, sx, sy)) = state.surface_at(px, py) {
                 state.seat.set_pointer_focus(Some(surface), sx, sy);
                 state.seat.send_pointer_motion(time, sx, sy);
             } else if !state.input.button_held {
-                // Only clear focus when no button is held — avoids dropping
-                // pointer focus during fast drags that leave the surface rect.
-                if matches!(state.grab, crate::state::GrabKind::None) {
-                    state.seat.set_pointer_focus(None, 0.0, 0.0);
-                }
+                // Don't drop focus mid-drag even if the cursor leaves the rect.
+                state.seat.set_pointer_focus(None, 0.0, 0.0);
             }
 
             state.needs_redraw = true;
@@ -331,26 +328,36 @@ fn handle_pointer(state: &mut Axiom, event: PointerEvent) {
             if pressed {
                 let (px, py) = (state.input.pointer_x, state.input.pointer_y);
 
-                if let Some(id) = state.wm.window_at(px as i32, py as i32) {
-                    if state.wm.focused_window() != Some(id) {
-                        state.wm.focus_window(id);
-                        state.sync_keyboard_focus();
-                        state.needs_redraw = true;
+                // ── Click-to-focus ─────────────────────────────────────────────
+                // Use state.window_at (on Axiom, searches the anim rects) not
+                // state.wm.window_at — that method doesn't exist on WmState and
+                // was silently doing nothing before.
+                if let Some(win_id) = state.window_at(px, py) {
+                    if state.wm.focused_window() != Some(win_id) {
+                        // focus_window_by_click handles:
+                        //   - wm.focus_window()
+                        //   - send_configure to old + new (so decorations update)
+                        //   - XWayland focus if applicable
+                        //   - sync_keyboard_focus (sends wl_keyboard.enter)
+                        state.focus_window_by_click(win_id);
                     }
                 }
 
-                // Re-establish pointer focus so the click is delivered.
+                // Re-query surface_at after focus change — the window order
+                // may have changed (focused window moves to top of draw list).
                 if let Some((surface, sx, sy)) = state.surface_at(px, py) {
                     state.seat.set_pointer_focus(Some(surface), sx, sy);
-                    // Deliver the button event to the now-focused surface.
                     state.seat.send_pointer_button(time, button, wl_state);
                     return;
                 }
+                // Click landed on the wallpaper / no window — still deliver
+                // the button event (some clients watch for release without press).
+                state.seat.send_pointer_button(time, button, wl_state);
             } else {
+                // Button release: end any active grab, then forward event.
                 state.end_grab();
+                state.seat.send_pointer_button(time, button, wl_state);
             }
-
-            state.seat.send_pointer_button(time, button, wl_state);
         }
 
         PointerEvent::ScrollWheel(s) => {
@@ -384,58 +391,86 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
                 tracing::error!("Lua keybind '{fn_name}': {e}");
             }
         }
+
         Action::Close => {
             if let Some(id) = state.wm.focused_window() {
                 state.close_window(id);
             }
         }
+
         Action::FocusDir(dir) => {
             state.wm.focus_direction(dir);
+            // Keyboard enter goes to the new focus; the previously focused
+            // window needs a configure so its activated state clears.
             state.sync_keyboard_focus();
+            if let Some(id) = state.wm.focused_window() {
+                if let Some(surf) = state.wm.windows.get(&id).and_then(|w| w.surface.clone()) {
+                    state.send_configure_for_surface(&surf, id);
+                }
+            }
+            state.needs_redraw = true;
         }
+
         Action::MoveDir(dir) => {
             state.wm.move_direction(dir);
-            state.needs_redraw = true;
+            // Re-tile changes every window's rect — tell all clients.
+            state.send_configure_all();
         }
+
         Action::SwitchWorkspace(idx) => {
             state.wm.switch_workspace(idx);
-            state.needs_redraw = true;
+            // Windows on the newly visible workspace need configures so they
+            // know their current size (they may have been tiled while hidden).
+            state.send_configure_all();
+            state.sync_keyboard_focus();
         }
+
         Action::MoveToWorkspace(idx) => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.move_to_workspace(id, idx);
-                state.needs_redraw = true;
+                state.send_configure_all();
+                state.sync_keyboard_focus();
             }
         }
+
         Action::ToggleFloat => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.toggle_float(id);
-                state.needs_redraw = true;
+                // Toggling float re-tiles everyone else too.
+                state.send_configure_all();
             }
         }
+
         Action::ToggleFullscreen => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.toggle_fullscreen(id);
-                state.send_configure_focused();
+                if let Some(surf) = state.wm.windows.get(&id).and_then(|w| w.surface.clone()) {
+                    state.send_configure_for_surface(&surf, id);
+                }
                 state.needs_redraw = true;
             }
         }
+
         Action::IncMaster => {
             state.wm.inc_master();
-            state.needs_redraw = true;
+            state.send_configure_all();
         }
+
         Action::DecMaster => {
             state.wm.dec_master();
-            state.needs_redraw = true;
+            state.send_configure_all();
         }
+
         Action::Reload => {
             state.reload_config();
         }
+
         Action::Quit => {
             state
                 .running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
+
         Action::Spawn(cmd) => {
             spawn(&cmd);
         }
@@ -444,7 +479,6 @@ fn dispatch_action(state: &mut Axiom, action: Action) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns true for pure modifier keysyms that should always pass through.
 fn is_modifier_sym(sym: xkb::Keysym) -> bool {
     matches!(
         sym,

@@ -92,6 +92,12 @@ impl Window {
             self.rect.inset(border_w)
         }
     }
+
+    /// True if the compositor owns this window's size (tiled/fullscreen).
+    /// False if the client is free to pick its own size (floating).
+    pub fn compositor_sized(&self) -> bool {
+        !self.floating && !self.fullscreen
+    }
 }
 
 // ── Workspace ─────────────────────────────────────────────────────────────────
@@ -139,6 +145,7 @@ impl Workspace {
 pub struct WmConfig {
     pub border_w: i32,
     pub gap: i32,
+    pub outer_gap: i32,
     pub bar_height: i32,
     pub bar_at_bottom: bool,
     pub active_border: [f32; 4],
@@ -153,7 +160,8 @@ impl Default for WmConfig {
         Self {
             border_w: 2,
             gap: 6,
-            bar_height: 28, // ← was 0
+            outer_gap: 8,
+            bar_height: 28,
             bar_at_bottom: false,
             active_border: [0.706, 0.745, 0.996, 1.0],
             inactive_border: [0.271, 0.278, 0.353, 1.0],
@@ -243,7 +251,6 @@ impl WmState {
         let n = cfg.workspaces_count;
         let workspaces = (0..n).map(|i| Workspace::new(i, cfg.gap)).collect();
 
-        // Compute the initial usable rect (bar at top by default).
         let bh = cfg.bar_height;
         let usable = if cfg.bar_at_bottom {
             Rect::new(0, 0, screen_w, screen_h - bh)
@@ -462,6 +469,7 @@ impl WmState {
         if let Some(w) = self.windows.get_mut(&id) {
             w.title = title;
         }
+        // No reflow — title change never affects geometry.
     }
 
     pub fn toggle_float(&mut self, id: WindowId) {
@@ -629,9 +637,7 @@ impl WmState {
     }
 
     pub fn toggle_scratchpad(&mut self, name: &str) {
-        // Read active_ws before taking a mutable borrow on scratchpads.
         let aws = self.active_ws();
-
         let Some(sp) = self.scratchpads.get_mut(name) else {
             return;
         };
@@ -650,7 +656,6 @@ impl WmState {
             let x = ((self.screen_w - w) / 2).max(0);
             let y = ((self.screen_h - h) / 2).max(0);
             sp.visible = true;
-            // Drop the scratchpad borrow before touching windows/workspaces.
             drop(sp);
             if let Some(win) = self.windows.get_mut(&win_id) {
                 win.rect = Rect::new(x, y, w, h);
@@ -670,9 +675,6 @@ impl WmState {
     // ── Reflow ────────────────────────────────────────────────────────────────
 
     pub fn reflow(&mut self) {
-        // Collect everything we need from monitors+workspaces in one pass,
-        // producing plain data with no borrows into self, before we touch
-        // self.windows mutably.
         struct Task {
             usable: Rect,
             ox: i32,
@@ -682,6 +684,7 @@ impl WmState {
             layout: Layout,
             ratio: f32,
             gap: i32,
+            outer_gap: i32,
             tiled: Vec<WindowId>,
             all_wins: Vec<WindowId>,
         }
@@ -711,13 +714,13 @@ impl WmState {
                     layout: ws.layout,
                     ratio: ws.main_ratio,
                     gap: ws.gap,
+                    outer_gap: self.config.outer_gap,
                     tiled,
                     all_wins: ws.windows.clone(),
                 }
             })
             .collect();
 
-        // Now mutate self.windows freely — no borrows on monitors/workspaces.
         for task in &tasks {
             let rects = layout::compute(
                 task.layout,
@@ -725,6 +728,7 @@ impl WmState {
                 task.tiled.len(),
                 task.ratio,
                 task.gap,
+                task.outer_gap,
             );
             for (i, &id) in task.tiled.iter().enumerate() {
                 if let Some(win) = self.windows.get_mut(&id) {
@@ -764,12 +768,31 @@ impl WmState {
     ) {
     }
 
+    /// Called when a client acks a configure and tells us the geometry it
+    /// actually rendered at.  For tiled/fullscreen windows the compositor owns
+    /// the size — we discard the client's suggestion and keep the WM rect.
+    /// For floating windows we accept it so the window settles at whatever
+    /// size the client prefers.
     pub fn set_window_geometry(&mut self, id: WindowId, _x: i32, _y: i32, w: i32, h: i32) {
-        if let Some(win) = self.windows.get_mut(&id) {
+        let Some(win) = self.windows.get_mut(&id) else {
+            return;
+        };
+        // Only accept client-reported geometry for floating windows.
+        // Tiled and fullscreen windows have their rect set exclusively by
+        // reflow(); accepting the client's size here is what caused the
+        // configure → commit → set_window_geometry → reflow thrash loop.
+        if win.floating && !win.fullscreen {
+            // Clamp to reasonable minimums so clients can't collapse to 0×0.
+            let w = w.max(80);
+            let h = h.max(60);
             win.rect.w = w;
             win.rect.h = h;
+            win.float_rect.w = w;
+            win.float_rect.h = h;
         }
+        // Tiled/fullscreen: silently ignore — reflow() already set the correct rect.
     }
+
     pub fn set_window_title(&mut self, id: WindowId, title: String) {
         self.set_title(id, title);
     }
