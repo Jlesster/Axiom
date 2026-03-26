@@ -1,223 +1,203 @@
-// src/scripting/mod.rs
-
-pub mod lua_api;
-pub mod signals;
+mod lua_api;
 
 use anyhow::Result;
 use mlua::prelude::*;
-use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use crate::wm::WmState;
-use lua_api::ActionQueue;
+use crate::wm::{Layout, WindowId, WmState};
+
+// ── Action queue ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum LuaAction {
+    Spawn(String),
+    FocusId(WindowId),
+    CloseId(WindowId),
+    MoveToWorkspace(WindowId, usize),
+    SwitchWorkspace(usize),
+    SetLayout(usize, Layout),
+    SetFloat(WindowId, bool),
+    SetFullscreen(WindowId, bool),
+    FocusDirection(u8),
+    CycleFocus(i32),
+    IncMaster,
+    DecMaster,
+    Reload,
+    Quit,
+}
+
+pub type ActionQueue = Arc<Mutex<Vec<LuaAction>>>;
+
+// ── ScriptEngine ─────────────────────────────────────────────────────────────
 
 pub struct ScriptEngine {
     pub lua: Lua,
-    pub queue: ActionQueue,
-    rc_path: PathBuf,
+    pub actions: ActionQueue,
 }
 
 impl ScriptEngine {
-    pub fn new(config_dir: &Path, wm: &WmState) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let lua = Lua::new();
-
-        {
-            let package: LuaTable = lua.globals().get("package")?;
-            let existing: String = package.get("path").unwrap_or_default();
-            let dir = config_dir.to_string_lossy();
-            package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua;{existing}"))?;
-            package.set("cpath", "")?;
-        }
-
-        signals::install_globals(&lua)?;
-        let queue =
-            lua_api::install(&lua, wm).map_err(|e| anyhow::anyhow!("Lua API install: {e}"))?;
-
-        let rc_path = config_dir.join("axiom.rc.lua");
-        write_default_rc_if_missing(&rc_path);
-
-        Ok(Self {
-            lua,
-            queue,
-            rc_path,
-        })
+        let actions: ActionQueue = Arc::new(Mutex::new(Vec::new()));
+        Ok(Self { lua, actions })
     }
 
-    /// Execute axiom.rc.lua. All require() calls resolve relative to the
-    /// config directory automatically via the package.path set above.
-    pub fn run_rc(&self, wm: &mut WmState) -> Result<()> {
-        if !self.rc_path.exists() {
-            tracing::info!("No axiom.rc.lua at {:?} — using defaults", self.rc_path);
+    pub fn load_config(&mut self, wm: &mut WmState) -> Result<()> {
+        lua_api::install(&self.lua, self.actions.clone(), wm)?;
+        let path = config_path();
+        if !path.exists() {
+            tracing::info!("No config at {path:?}, using defaults");
             return Ok(());
         }
-        let src = std::fs::read_to_string(&self.rc_path)?;
+        let code = std::fs::read_to_string(&path)?;
         self.lua
-            .load(&src)
-            .set_name("axiom.rc.lua")
-            .exec()
-            .map_err(|e| anyhow::anyhow!("RC error: {e}"))?;
-        self.apply_rules(wm);
+            .load(&code)
+            .set_name(path.to_string_lossy())
+            .exec()?;
+        tracing::info!("Loaded config from {path:?}");
         Ok(())
     }
 
-    pub fn reload(&self, wm: &mut WmState) -> Result<()> {
-        // Clear rules and keybinds so reload doesn't accumulate duplicates.
-        if let Ok(tbl) = self.lua.named_registry_value::<LuaTable>("axiom_rules") {
-            for i in 1..=tbl.raw_len() {
-                let _ = tbl.set(i, LuaValue::Nil);
-            }
-        }
-        if let Ok(tbl) = self.lua.named_registry_value::<LuaTable>("axiom_keybinds") {
-            for pair in tbl.clone().pairs::<LuaValue, LuaValue>() {
-                if let Ok((k, _)) = pair {
-                    let _ = tbl.set(k, LuaValue::Nil);
-                }
-            }
-        }
-        self.run_rc(wm)
+    pub fn emit_client_open(&self, wm: &WmState, id: WindowId) {
+        self.emit_client("client.open", wm, id);
     }
-
-    pub fn fire_keybind(&self, combo: &str) -> Result<bool> {
-        lua_api::fire_keybind(&self.lua, combo)
-            .map_err(|e| anyhow::anyhow!("keybind '{combo}': {e}"))
+    pub fn emit_client_close(&self, wm: &WmState, id: WindowId) {
+        self.emit_client("client.close", wm, id);
     }
-
-    pub fn drain(&mut self, state: &mut crate::state::Axiom) {
-        lua_api::drain(&self.queue, state);
-    }
-
-    pub fn emit_client(&self, event: &str, win: &crate::wm::Window) {
-        signals::emit_client_signal(&self.lua, event, win);
+    pub fn emit_client_focus(&self, wm: &WmState, id: WindowId) {
+        self.emit_client("client.focus", wm, id);
     }
 
     pub fn emit_bare(&self, event: &str) {
-        lua_api::emit_bare(&self.lua, event);
+        let _ = (|| -> LuaResult<()> {
+            let signals: LuaTable = self.lua.globals().get("_axiom_signals")?;
+            if let Ok(f) = signals.get::<_, LuaFunction>(event) {
+                // ← get::<_, V>
+                f.call::<_, ()>(())?;
+            }
+            Ok(())
+        })();
     }
 
-    pub fn tick(&self, wm: &WmState) {
-        signals::update_client_list(&self.lua, wm);
-        signals::update_screen_count(&self.lua, wm.monitors.len());
+    pub fn fire_keybind(&self, combo: &str) -> bool {
+        (|| -> LuaResult<bool> {
+            let keybinds: LuaTable = self.lua.globals().get("_axiom_keybinds")?;
+            if let Ok(f) = keybinds.get::<_, LuaFunction>(combo) {
+                // ← get::<_, V>
+                f.call::<_, ()>(())?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })()
+        .unwrap_or(false)
     }
 
-    fn apply_rules(&self, wm: &mut WmState) {
-        use crate::wm::rules::{Effect, Matcher, WindowRule};
-        let Ok(tbl) = self.lua.named_registry_value::<LuaTable>("axiom_rules") else {
+    fn emit_client(&self, event: &str, wm: &WmState, id: WindowId) {
+        let Some(win) = wm.windows.get(&id) else {
             return;
         };
-        wm.config.rules.clear();
-        for pair in tbl.clone().pairs::<LuaValue, LuaTable>() {
-            let Ok((_, rule)) = pair else { continue };
-            let Ok(m) = rule.get::<_, LuaTable>("match") else {
-                continue;
-            };
-            let Ok(act) = rule.get::<_, LuaTable>("action") else {
-                continue;
-            };
+        let _ = (|| -> LuaResult<()> {
+            let tbl = self.lua.create_table()?;
+            tbl.set("id", win.id)?;
+            tbl.set("app_id", win.app_id.clone())?;
+            tbl.set("title", win.title.clone())?;
+            tbl.set("floating", win.floating)?;
+            tbl.set("fullscreen", win.fullscreen)?;
+            tbl.set("x", win.rect.x)?;
+            tbl.set("y", win.rect.y)?;
+            tbl.set("width", win.rect.w)?;
+            tbl.set("height", win.rect.h)?;
+            let signals: LuaTable = self.lua.globals().get("_axiom_signals")?;
+            if let Ok(f) = signals.get::<_, LuaFunction>(event) {
+                // ← get::<_, V>
+                f.call::<_, ()>(tbl)?;
+            }
+            Ok(())
+        })();
+    }
+}
 
-            let matcher = if let (Ok(a), Ok(t)) =
-                (m.get::<_, String>("app_id"), m.get::<_, String>("title"))
-            {
-                Matcher::Both {
-                    app_id: a,
-                    title: t,
-                }
-            } else if let Ok(a) = m.get::<_, String>("app_id") {
-                Matcher::AppId(a)
-            } else if let Ok(t) = m.get::<_, String>("title") {
-                Matcher::Title(t)
-            } else {
-                Matcher::Always
-            };
+fn config_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+    std::path::PathBuf::from(base).join("axiom/axiom.rc.lua")
+}
 
-            let mut effects = Vec::new();
-            if act.get::<_, bool>("float").unwrap_or(false) {
-                effects.push(Effect::Float);
+pub fn apply_action(action: LuaAction, state: &mut crate::state::Axiom) {
+    match action {
+        LuaAction::Spawn(cmd) => {
+            spawn(&cmd);
+        }
+        LuaAction::SwitchWorkspace(ws) => {
+            state.wm.switch_workspace(ws);
+            state.needs_redraw = true;
+        }
+        LuaAction::MoveToWorkspace(id, ws) => {
+            state.wm.move_to_workspace(id, ws);
+            state.needs_redraw = true;
+        }
+        LuaAction::SetLayout(ws_idx, layout) => {
+            if let Some(ws) = state.wm.workspaces.get_mut(ws_idx) {
+                ws.layout = layout;
             }
-            if let Ok(ws) = act.get::<_, usize>("workspace") {
-                effects.push(Effect::Workspace(ws.saturating_sub(1)));
+            state.wm.reflow();
+            state.needs_redraw = true;
+        }
+        LuaAction::SetFloat(id, on) => {
+            if let Some(w) = state.wm.windows.get_mut(&id) {
+                w.floating = on;
             }
-            if !effects.is_empty() {
-                wm.config.rules.push(WindowRule { matcher, effects });
-            }
+            state.wm.reflow();
+            state.needs_redraw = true;
+        }
+        LuaAction::SetFullscreen(id, on) => {
+            state.wm.fullscreen_window(id, on);
+            state.needs_redraw = true;
+        }
+        LuaAction::FocusDirection(dir) => {
+            state.wm.focus_direction(dir);
+            state.sync_keyboard_focus();
+            state.needs_redraw = true;
+        }
+        LuaAction::CycleFocus(delta) => {
+            state.wm.cycle_focus(delta);
+            state.sync_keyboard_focus();
+            state.needs_redraw = true;
+        }
+        LuaAction::FocusId(id) => {
+            state.wm.focus_window(id);
+            state.sync_keyboard_focus();
+            state.needs_redraw = true;
+        }
+        LuaAction::CloseId(id) => {
+            state.close_window(id);
+        }
+        LuaAction::IncMaster => {
+            state.wm.inc_master();
+            state.needs_redraw = true;
+        }
+        LuaAction::DecMaster => {
+            state.wm.dec_master();
+            state.needs_redraw = true;
+        }
+        LuaAction::Reload => {
+            let _ = state.reload_config();
+        }
+        LuaAction::Quit => {
+            state.loop_signal.stop();
         }
     }
 }
 
-// ── Default RC ────────────────────────────────────────────────────────────────
-
-fn write_default_rc_if_missing(path: &Path) {
-    if path.exists() {
-        return;
+pub fn spawn(cmd: &str) {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if let Some((prog, args)) = parts.split_first() {
+        let _ = std::process::Command::new(prog)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Use a high-fence raw string so the Lua code's double-quoted strings
-    // don't accidentally close the Rust raw string literal.
-    let rc = r######"-- axiom.rc.lua  (auto-generated defaults — edit freely)
-
-axiom.set {
-    border_width    = 2,
-    gap             = 6,
-    bar_height      = 28,
-    workspaces      = 9,
-    border_active   = "#7dc4e4",
-    border_inactive = "#45475a",
-}
-
-local mod = "super"
-
--- Terminal
-axiom.key(mod.."+Return", function() axiom.spawn("foot")      end)
-
--- Launcher
-axiom.key(mod.."+d", function() axiom.spawn("fuzzel")         end)
-axiom.key(mod.."+p", function() axiom.spawn("rofi -show run") end)
-
--- Window control
-axiom.key(mod.."+q",       function() axiom.close()      end)
-axiom.key(mod.."+shift+q", function() axiom.quit()       end)
-axiom.key(mod.."+f",       function() axiom.fullscreen() end)
-axiom.key(mod.."+shift+f", function() axiom.float()      end)
-
--- Focus (vim + arrow keys)
-axiom.key(mod.."+h",     function() axiom.focus("left")  end)
-axiom.key(mod.."+l",     function() axiom.focus("right") end)
-axiom.key(mod.."+k",     function() axiom.focus("up")    end)
-axiom.key(mod.."+j",     function() axiom.focus("down")  end)
-axiom.key(mod.."+Left",  function() axiom.focus("left")  end)
-axiom.key(mod.."+Right", function() axiom.focus("right") end)
-axiom.key(mod.."+Up",    function() axiom.focus("up")    end)
-axiom.key(mod.."+Down",  function() axiom.focus("down")  end)
-
--- Cycle focus
-axiom.key(mod.."+Tab",       function() axiom.cycle(1)  end)
-axiom.key(mod.."+shift+Tab", function() axiom.cycle(-1) end)
-
--- Move window in layout
-axiom.key(mod.."+shift+h", function() axiom.move("left")  end)
-axiom.key(mod.."+shift+l", function() axiom.move("right") end)
-axiom.key(mod.."+shift+k", function() axiom.move("up")    end)
-axiom.key(mod.."+shift+j", function() axiom.move("down")  end)
-
--- Layouts
-axiom.key(mod.."+space",       function() axiom.layout(axiom.ws(), "tile")    end)
-axiom.key(mod.."+shift+space", function() axiom.layout(axiom.ws(), "monocle") end)
-axiom.key(mod.."+b",           function() axiom.layout(axiom.ws(), "bsp")     end)
-axiom.key(mod.."+equal",       function() axiom.inc_master() end)
-axiom.key(mod.."+minus",       function() axiom.dec_master() end)
-
--- Workspaces 1-9
-for i = 1, 9 do
-    local n = i
-    axiom.key(mod.."+"..n,       function() axiom.workspace(n) end)
-    axiom.key(mod.."+shift+"..n, function() axiom.send(n)      end)
-end
-
--- Reload / screenshot
-axiom.key(mod.."+shift+r", function() axiom.reload() end)
-axiom.key("Print",         function() axiom.spawn("grim ~/screenshot.png") end)
-axiom.key("shift+Print",   function() axiom.spawn("grim -g \"$(slurp)\" ~/screenshot.png") end)
-"######;
-    let _ = std::fs::write(path, rc);
-    tracing::info!("wrote default axiom.rc.lua to {:?}", path);
 }

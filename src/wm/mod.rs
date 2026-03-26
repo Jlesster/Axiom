@@ -1,59 +1,50 @@
-// src/wm/mod.rs — pure window manager state.
-
-pub mod anim;
-pub mod layout;
-pub mod rules;
-
-pub use anim::AnimSet;
-pub use layout::Layout;
-pub use rules::{Effect, Matcher, RuleEngine, WindowRule};
-
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use wayland_server::protocol::wl_surface::WlSurface;
-use wayland_server::Resource as _;
 
-// ── Rect ──────────────────────────────────────────────────────────────────────
+pub type WindowId = u32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
     pub w: i32,
     pub h: i32,
 }
-
 impl Rect {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         Self { x, y, w, h }
     }
-    pub fn contains(self, px: i32, py: i32) -> bool {
-        px >= self.x && py >= self.y && px < self.x + self.w && py < self.y + self.h
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
-    pub fn inset(self, px: i32) -> Self {
+    pub fn inset(&self, a: i32) -> Self {
         Self {
-            x: self.x + px,
-            y: self.y + px,
-            w: (self.w - px * 2).max(1),
-            h: (self.h - px * 2).max(1),
+            x: self.x + a,
+            y: self.y + a,
+            w: (self.w - 2 * a).max(0),
+            h: (self.h - 2 * a).max(0),
         }
     }
-    pub fn center(self) -> (i32, i32) {
-        (self.x + self.w / 2, self.y + self.h / 2)
-    }
-    pub fn is_zero(self) -> bool {
-        self.w == 0 && self.h == 0
-    }
 }
 
-// ── WindowId ──────────────────────────────────────────────────────────────────
-
-pub type WindowId = u32;
-static NEXT_WIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-pub fn new_window_id() -> WindowId {
-    NEXT_WIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    #[default]
+    MasterStack,
+    Bsp,
+    Monocle,
+    Float,
 }
-
-// ── Window ────────────────────────────────────────────────────────────────────
+impl Layout {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "bsp" => Self::Bsp,
+            "monocle" => Self::Monocle,
+            "float" => Self::Float,
+            _ => Self::MasterStack,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -61,406 +52,242 @@ pub struct Window {
     pub app_id: String,
     pub title: String,
     pub rect: Rect,
-    pub float_rect: Rect,
     pub floating: bool,
     pub fullscreen: bool,
     pub maximized: bool,
-    pub surface_id: u32,
-    pub surface: Option<WlSurface>,
+    pub workspace: usize,
+    saved_rect: Option<Rect>,
 }
-
 impl Window {
-    pub fn new(surface_id: u32, app_id: String) -> Self {
-        let id = new_window_id();
+    fn new(id: WindowId, ws: usize) -> Self {
         Self {
             id,
-            surface_id,
-            title: app_id.clone(),
-            app_id,
+            app_id: String::new(),
+            title: String::new(),
             rect: Rect::default(),
-            float_rect: Rect::default(),
             floating: false,
             fullscreen: false,
             maximized: false,
-            surface: None,
+            workspace: ws,
+            saved_rect: None,
         }
-    }
-    pub fn inner_rect(&self, border_w: i32) -> Rect {
-        if self.fullscreen || border_w == 0 {
-            self.rect
-        } else {
-            self.rect.inset(border_w)
-        }
-    }
-
-    /// True if the compositor owns this window's size (tiled/fullscreen).
-    /// False if the client is free to pick its own size (floating).
-    pub fn compositor_sized(&self) -> bool {
-        !self.floating && !self.fullscreen
     }
 }
-
-// ── Workspace ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    pub index: usize,
     pub windows: Vec<WindowId>,
     pub focused: Option<WindowId>,
     pub layout: Layout,
-    pub main_ratio: f32,
-    pub gap: i32,
-    pub master_n: usize,
+    pub master_count: usize,
+    pub master_ratio: f32,
 }
-
-impl Workspace {
-    pub fn new(index: usize, gap: i32) -> Self {
-        Self {
-            index,
-            windows: Vec::new(),
-            focused: None,
-            layout: Layout::MasterStack,
-            main_ratio: 0.55,
-            gap,
-            master_n: 1,
-        }
-    }
-    pub fn focus_idx(&self) -> Option<usize> {
-        let f = self.focused?;
-        self.windows.iter().position(|&w| w == f)
-    }
-    pub fn cycle_focus(&mut self, delta: i32) {
-        let n = self.windows.len() as i32;
-        if n == 0 {
-            return;
-        }
-        let cur = self.focus_idx().map(|i| i as i32).unwrap_or(0);
-        self.focused = Some(self.windows[((cur + delta).rem_euclid(n)) as usize]);
-    }
-}
-
-// ── WmConfig ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct WmConfig {
-    pub border_w: i32,
-    pub gap: i32,
-    pub outer_gap: i32,
-    pub bar_height: i32,
-    pub bar_at_bottom: bool,
-    pub active_border: [f32; 4],
-    pub inactive_border: [f32; 4],
-    pub bar_bg: [f32; 4],
-    pub workspaces_count: usize,
-    pub rules: Vec<rules::WindowRule>,
-}
-
-impl Default for WmConfig {
+impl Default for Workspace {
     fn default() -> Self {
         Self {
-            border_w: 2,
-            gap: 6,
-            outer_gap: 8,
-            bar_height: 28,
-            bar_at_bottom: false,
-            active_border: [0.706, 0.745, 0.996, 1.0],
-            inactive_border: [0.271, 0.278, 0.353, 1.0],
-            bar_bg: [0.094, 0.094, 0.141, 1.0],
-            workspaces_count: 9,
-            rules: Vec::new(),
+            windows: vec![],
+            focused: None,
+            layout: Layout::default(),
+            master_count: 1,
+            master_ratio: 0.55,
         }
     }
 }
-
-// ── Interactive grab ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum GrabKind {
-    Move,
-    Resize,
-}
-
-#[derive(Debug, Clone)]
-pub struct InteractiveGrab {
-    pub win_id: WindowId,
-    pub kind: GrabKind,
-    pub start_x: f64,
-    pub start_y: f64,
-    pub start_rect: Rect,
-}
-
-// ── Scratchpad ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct Scratchpad {
-    pub name: String,
-    pub app_id: String,
-    pub win_id: Option<WindowId>,
-    pub visible: bool,
-    pub w_pct: f32,
-    pub h_pct: f32,
-}
-
-// ── Monitor ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct Monitor {
-    pub output_id: u32,
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
     pub active_ws: usize,
-    pub usable: Rect,
+    pub bar_height: i32,
 }
 
-impl Monitor {
-    pub fn new(output_id: u32, x: i32, y: i32, w: i32, h: i32, first_ws: usize) -> Self {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WmConfig {
+    pub border_w: u32,
+    pub gap: u32,
+    pub outer_gap: u32,
+    pub bar_height: u32,
+    pub workspaces_count: usize,
+    pub bar_at_bottom: bool,
+    pub active_border: [u8; 4],
+    pub inactive_border: [u8; 4],
+    pub bar_bg: [u8; 4],
+}
+impl Default for WmConfig {
+    fn default() -> Self {
         Self {
-            output_id,
-            x,
-            y,
-            width: w,
-            height: h,
-            active_ws: first_ws,
-            usable: Rect::new(x, y, w, h),
+            border_w: 2,
+            gap: 6,
+            outer_gap: 0,
+            bar_height: 24,
+            workspaces_count: 9,
+            bar_at_bottom: false,
+            active_border: [122, 162, 247, 255], // #7aa2f7
+            inactive_border: [59, 66, 97, 255],  // #3b4261
+            bar_bg: [30, 30, 46, 255],           // #1e1e2e
         }
     }
-    pub fn geometry(&self) -> Rect {
-        Rect::new(self.x, self.y, self.width, self.height)
+}
+impl WmConfig {
+    pub fn active_border_f32(&self) -> [f32; 4] {
+        u8x4_to_f32(self.active_border)
+    }
+    pub fn inactive_border_f32(&self) -> [f32; 4] {
+        u8x4_to_f32(self.inactive_border)
+    }
+    pub fn bar_bg_f32(&self) -> [f32; 4] {
+        u8x4_to_f32(self.bar_bg)
+    }
+
+    /// Called from lua_api hex colours
+    pub fn set_active_border_rgba(&mut self, rgba: [f32; 4]) {
+        self.active_border = f32x4_to_u8(rgba);
+    }
+    pub fn set_inactive_border_rgba(&mut self, rgba: [f32; 4]) {
+        self.inactive_border = f32x4_to_u8(rgba);
+    }
+    pub fn set_bar_bg_rgba(&mut self, rgba: [f32; 4]) {
+        self.bar_bg = f32x4_to_u8(rgba);
     }
 }
 
-// ── WmState ───────────────────────────────────────────────────────────────────
+fn u8x4_to_f32(c: [u8; 4]) -> [f32; 4] {
+    [
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+        c[3] as f32 / 255.0,
+    ]
+}
+fn f32x4_to_u8(c: [f32; 4]) -> [u8; 4] {
+    [
+        (c[0] * 255.0) as u8,
+        (c[1] * 255.0) as u8,
+        (c[2] * 255.0) as u8,
+        (c[3] * 255.0) as u8,
+    ]
+}
 
 pub struct WmState {
-    pub windows: HashMap<WindowId, Window>,
-    pub workspaces: Vec<Workspace>,
-    pub active_monitor: usize,
-    pub monitors: Vec<Monitor>,
-    pub screen_w: i32,
-    pub screen_h: i32,
-    pub content: Rect,
     pub config: WmConfig,
-    pub scratchpads: HashMap<String, Scratchpad>,
-    pub grab: Option<InteractiveGrab>,
+    pub workspaces: Vec<Workspace>,
+    pub windows: HashMap<WindowId, Window>,
+    pub monitors: Vec<Monitor>,
+    active_ws: usize,
+    next_id: WindowId,
 }
 
 impl WmState {
-    pub fn new(screen_w: i32, screen_h: i32, cfg: WmConfig) -> Self {
-        let n = cfg.workspaces_count;
-        let workspaces = (0..n).map(|i| Workspace::new(i, cfg.gap)).collect();
-
-        let bh = cfg.bar_height;
-        let usable = if cfg.bar_at_bottom {
-            Rect::new(0, 0, screen_w, screen_h - bh)
-        } else {
-            Rect::new(0, bh, screen_w, screen_h - bh)
-        };
-        let mut monitor = Monitor::new(0, 0, 0, screen_w, screen_h, 0);
-        monitor.usable = usable;
-
-        let content = usable;
-        let mut s = Self {
-            windows: HashMap::new(),
-            workspaces,
-            active_monitor: 0,
-            monitors: vec![monitor],
-            screen_w,
-            screen_h,
-            content,
+    pub fn new() -> Self {
+        let cfg = WmConfig::default();
+        let ws_count = cfg.workspaces_count;
+        Self {
             config: cfg,
-            scratchpads: HashMap::new(),
-            grab: None,
-        };
-        s.reflow();
-        s
-    }
-
-    // ── Monitor management ────────────────────────────────────────────────────
-
-    pub fn add_monitor(&mut self, output_id: u32, x: i32, y: i32, w: i32, h: i32) {
-        let used: std::collections::HashSet<usize> =
-            self.monitors.iter().map(|m| m.active_ws).collect();
-        let ws_idx = (0..self.workspaces.len())
-            .find(|i| !used.contains(i))
-            .unwrap_or(self.workspaces.len() - 1);
-        self.monitors
-            .push(Monitor::new(output_id, x, y, w, h, ws_idx));
-        self.reflow();
-    }
-
-    pub fn remove_monitor(&mut self, output_id: u32) {
-        if let Some(idx) = self.monitors.iter().position(|m| m.output_id == output_id) {
-            self.monitors.swap_remove(idx);
-            self.active_monitor = self
-                .active_monitor
-                .min(self.monitors.len().saturating_sub(1));
-            self.reflow();
+            workspaces: (0..ws_count).map(|_| Workspace::default()).collect(),
+            windows: HashMap::new(),
+            monitors: vec![],
+            active_ws: 0,
+            next_id: 1,
         }
-    }
-
-    pub fn update_monitor_usable(&mut self, output_id: u32, usable: Rect) {
-        if let Some(m) = self.monitors.iter_mut().find(|m| m.output_id == output_id) {
-            m.usable = usable;
-            self.reflow();
-        }
-    }
-
-    pub fn monitor_at(&self, x: i32, y: i32) -> usize {
-        self.monitors
-            .iter()
-            .position(|m| m.geometry().contains(x, y))
-            .unwrap_or(self.active_monitor)
     }
 
     pub fn active_ws(&self) -> usize {
-        self.monitors
-            .get(self.active_monitor)
-            .map(|m| m.active_ws)
-            .unwrap_or(0)
+        self.active_ws
     }
-
-    pub fn resize(&mut self, w: i32, h: i32) {
-        self.screen_w = w;
-        self.screen_h = h;
-        if let Some(m) = self.monitors.first_mut() {
-            m.width = w;
-            m.height = h;
-            m.usable = Rect::new(0, 0, w, h);
-        }
-        self.reflow();
-    }
-
-    // ── Focus ─────────────────────────────────────────────────────────────────
-
     pub fn focused_window(&self) -> Option<WindowId> {
-        self.workspaces[self.active_ws()].focused
-    }
-    pub fn set_focused(&mut self, id: WindowId) {
-        let aws = self.active_ws();
-        let ws = &mut self.workspaces[aws];
-        if ws.windows.contains(&id) {
-            ws.focused = Some(id);
-        }
-    }
-    pub fn focus_window(&mut self, id: WindowId) {
-        self.set_focused(id);
+        self.workspaces.get(self.active_ws)?.focused
     }
     pub fn window(&self, id: WindowId) -> &Window {
-        self.windows.get(&id).expect("window not found")
+        self.windows.get(&id).unwrap()
     }
     pub fn window_mut(&mut self, id: WindowId) -> &mut Window {
-        self.windows.get_mut(&id).expect("window not found")
+        self.windows.get_mut(&id).unwrap()
     }
 
-    pub fn window_at(&self, px: i32, py: i32) -> Option<WindowId> {
-        let aws = self.active_ws();
-        let ws = &self.workspaces[aws];
-        let (tiled, floating): (Vec<_>, Vec<_>) = ws
-            .windows
-            .iter()
-            .copied()
-            .partition(|&id| self.windows.get(&id).map(|w| !w.floating).unwrap_or(true));
-        for &id in floating.iter().rev().chain(tiled.iter().rev()) {
-            if self
-                .windows
-                .get(&id)
-                .map(|w| w.rect.contains(px, py))
-                .unwrap_or(false)
-            {
-                return Some(id);
-            }
+    pub fn add_window(&mut self) -> WindowId {
+        let id = self.next_id;
+        self.next_id += 1;
+        let ws = self.active_ws;
+        self.windows.insert(id, Window::new(id, ws));
+        self.workspaces[ws].windows.push(id);
+        if self.workspaces[ws].focused.is_none() {
+            self.workspaces[ws].focused = Some(id);
         }
-        None
-    }
-
-    // ── Spatial helpers ───────────────────────────────────────────────────────
-
-    fn nearest_in_dir(&self, cur_id: WindowId, dx: i32, dy: i32) -> Option<WindowId> {
-        let aws = self.active_ws();
-        let ws = &self.workspaces[aws];
-        let (cx, cy) = self.windows.get(&cur_id)?.rect.center();
-        ws.windows
-            .iter()
-            .filter(|&&id| id != cur_id)
-            .filter_map(|&id| self.windows.get(&id).map(|w| (id, w.rect)))
-            .filter(|(_, r)| {
-                let (nx, ny) = r.center();
-                (nx - cx) * dx + (ny - cy) * dy > 0
-            })
-            .min_by_key(|(_, r)| {
-                let (nx, ny) = r.center();
-                (nx - cx).pow(2) + (ny - cy).pow(2)
-            })
-            .map(|(id, _)| id)
-    }
-
-    pub fn focus_in_dir(&mut self, dx: i32, dy: i32) {
-        let Some(cur_id) = self.workspaces[self.active_ws()].focused else {
-            return;
-        };
-        if let Some(id) = self.nearest_in_dir(cur_id, dx, dy) {
-            let aws = self.active_ws();
-            self.workspaces[aws].focused = Some(id);
-        }
-    }
-    pub fn focus_direction(&mut self, dir: u8) {
-        let (dx, dy) = dir_to_vec(dir);
-        self.focus_in_dir(dx, dy);
-    }
-    pub fn move_direction(&mut self, dir: u8) {
-        let aws = self.active_ws();
-        let Some(cur_id) = self.workspaces[aws].focused else {
-            return;
-        };
-        let (dx, dy) = dir_to_vec(dir);
-        if let Some(target_id) = self.nearest_in_dir(cur_id, dx, dy) {
-            let ws = &mut self.workspaces[aws];
-            let ai = ws.windows.iter().position(|&w| w == cur_id).unwrap();
-            let bi = ws.windows.iter().position(|&w| w == target_id).unwrap();
-            ws.windows.swap(ai, bi);
-            self.reflow();
-        }
-    }
-    pub fn relayout_focused_workspace(&mut self) {
-        self.reflow();
-    }
-
-    // ── Window management ─────────────────────────────────────────────────────
-
-    pub fn add_window(&mut self, win: Window) -> WindowId {
-        let id = win.id;
-        let aid = win.app_id.clone();
-        let ttl = win.title.clone();
-        let floating =
-            self.config.rules.iter().any(|r| {
-                r.matcher.matches(&aid, &ttl) && r.effects.contains(&rules::Effect::Float)
-            });
-        let mut win = win;
-        win.floating = floating;
-        self.windows.insert(id, win);
-        let aws = self.active_ws();
-        let ws = &mut self.workspaces[aws];
-        ws.windows.push(id);
-        ws.focused = Some(id);
         self.reflow();
         id
     }
 
     pub fn remove_window(&mut self, id: WindowId) {
-        self.windows.remove(&id);
-        for ws in &mut self.workspaces {
-            ws.windows.retain(|&w| w != id);
-            if ws.focused == Some(id) {
-                ws.focused = ws.windows.last().copied();
+        if let Some(win) = self.windows.remove(&id) {
+            let ws = win.workspace;
+            if let Some(wsp) = self.workspaces.get_mut(ws) {
+                wsp.windows.retain(|&w| w != id);
+                if wsp.focused == Some(id) {
+                    wsp.focused = wsp.windows.last().copied();
+                }
             }
         }
-        for sp in self.scratchpads.values_mut() {
-            if sp.win_id == Some(id) {
-                sp.win_id = None;
-                sp.visible = false;
+        self.reflow();
+    }
+
+    pub fn focus_window(&mut self, id: WindowId) {
+        if let Some(win) = self.windows.get(&id) {
+            let ws = win.workspace;
+            self.active_ws = ws;
+            if let Some(wsp) = self.workspaces.get_mut(ws) {
+                wsp.focused = Some(id);
             }
+        }
+    }
+
+    pub fn switch_workspace(&mut self, ws: usize) {
+        if ws < self.workspaces.len() {
+            self.active_ws = ws;
+            if let Some(mon) = self.monitors.first_mut() {
+                mon.active_ws = ws;
+            }
+        }
+    }
+
+    pub fn move_to_workspace(&mut self, id: WindowId, ws: usize) {
+        if ws >= self.workspaces.len() {
+            return;
+        }
+        if let Some(win) = self.windows.get_mut(&id) {
+            let old = win.workspace;
+            win.workspace = ws;
+            if let Some(w) = self.workspaces.get_mut(old) {
+                w.windows.retain(|&x| x != id);
+                if w.focused == Some(id) {
+                    w.focused = w.windows.last().copied();
+                }
+            }
+            self.workspaces[ws].windows.push(id);
+        }
+        self.reflow();
+    }
+
+    pub fn fullscreen_window(&mut self, id: WindowId, on: bool) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            if on && win.saved_rect.is_none() {
+                win.saved_rect = Some(win.rect);
+            }
+            win.fullscreen = on;
+            if !on {
+                if let Some(r) = win.saved_rect.take() {
+                    win.rect = r;
+                }
+            }
+        }
+        self.reflow();
+    }
+
+    pub fn toggle_float(&mut self, id: WindowId) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.floating = !win.floating;
         }
         self.reflow();
     }
@@ -469,395 +296,245 @@ impl WmState {
         if let Some(w) = self.windows.get_mut(&id) {
             w.title = title;
         }
-        // No reflow — title change never affects geometry.
     }
-
-    pub fn toggle_float(&mut self, id: WindowId) {
-        let Some(win) = self.windows.get_mut(&id) else {
-            return;
-        };
-        win.floating = !win.floating;
-        if win.floating {
-            if win.float_rect.is_zero() {
-                let r = win.rect;
-                win.float_rect = if r.is_zero() {
-                    let w = (self.screen_w / 2).max(400);
-                    let h = (self.screen_h / 2).max(300);
-                    Rect::new(
-                        ((self.screen_w - w) / 2).max(0),
-                        ((self.screen_h - h) / 2).max(0),
-                        w,
-                        h,
-                    )
-                } else {
-                    r
-                };
-            }
-            win.rect = win.float_rect;
+    pub fn set_app_id(&mut self, id: WindowId, app_id: String) {
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.app_id = app_id;
         }
-        self.reflow();
     }
-
-    pub fn toggle_fullscreen(&mut self, id: WindowId) {
-        if let Some(win) = self.windows.get_mut(&id) {
-            win.fullscreen = !win.fullscreen;
-        }
-        self.reflow();
-    }
-
-    pub fn move_float(&mut self, id: WindowId, dx: i32, dy: i32) {
-        let Some(win) = self.windows.get_mut(&id) else {
-            return;
-        };
-        if !win.floating {
-            return;
-        }
-        win.rect.x = (win.rect.x + dx).max(0).min(self.screen_w - win.rect.w);
-        win.rect.y = (win.rect.y + dy).max(0).min(self.screen_h - win.rect.h);
-        win.float_rect = win.rect;
-    }
-
-    pub fn resize_float(&mut self, id: WindowId, dw: i32, dh: i32) {
-        let Some(win) = self.windows.get_mut(&id) else {
-            return;
-        };
-        if !win.floating {
-            return;
-        }
-        win.rect.w = (win.rect.w + dw).max(80).min(self.screen_w);
-        win.rect.h = (win.rect.h + dh).max(60).min(self.screen_h);
-        win.float_rect = win.rect;
-    }
-
-    // ── Master count ──────────────────────────────────────────────────────────
 
     pub fn inc_master(&mut self) {
-        let aws = self.active_ws();
-        self.workspaces[aws].master_n = self.workspaces[aws].master_n.saturating_add(1);
+        if let Some(ws) = self.workspaces.get_mut(self.active_ws) {
+            ws.master_count += 1;
+        }
+        self.reflow();
     }
     pub fn dec_master(&mut self) {
-        let aws = self.active_ws();
-        self.workspaces[aws].master_n = self.workspaces[aws].master_n.saturating_sub(1).max(1);
-    }
-
-    // ── Workspace switching ───────────────────────────────────────────────────
-
-    pub fn switch_workspace(&mut self, n: usize) {
-        let n = n.min(self.workspaces.len() - 1);
-        let am = self.active_monitor;
-        self.monitors[am].active_ws = n;
+        if let Some(ws) = self.workspaces.get_mut(self.active_ws) {
+            ws.master_count = ws.master_count.saturating_sub(1).max(1);
+        }
         self.reflow();
     }
 
-    pub fn move_to_workspace(&mut self, win_id: WindowId, n: usize) {
-        let n = n.min(self.workspaces.len() - 1);
-        let aws = self.active_ws();
-        if n == aws {
-            return;
-        }
-        let ws = &mut self.workspaces[aws];
-        ws.windows.retain(|&w| w != win_id);
-        if ws.focused == Some(win_id) {
-            ws.focused = ws.windows.last().copied();
-        }
-        let ws = &mut self.workspaces[n];
-        ws.windows.push(win_id);
-        ws.focused = Some(win_id);
-        self.reflow();
-    }
-
-    // ── Interactive grab ──────────────────────────────────────────────────────
-
-    pub fn start_move(&mut self, win_id: WindowId, start_x: f64, start_y: f64) {
-        let rect = self
-            .windows
-            .get(&win_id)
-            .map(|w| w.rect)
-            .unwrap_or_default();
-        self.grab = Some(InteractiveGrab {
-            win_id,
-            kind: GrabKind::Move,
-            start_x,
-            start_y,
-            start_rect: rect,
-        });
-    }
-    pub fn start_resize(&mut self, win_id: WindowId, start_x: f64, start_y: f64) {
-        let rect = self
-            .windows
-            .get(&win_id)
-            .map(|w| w.rect)
-            .unwrap_or_default();
-        self.grab = Some(InteractiveGrab {
-            win_id,
-            kind: GrabKind::Resize,
-            start_x,
-            start_y,
-            start_rect: rect,
-        });
-    }
-    pub fn update_grab(&mut self, px: f64, py: f64) {
-        let Some(grab) = &self.grab else { return };
-        let (dx, dy) = ((px - grab.start_x) as i32, (py - grab.start_y) as i32);
-        let (id, base, kind) = (grab.win_id, grab.start_rect, grab.kind);
-        match kind {
-            GrabKind::Move => {
-                if let Some(w) = self.windows.get_mut(&id) {
-                    w.rect.x = base.x + dx;
-                    w.rect.y = base.y + dy;
-                    w.float_rect = w.rect;
-                    w.floating = true;
-                }
-            }
-            GrabKind::Resize => {
-                if let Some(w) = self.windows.get_mut(&id) {
-                    w.rect.w = (base.w + dx).max(80);
-                    w.rect.h = (base.h + dy).max(60);
-                    w.float_rect = w.rect;
-                    w.floating = true;
-                }
-            }
-        }
-    }
-    pub fn end_grab(&mut self) {
-        self.grab = None;
-    }
-
-    // ── Scratchpads ───────────────────────────────────────────────────────────
-
-    pub fn register_scratchpad(&mut self, name: String, app_id: String, w: f32, h: f32) {
-        self.scratchpads.entry(name.clone()).or_insert(Scratchpad {
-            name,
-            app_id,
-            win_id: None,
-            visible: false,
-            w_pct: w,
-            h_pct: h,
-        });
-    }
-
-    pub fn toggle_scratchpad(&mut self, name: &str) {
-        let aws = self.active_ws();
-        let Some(sp) = self.scratchpads.get_mut(name) else {
+    pub fn focus_direction(&mut self, dir: u8) {
+        let Some(fid) = self.focused_window() else {
             return;
         };
-        let Some(win_id) = sp.win_id else { return };
-        if sp.visible {
-            let ws = &mut self.workspaces[aws];
-            ws.windows.retain(|&w| w != win_id);
-            if ws.focused == Some(win_id) {
-                ws.focused = ws.windows.last().copied();
-            }
-            sp.visible = false;
-        } else {
-            let (w_pct, h_pct) = (sp.w_pct, sp.h_pct);
-            let w = (self.screen_w as f32 * w_pct) as i32;
-            let h = (self.screen_h as f32 * h_pct) as i32;
-            let x = ((self.screen_w - w) / 2).max(0);
-            let y = ((self.screen_h - h) / 2).max(0);
-            sp.visible = true;
-            drop(sp);
-            if let Some(win) = self.windows.get_mut(&win_id) {
-                win.rect = Rect::new(x, y, w, h);
-                win.float_rect = win.rect;
-                win.floating = true;
-            }
-            for ws in &mut self.workspaces {
-                ws.windows.retain(|&w| w != win_id);
-            }
-            let ws = &mut self.workspaces[aws];
-            ws.windows.push(win_id);
-            ws.focused = Some(win_id);
-        }
-        self.reflow();
-    }
-
-    // ── Reflow ────────────────────────────────────────────────────────────────
-
-    pub fn reflow(&mut self) {
-        struct Task {
-            usable: Rect,
-            ox: i32,
-            oy: i32,
-            sw: i32,
-            sh: i32,
-            layout: Layout,
-            ratio: f32,
-            master_n: usize,
-            gap: i32,
-            outer_gap: i32,
-            border_w: i32,
-            tiled: Vec<WindowId>,
-            all_wins: Vec<WindowId>,
-        }
-
-        let tasks: Vec<Task> = self
-            .monitors
+        let cur = self.windows[&fid].rect;
+        let ws_idx = self.active_ws;
+        let best = self.workspaces[ws_idx]
+            .windows
             .iter()
-            .map(|m| {
-                let ws = &self.workspaces[m.active_ws];
-                let tiled: Vec<WindowId> = ws
-                    .windows
-                    .iter()
-                    .copied()
-                    .filter(|&id| {
-                        self.windows
-                            .get(&id)
-                            .map(|w| !w.floating && !w.fullscreen)
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                Task {
-                    usable: m.usable,
-                    ox: m.x,
-                    oy: m.y,
-                    sw: m.width,
-                    sh: m.height,
-                    layout: ws.layout,
-                    ratio: ws.main_ratio,
-                    master_n: ws.master_n,
-                    gap: ws.gap,
-                    outer_gap: self.config.outer_gap,
-                    border_w: self.config.border_w,
-                    tiled,
-                    all_wins: ws.windows.clone(),
+            .copied()
+            .filter(|&id| id != fid)
+            .filter_map(|id| {
+                let r = self.windows[&id].rect;
+                let ok = match dir {
+                    0 => r.x + r.w <= cur.x,
+                    1 => r.x >= cur.x + cur.w,
+                    2 => r.y + r.h <= cur.y,
+                    3 => r.y >= cur.y + cur.h,
+                    _ => false,
+                };
+                if ok {
+                    let dx = (r.x + r.w / 2) - (cur.x + cur.w / 2);
+                    let dy = (r.y + r.h / 2) - (cur.y + cur.h / 2);
+                    Some((id, dx * dx + dy * dy))
+                } else {
+                    None
                 }
             })
-            .collect();
-
-        for task in &tasks {
-            // layout::compute returns tile rects (including the space the border
-            // ring will occupy). We then inset each rect by border_w to get the
-            // content rect — the area the client actually renders into. The border
-            // ring is drawn outside the content rect, expanding back to the tile
-            // boundary. This means:
-            //   tile rect  = layout output  (what the WM owns)
-            //   content rect = tile.inset(border_w)  (what we send in configure)
-            //
-            // The gap between tiles must also account for the two border rings
-            // meeting across the gap. With gap=6 and bw=2, each tile's border
-            // extends 2px outward, leaving 2px of actual gap between borders.
-            // To keep a visually consistent gap, increase inner_gap by 2*border_w
-            // so layout spacing accounts for both rings.
-            let effective_gap = task.gap + task.border_w * 2;
-            let rects = layout::compute(
-                task.layout,
-                task.usable,
-                task.tiled.len(),
-                task.ratio,
-                task.master_n,
-                effective_gap,
-                task.outer_gap,
-            );
-            for (i, &id) in task.tiled.iter().enumerate() {
-                if let Some(win) = self.windows.get_mut(&id) {
-                    // Store the content rect (inset by border_w). The renderer
-                    // draws the border ring outside this rect. The configure sent
-                    // to the client uses win.rect.w × win.rect.h so the client
-                    // renders exactly the content area, not the tile area.
-                    let tile = rects.get(i).copied().unwrap_or(task.usable);
-                    win.rect = tile.inset(task.border_w);
-                }
-            }
-            for &id in &task.all_wins {
-                if let Some(win) = self.windows.get_mut(&id) {
-                    if win.fullscreen {
-                        win.rect = Rect::new(task.ox, task.oy, task.sw, task.sh);
-                    } else if win.floating && !win.float_rect.is_zero() {
-                        win.rect = win.float_rect;
-                    }
-                }
-            }
-        }
-
-        if let Some(m) = self.monitors.first() {
-            self.content = m.usable;
+            .min_by_key(|&(_, d)| d)
+            .map(|(id, _)| id);
+        if let Some(id) = best {
+            self.workspaces[ws_idx].focused = Some(id);
         }
     }
 
-    pub fn rect_snapshot(&self) -> Vec<(WindowId, Rect)> {
-        let aws = self.active_ws();
-        self.workspaces[aws]
-            .windows
-            .iter()
-            .filter_map(|&id| self.windows.get(&id).map(|w| (id, w.rect)))
-            .collect()
-    }
-
-    // ── xdg_shell shims ───────────────────────────────────────────────────────
-
-    pub fn new_toplevel_pending(
-        &mut self,
-        _toplevel: wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
-    ) {
-    }
-
-    /// Called when a client acks a configure and tells us the geometry it
-    /// actually rendered at.  For tiled/fullscreen windows the compositor owns
-    /// the size — we discard the client's suggestion and keep the WM rect.
-    /// For floating windows we accept it so the window settles at whatever
-    /// size the client prefers.
-    pub fn set_window_geometry(&mut self, id: WindowId, _x: i32, _y: i32, w: i32, h: i32) {
-        let Some(win) = self.windows.get_mut(&id) else {
+    pub fn cycle_focus(&mut self, delta: i32) {
+        let ws = &mut self.workspaces[self.active_ws];
+        if ws.windows.is_empty() {
             return;
-        };
-        // Only accept client-reported geometry for floating windows.
-        // Tiled and fullscreen windows have their rect set exclusively by
-        // reflow(); accepting the client's size here is what caused the
-        // configure → commit → set_window_geometry → reflow thrash loop.
-        if win.floating && !win.fullscreen {
-            // Clamp to reasonable minimums so clients can't collapse to 0×0.
-            let w = w.max(80);
-            let h = h.max(60);
-            win.rect.w = w;
-            win.rect.h = h;
-            win.float_rect.w = w;
-            win.float_rect.h = h;
         }
-        // Tiled/fullscreen: silently ignore — reflow() already set the correct rect.
+        let cur = ws
+            .focused
+            .and_then(|f| ws.windows.iter().position(|&id| id == f))
+            .unwrap_or(0);
+        let n = ws.windows.len() as i32;
+        ws.focused = Some(ws.windows[((cur as i32 + delta).rem_euclid(n)) as usize]);
     }
 
-    pub fn set_window_title(&mut self, id: WindowId, title: String) {
-        self.set_title(id, title);
+    pub fn add_monitor(&mut self, x: i32, y: i32, w: i32, h: i32) -> usize {
+        let idx = self.monitors.len();
+        self.monitors.push(Monitor {
+            x,
+            y,
+            width: w,
+            height: h,
+            active_ws: idx.min(self.workspaces.len() - 1),
+            bar_height: self.config.bar_height as i32,
+        });
+        idx
     }
-    pub fn set_window_app_id(&mut self, id: WindowId, app_id: String) {
-        if let Some(win) = self.windows.get_mut(&id) {
-            win.app_id = app_id;
+
+    pub fn apply_config(&mut self, cfg: WmConfig) {
+        let ws_count = cfg.workspaces_count;
+        self.config = cfg;
+        while self.workspaces.len() < ws_count {
+            self.workspaces.push(Workspace::default());
         }
+        self.reflow();
     }
-    pub fn set_window_parent(&mut self, _id: WindowId, _parent: Option<WindowId>) {}
-    pub fn maximize_window(&mut self, id: WindowId, on: bool) {
-        if let Some(win) = self.windows.get_mut(&id) {
-            win.maximized = on;
-            if on {
-                win.floating = false;
+
+    pub fn reflow(&mut self) {
+        let mon = self.monitors.first().cloned().unwrap_or(Monitor {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            active_ws: 0,
+            bar_height: 24,
+        });
+        let cfg = self.config.clone();
+        let ws_count = self.workspaces.len();
+
+        for ws_idx in 0..ws_count {
+            let tiled: Vec<WindowId> = self.workspaces[ws_idx]
+                .windows
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.windows
+                        .get(id)
+                        .map(|w| !w.floating && !w.fullscreen)
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            let layout = self.workspaces[ws_idx].layout;
+            let bar_h = cfg.bar_height as i32;
+            let (ax, ay, aw, ah) = if cfg.bar_at_bottom {
+                (
+                    mon.x + cfg.outer_gap as i32,
+                    mon.y + cfg.outer_gap as i32,
+                    mon.width - 2 * cfg.outer_gap as i32,
+                    mon.height - bar_h - 2 * cfg.outer_gap as i32,
+                )
+            } else {
+                (
+                    mon.x + cfg.outer_gap as i32,
+                    mon.y + bar_h + cfg.outer_gap as i32,
+                    mon.width - 2 * cfg.outer_gap as i32,
+                    mon.height - bar_h - 2 * cfg.outer_gap as i32,
+                )
+            };
+
+            let rects = compute_layout(
+                layout,
+                &tiled,
+                ax,
+                ay,
+                aw,
+                ah,
+                cfg.gap as i32,
+                cfg.border_w as i32,
+                self.workspaces[ws_idx].master_count,
+                self.workspaces[ws_idx].master_ratio,
+            );
+
+            for (id, rect) in tiled.iter().zip(rects.iter()) {
+                if let Some(w) = self.windows.get_mut(id) {
+                    w.rect = *rect;
+                }
+            }
+
+            // Fullscreen windows
+            let fs: Vec<WindowId> = self.workspaces[ws_idx]
+                .windows
+                .iter()
+                .copied()
+                .filter(|id| self.windows.get(id).map(|w| w.fullscreen).unwrap_or(false))
+                .collect();
+            for id in fs {
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.rect = Rect::new(mon.x, mon.y, mon.width, mon.height);
+                }
             }
         }
-        self.reflow();
-    }
-    pub fn fullscreen_window(&mut self, id: WindowId, on: bool) {
-        if let Some(win) = self.windows.get_mut(&id) {
-            win.fullscreen = on;
-        }
-        self.reflow();
-    }
-    pub fn minimize_window(&mut self, id: WindowId) {
-        let aws = self.active_ws();
-        let ws = &mut self.workspaces[aws];
-        ws.windows.retain(|&w| w != id);
-        if ws.focused == Some(id) {
-            ws.focused = ws.windows.last().copied();
-        }
-        self.reflow();
     }
 }
 
-fn dir_to_vec(dir: u8) -> (i32, i32) {
-    match dir {
-        0 => (-1, 0),
-        1 => (1, 0),
-        2 => (0, -1),
-        3 => (0, 1),
-        _ => (0, 0),
+fn compute_layout(
+    layout: Layout,
+    ids: &[WindowId],
+    ax: i32,
+    ay: i32,
+    aw: i32,
+    ah: i32,
+    gap: i32,
+    _border: i32,
+    master_count: usize,
+    master_ratio: f32,
+) -> Vec<Rect> {
+    let n = ids.len();
+    if n == 0 {
+        return vec![];
     }
+    match layout {
+        Layout::MasterStack => {
+            let mc = master_count.min(n);
+            let sc = n - mc;
+            let mut rects = vec![];
+            if sc == 0 {
+                let each_h = (ah - gap * (mc as i32 - 1)) / mc as i32;
+                for i in 0..mc {
+                    rects.push(Rect::new(ax, ay + i as i32 * (each_h + gap), aw, each_h));
+                }
+            } else {
+                let mw = ((aw as f32 * master_ratio) as i32 - gap / 2).max(1);
+                let sw = aw - mw - gap;
+                let each_mh = (ah - gap * (mc as i32 - 1)) / mc as i32;
+                for i in 0..mc {
+                    rects.push(Rect::new(ax, ay + i as i32 * (each_mh + gap), mw, each_mh));
+                }
+                let each_sh = (ah - gap * (sc as i32 - 1)) / sc as i32;
+                for i in 0..sc {
+                    rects.push(Rect::new(
+                        ax + mw + gap,
+                        ay + i as i32 * (each_sh + gap),
+                        sw,
+                        each_sh,
+                    ));
+                }
+            }
+            rects
+        }
+        Layout::Bsp => bsp_layout(ax, ay, aw, ah, gap, n),
+        Layout::Monocle => vec![Rect::new(ax, ay, aw, ah); n],
+        Layout::Float => ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Rect::new(ax + i as i32 * 30, ay + i as i32 * 30, aw / 2, ah / 2))
+            .collect(),
+    }
+}
+
+fn bsp_layout(x: i32, y: i32, w: i32, h: i32, gap: i32, n: usize) -> Vec<Rect> {
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return vec![Rect::new(x, y, w, h)];
+    }
+    let half = n / 2;
+    let (r1, r2) = if w >= h {
+        let lw = (w - gap) / 2;
+        ((x, y, lw, h), (x + lw + gap, y, w - lw - gap, h))
+    } else {
+        let th = (h - gap) / 2;
+        ((x, y, w, th), (x, y + th + gap, w, h - th - gap))
+    };
+    let mut rects = bsp_layout(r1.0, r1.1, r1.2, r1.3, gap, half);
+    rects.extend(bsp_layout(r2.0, r2.1, r2.2, r2.3, gap, n - half));
+    rects
 }

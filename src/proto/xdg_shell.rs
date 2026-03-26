@@ -1,29 +1,9 @@
-// src/proto/xdg_shell.rs — xdg_wm_base / xdg_surface / xdg_toplevel / xdg_popup.
-//
-// Configure round-trip (correct order):
-//
-//   1. GetToplevel → send configure(0,0,[]) + xdg_surface.configure(serial).
-//      Size 0,0 = "you choose" before WM has assigned a rect.
-//
-//   2. Client commits wl_surface for the first time (on_surface_commit in
-//      state.rs) → wm.add_window() + reflow() assigns a real rect →
-//      send configure(w,h,tiled_states) + xdg_surface.configure(serial).
-//      configured is set false, ever_acked is still false.
-//
-//   3. Client calls AckConfigure(serial). configured = true, ever_acked = true.
-//
-//   4. Client commits content at (w,h). upload_surface_texture() stores texture.
-//
-//   After step 3 ever_acked stays true forever. Subsequent configures
-//   (focus change, resize, etc.) do NOT reset configured back to false,
-//   so a race between a re-configure and a commit can never permanently
-//   prevent texture upload.
-
+use crate::state::Axiom;
+use crate::wm::WindowId;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
 use wayland_protocols::xdg::shell::server::{
     xdg_popup::{self, XdgPopup},
-    xdg_positioner::{self, XdgPositioner},
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
     xdg_wm_base::{self, XdgWmBase},
@@ -33,535 +13,568 @@ use wayland_server::{
     New, Resource,
 };
 
-use crate::state::Axiom;
-use crate::wm::WindowId;
+// ── Serial counter ────────────────────────────────────────────────────────────
 
-// ── xdg_wm_base global ────────────────────────────────────────────────────────
+static SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+fn next_serial() -> u32 {
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// ── Per-toplevel data ─────────────────────────────────────────────────────────
+
+pub struct ToplevelData {
+    pub window_id: Option<WindowId>,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+    /// Keep handles so we can send events back to the client.
+    pub xdg_surface: XdgSurface,
+    pub toplevel: XdgToplevel,
+    /// The underlying wl_surface for surface→window lookups.
+    pub wl_surface: WlSurface,
+    // Configure state machine
+    pub configure_serial: u32,
+    pub ever_acked: bool,
+    pub mapped: bool, // true after first acked commit
+}
+
+pub type ToplevelDataRef = Arc<Mutex<ToplevelData>>;
+
+// ── XdgSurface user-data ──────────────────────────────────────────────────────
+
+pub struct XdgSurfaceData {
+    /// The underlying wl_surface (set at GetXdgSurface time).
+    pub wl_surface: Option<WlSurface>,
+    pub toplevel: Option<ToplevelDataRef>,
+    pub configure_serial: u32,
+    pub ever_acked: bool,
+}
+impl Default for XdgSurfaceData {
+    fn default() -> Self {
+        Self {
+            wl_surface: None,
+            toplevel: None,
+            configure_serial: 0,
+            ever_acked: false,
+        }
+    }
+}
+
+pub type XdgSurfaceDataRef = Arc<Mutex<XdgSurfaceData>>;
+
+// ── Global surface→toplevel map ───────────────────────────────────────────────
+// Keyed by wl_surface protocol id so on_surface_commit can look up the
+// toplevel for any surface in O(1) without scanning.
+
+thread_local! {
+    pub static SURFACE_MAP: std::cell::RefCell<HashMap<u32, ToplevelDataRef>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn register_surface(surface: &WlSurface, tl: ToplevelDataRef) {
+    SURFACE_MAP.with(|m| m.borrow_mut().insert(surface.id().protocol_id(), tl));
+}
+
+fn unregister_surface(surface: &WlSurface) {
+    SURFACE_MAP.with(|m| m.borrow_mut().remove(&surface.id().protocol_id()));
+}
+
+pub fn toplevel_for_surface(surface: &WlSurface) -> Option<ToplevelDataRef> {
+    SURFACE_MAP.with(|m| m.borrow().get(&surface.id().protocol_id()).cloned())
+}
+
+// ── GlobalDispatch / Dispatch: XdgWmBase ─────────────────────────────────────
 
 impl GlobalDispatch<XdgWmBase, ()> for Axiom {
     fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<XdgWmBase>,
-        _global_data: &(),
-        data_init: &mut DataInit<'_, Self>,
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        res: New<XdgWmBase>,
+        _: &(),
+        di: &mut DataInit<'_, Self>,
     ) {
-        data_init.init(resource, ());
+        di.init(res, ());
     }
 }
 
 impl Dispatch<XdgWmBase, ()> for Axiom {
     fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &XdgWmBase,
-        request: xdg_wm_base::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        data_init: &mut DataInit<'_, Self>,
+        _: &mut Self,
+        _: &Client,
+        _: &XdgWmBase,
+        req: xdg_wm_base::Request,
+        _: &(),
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
     ) {
-        match request {
+        match req {
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
-                let xdg_data = XdgSurfaceData {
-                    wl_surface: surface,
-                    configured: false,
-                    ever_acked: false,
-                    configure_serial: 0,
-                    role: XdgRole::None,
-                };
-                data_init.init(id, Arc::new(Mutex::new(xdg_data)));
+                // Store the wl_surface in the xdg_surface data so GetToplevel
+                // can register the surface→toplevel mapping.
+                let data = Arc::new(Mutex::new(XdgSurfaceData {
+                    wl_surface: Some(surface),
+                    ..Default::default()
+                }));
+                di.init(id, data);
             }
-            xdg_wm_base::Request::CreatePositioner { id } => {
-                data_init.init(id, std::sync::Mutex::new(PositionerData::default()));
-            }
-            xdg_wm_base::Request::Pong { serial } => {
-                log::trace!("xdg_wm_base pong serial={}", serial);
-            }
+            xdg_wm_base::Request::Pong { serial: _ } => {}
             xdg_wm_base::Request::Destroy => {}
             _ => {}
         }
     }
 }
 
-// ── xdg_surface data ──────────────────────────────────────────────────────────
-
-pub type XdgSurfaceDataRef = Arc<Mutex<XdgSurfaceData>>;
-
-#[derive(Clone)]
-pub struct XdgSurfaceData {
-    pub wl_surface: WlSurface,
-    /// True once the client has acked at least one configure from us.
-    /// Once true, never reset to false — subsequent configures do not
-    /// re-gate texture upload on a new ack.
-    pub configured: bool,
-    /// Latched true on first AckConfigure. Guards the reset logic in
-    /// send_configure_for_surface so we only gate upload before the first ack.
-    pub ever_acked: bool,
-    pub configure_serial: u32,
-    pub role: XdgRole,
-}
-
-#[derive(Clone)]
-pub enum XdgRole {
-    None,
-    Toplevel(XdgToplevel),
-    Popup(XdgPopup),
-}
-
-// ── xdg_surface dispatch ──────────────────────────────────────────────────────
+// ── Dispatch: XdgSurface ─────────────────────────────────────────────────────
 
 impl Dispatch<XdgSurface, XdgSurfaceDataRef> for Axiom {
     fn request(
-        state: &mut Self,
-        _client: &Client,
+        _state: &mut Self,
+        _: &Client,
         xdg_surface: &XdgSurface,
-        request: xdg_surface::Request,
+        req: xdg_surface::Request,
         data: &XdgSurfaceDataRef,
-        _dh: &DisplayHandle,
-        data_init: &mut DataInit<'_, Self>,
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
     ) {
-        match request {
+        match req {
             xdg_surface::Request::GetToplevel { id } => {
-                let toplevel_data = ToplevelData {
-                    xdg_surface: xdg_surface.clone(),
-                    xdg_data: Arc::clone(data),
+                let tl_res = di.init(id, Arc::clone(data));
+
+                let serial = next_serial();
+
+                // Retrieve the wl_surface we stored at GetXdgSurface time.
+                let wl_surface = data
+                    .lock()
+                    .unwrap()
+                    .wl_surface
+                    .clone()
+                    .expect("XdgSurfaceData must have wl_surface set");
+
+                let tl_data = Arc::new(Mutex::new(ToplevelData {
                     window_id: None,
                     title: None,
                     app_id: None,
-                    min_size: (0, 0),
-                    max_size: (0, 0),
-                    pending_states: Vec::new(),
-                };
-                let toplevel_ref = Arc::new(Mutex::new(toplevel_data));
-                let toplevel = data_init.init(id, Arc::clone(&toplevel_ref));
-                data.lock().unwrap().role = XdgRole::Toplevel(toplevel.clone());
+                    xdg_surface: xdg_surface.clone(),
+                    toplevel: tl_res.clone(),
+                    wl_surface: wl_surface.clone(),
+                    configure_serial: serial,
+                    ever_acked: false,
+                    mapped: false,
+                }));
 
-                let wl_surface = data.lock().unwrap().wl_surface.clone();
-                state.register_toplevel(wl_surface, toplevel_ref, Arc::clone(data));
-
-                // Initial configure: size 0,0 = client picks. Real size comes
-                // after wm.add_window() / reflow() in on_surface_commit.
-                toplevel.configure(0, 0, vec![]);
-                let serial = state.next_serial();
-                xdg_surface.configure(serial);
                 {
                     let mut d = data.lock().unwrap();
+                    d.toplevel = Some(Arc::clone(&tl_data));
                     d.configure_serial = serial;
-                    d.configured = false;
-                    d.ever_acked = false;
                 }
-            }
 
+                // Register surface → toplevel mapping immediately so
+                // on_surface_commit can find it on the first commit.
+                register_surface(&wl_surface, Arc::clone(&tl_data));
+
+                // Initial configure: size 0,0 → "client picks its own size".
+                tl_res.configure(0, 0, vec![]);
+                xdg_surface.configure(serial);
+            }
             xdg_surface::Request::GetPopup {
                 id,
-                parent,
-                positioner,
+                parent: _,
+                positioner: _,
             } => {
-                let pos_data = positioner
-                    .data::<std::sync::Mutex<PositionerData>>()
-                    .and_then(|m| m.lock().ok().map(|d| d.clone()))
-                    .unwrap_or_default();
-                let popup_data = PopupData {
-                    xdg_surface: xdg_surface.clone(),
-                    xdg_data: Arc::clone(data),
-                    positioner: pos_data,
-                    parent: parent.map(|p| p.data::<XdgSurfaceDataRef>().unwrap().clone()),
-                };
-                let popup = data_init.init(id, Arc::new(Mutex::new(popup_data)));
-                data.lock().unwrap().role = XdgRole::Popup(popup);
+                di.init(id, Arc::clone(data));
             }
-
-            xdg_surface::Request::SetWindowGeometry {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                // xdg_surface.set_window_geometry describes the *visible content
-                // bounds* within the client's buffer — it is NOT a request for the
-                // compositor to resize the window.  Passing it to set_window_geometry
-                // overwrites win.rect with the client's self-reported inset dims,
-                // which corrupts the compositor's tiling rect and causes subsequent
-                // configure messages to send the wrong (shrinking) size.
-                //
-                // For tiled windows we ignore the hint entirely — the compositor
-                // owns the rect.  For floating windows the client *does* choose its
-                // own size, so we store it as a decoration hint so the renderer can
-                // clip to the visible region; but we still do NOT let it overwrite
-                // win.rect.w / win.rect.h because those are set by the user's resize
-                // grab, not by the client.
-                //
-                // If you later need to honour shadow/CSD insets for floating windows,
-                // add a dedicated `window_geometry: Option<Rect>` field to Window and
-                // store (x, y, width, height) there for the renderer to use as the
-                // visible-content clip rect.  Do not route it through set_window_geometry.
-                let _ = (x, y, width, height); // acknowledged but intentionally unused
-            }
-
             xdg_surface::Request::AckConfigure { serial } => {
                 let mut d = data.lock().unwrap();
-                // Accept acks for the current serial OR any older serial —
-                // the spec says the client must ack the *latest* before
-                // committing, but we treat any ack as "client is alive and
-                // has seen at least one configure from us".
-                if serial == d.configure_serial || !d.ever_acked {
-                    d.configured = true;
+                if d.configure_serial == serial {
                     d.ever_acked = true;
-                }
-                // Do NOT call reflow() or send another configure here —
-                // that would create a configure storm.
-            }
-
-            xdg_surface::Request::Destroy => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = xdg_toplevel_window_id(&d) {
-                    drop(d);
-                    state.wm.remove_window(win_id);
-                }
-            }
-
-            _ => {}
-        }
-    }
-}
-
-fn xdg_toplevel_window_id(d: &XdgSurfaceData) -> Option<WindowId> {
-    if let XdgRole::Toplevel(ref tl) = d.role {
-        tl.data::<Arc<Mutex<ToplevelData>>>()
-            .and_then(|td| td.lock().ok()?.window_id)
-    } else {
-        None
-    }
-}
-
-// ── xdg_toplevel data + dispatch ──────────────────────────────────────────────
-
-pub type ToplevelDataRef = Arc<Mutex<ToplevelData>>;
-
-pub struct ToplevelData {
-    pub xdg_surface: XdgSurface,
-    pub xdg_data: XdgSurfaceDataRef,
-    pub window_id: Option<WindowId>,
-    pub title: Option<String>,
-    pub app_id: Option<String>,
-    pub min_size: (i32, i32),
-    pub max_size: (i32, i32),
-    pub pending_states: Vec<xdg_toplevel::State>,
-}
-
-impl Dispatch<XdgToplevel, ToplevelDataRef> for Axiom {
-    fn request(
-        state: &mut Self,
-        _client: &Client,
-        toplevel: &XdgToplevel,
-        request: xdg_toplevel::Request,
-        data: &ToplevelDataRef,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-        match request {
-            xdg_toplevel::Request::SetTitle { title } => {
-                let mut d = data.lock().unwrap();
-                d.title = Some(title.clone());
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.set_window_title(win_id, title);
-                }
-            }
-
-            xdg_toplevel::Request::SetAppId { app_id } => {
-                let mut d = data.lock().unwrap();
-                d.app_id = Some(app_id.clone());
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.set_window_app_id(win_id, app_id);
-                }
-            }
-
-            xdg_toplevel::Request::SetParent { parent } => {
-                let parent_win =
-                    parent.and_then(|p| p.data::<ToplevelDataRef>()?.lock().ok()?.window_id);
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.set_window_parent(win_id, parent_win);
-                }
-            }
-
-            xdg_toplevel::Request::SetMinSize { width, height } => {
-                data.lock().unwrap().min_size = (width, height);
-            }
-            xdg_toplevel::Request::SetMaxSize { width, height } => {
-                data.lock().unwrap().max_size = (width, height);
-            }
-
-            xdg_toplevel::Request::Move { seat: _, serial: _ } => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.start_interactive_move(win_id);
-                }
-            }
-
-            xdg_toplevel::Request::Resize {
-                seat: _,
-                serial: _,
-                edges,
-            } => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    if let Ok(edges) = edges.into_result() {
-                        state.start_interactive_resize(win_id, edges as u32);
+                    if let Some(ref tl) = d.toplevel.clone() {
+                        tl.lock().unwrap().ever_acked = true;
                     }
                 }
             }
+            xdg_surface::Request::SetWindowGeometry { .. } => {
+                // Clients use this to declare their visible region (excluding
+                // drop shadows, CSD decorations). We could honour this in the
+                // renderer — for now we accept and ignore it since we use
+                // server-side decorations and the WM-assigned rect.
+            }
+            xdg_surface::Request::Destroy => {}
+            _ => {}
+        }
+    }
 
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        _resource: &XdgSurface,
+        data: &XdgSurfaceDataRef,
+    ) {
+        let d = data.lock().unwrap();
+        // Unregister the surface mapping and close the window if it's still open.
+        if let Some(ref tl) = d.toplevel {
+            let tl = tl.lock().unwrap();
+            unregister_surface(&tl.wl_surface);
+            if let Some(id) = tl.window_id {
+                let id = id;
+                drop(tl);
+                drop(d);
+                state.close_window(id);
+            }
+        }
+    }
+}
+
+// ── Dispatch: XdgToplevel ────────────────────────────────────────────────────
+
+impl Dispatch<XdgToplevel, XdgSurfaceDataRef> for Axiom {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _toplevel: &XdgToplevel,
+        req: xdg_toplevel::Request,
+        data: &XdgSurfaceDataRef,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            xdg_toplevel::Request::SetTitle { title } => {
+                let window_id = {
+                    let d = data.lock().unwrap();
+                    d.toplevel.as_ref().and_then(|tl| {
+                        let mut tl = tl.lock().unwrap();
+                        tl.title = Some(title.clone());
+                        tl.window_id
+                    })
+                };
+                if let Some(id) = window_id {
+                    state.wm.set_title(id, title);
+                }
+            }
+            xdg_toplevel::Request::SetAppId { app_id } => {
+                let window_id = {
+                    let d = data.lock().unwrap();
+                    d.toplevel.as_ref().and_then(|tl| {
+                        let mut tl = tl.lock().unwrap();
+                        tl.app_id = Some(app_id.clone());
+                        tl.window_id
+                    })
+                };
+                if let Some(id) = window_id {
+                    state.wm.set_app_id(id, app_id);
+                }
+            }
+            xdg_toplevel::Request::Destroy => {
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                if let Some(id) = window_id {
+                    state.close_window(id);
+                }
+            }
             xdg_toplevel::Request::SetMaximized => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.maximize_window(win_id, true);
-                    send_configure_toplevel(state, toplevel, data);
+                // Treat maximize as "fill the workspace area" — effectively
+                // the same as our default tiling layout does already.
+                // Send a configure with the current WM rect so the client
+                // knows its new size.
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                if let Some(id) = window_id {
+                    if let Some(w) = state.wm.windows.get_mut(&id) {
+                        w.maximized = true;
+                    }
+                    crate::proto::configure_toplevel(state, id);
+                    state.needs_redraw = true;
                 }
             }
             xdg_toplevel::Request::UnsetMaximized => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.maximize_window(win_id, false);
-                    send_configure_toplevel(state, toplevel, data);
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                if let Some(id) = window_id {
+                    if let Some(w) = state.wm.windows.get_mut(&id) {
+                        w.maximized = false;
+                    }
+                    crate::proto::configure_toplevel(state, id);
+                    state.needs_redraw = true;
                 }
             }
             xdg_toplevel::Request::SetFullscreen { output: _ } => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.fullscreen_window(win_id, true);
-                    send_configure_toplevel(state, toplevel, data);
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                if let Some(id) = window_id {
+                    state.wm.fullscreen_window(id, true);
+                    crate::proto::configure_toplevel(state, id);
+                    state.needs_redraw = true;
                 }
             }
             xdg_toplevel::Request::UnsetFullscreen => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.fullscreen_window(win_id, false);
-                    send_configure_toplevel(state, toplevel, data);
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                if let Some(id) = window_id {
+                    state.wm.fullscreen_window(id, false);
+                    crate::proto::configure_toplevel(state, id);
+                    state.needs_redraw = true;
                 }
             }
-
+            xdg_toplevel::Request::Move { .. } => {
+                // Interactive move: in a tiling WM this is a no-op unless the
+                // window is floating. Future: start a drag for float windows.
+            }
+            xdg_toplevel::Request::Resize { .. } => {
+                // Interactive resize: no-op for tiled windows.
+                // Future: allow resize for floating windows.
+            }
             xdg_toplevel::Request::SetMinimized => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.minimize_window(win_id);
+                // Minimise to workspace — send to an invisible workspace slot.
+                // For now: move to last workspace and switch back.
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                if let Some(id) = window_id {
+                    let last = state.wm.workspaces.len().saturating_sub(1);
+                    state.wm.move_to_workspace(id, last);
+                    state.needs_redraw = true;
                 }
             }
-
-            xdg_toplevel::Request::Destroy => {
-                let d = data.lock().unwrap();
-                if let Some(win_id) = d.window_id {
-                    drop(d);
-                    state.wm.remove_window(win_id);
-                }
+            xdg_toplevel::Request::SetMinSize { width, height } => {
+                // Store min size on the window for future use in layouts.
+                let window_id = data
+                    .lock()
+                    .unwrap()
+                    .toplevel
+                    .as_ref()
+                    .and_then(|tl| tl.lock().unwrap().window_id);
+                // Currently we don't have min_size in the Window struct —
+                // we silently accept and ignore. A future commit can add
+                // Window::min_w / min_h and honour them in compute_layout.
+                let _ = (window_id, width, height);
             }
-
+            xdg_toplevel::Request::SetMaxSize { width, height } => {
+                let _ = (width, height);
+            }
+            xdg_toplevel::Request::SetParent { parent: _ } => {
+                // Parent hint for dialog positioning — no-op for now.
+            }
             _ => {}
         }
     }
-}
 
-// ── send_configure_toplevel ───────────────────────────────────────────────────
-//
-// Used only by the xdg_toplevel request handlers (maximize, fullscreen, etc.)
-// that originate from the client side. The compositor-initiated path goes
-// through state::send_configure_for_surface instead.
-//
-// Both paths produce identical wire bytes — this one uses the typed enum and
-// then encodes to bytes; send_configure_for_surface builds the bytes directly.
-// They must stay in sync.
-pub fn send_configure_toplevel(state: &mut Axiom, toplevel: &XdgToplevel, data: &ToplevelDataRef) {
-    let d = data.lock().unwrap();
-    let xdg_surface = d.xdg_surface.clone();
-    let win_id = d.win_id_or_zero();
-    drop(d);
-
-    let (width, height, wl_states) = if win_id > 0 {
-        let win = state.wm.window(win_id);
-        let focused = state.wm.focused_window() == Some(win_id);
-        let tiled = !win.floating && !win.fullscreen;
-
-        let mut st = vec![];
-        if win.maximized {
-            st.push(xdg_toplevel::State::Maximized);
-        }
-        if win.fullscreen {
-            st.push(xdg_toplevel::State::Fullscreen);
-        }
-        if focused {
-            st.push(xdg_toplevel::State::Activated);
-        }
-        if tiled {
-            st.push(xdg_toplevel::State::TiledLeft);
-            st.push(xdg_toplevel::State::TiledRight);
-            st.push(xdg_toplevel::State::TiledTop);
-            st.push(xdg_toplevel::State::TiledBottom);
-        }
-
-        (win.rect.w, win.rect.h, st)
-    } else {
-        (0, 0, vec![])
-    };
-
-    let states_bytes: Vec<u8> = wl_states
-        .iter()
-        .flat_map(|s| (*s as u32).to_ne_bytes())
-        .collect();
-
-    toplevel.configure(width, height, states_bytes);
-    let serial = state.next_serial();
-    xdg_surface.configure(serial);
-
-    {
-        let mut xdg = data.lock().unwrap().xdg_data.lock().unwrap().clone();
-        // Only gate on re-ack before the client has ever acked us.
-        // After ever_acked is true, leave configured = true.
-        drop(xdg);
-    }
-    // Update serial; preserve ever_acked / configured state correctly.
-    let xdg_data = data.lock().unwrap().xdg_data.clone();
-    let mut xdg = xdg_data.lock().unwrap();
-    xdg.configure_serial = serial;
-    if !xdg.ever_acked {
-        xdg.configured = false;
-    }
-    // If ever_acked is true, configured stays true — no re-gating.
-}
-
-impl ToplevelData {
-    fn win_id_or_zero(&self) -> WindowId {
-        self.window_id.unwrap_or(0)
-    }
-}
-
-// ── xdg_popup data + dispatch ─────────────────────────────────────────────────
-
-pub type PopupDataRef = Arc<Mutex<PopupData>>;
-
-pub struct PopupData {
-    pub xdg_surface: XdgSurface,
-    pub xdg_data: XdgSurfaceDataRef,
-    pub positioner: PositionerData,
-    pub parent: Option<XdgSurfaceDataRef>,
-}
-
-impl Dispatch<XdgPopup, PopupDataRef> for Axiom {
-    fn request(
+    fn destroyed(
         state: &mut Self,
-        _client: &Client,
-        popup: &XdgPopup,
-        request: xdg_popup::Request,
-        data: &PopupDataRef,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
+        _: wayland_server::backend::ClientId,
+        _resource: &XdgToplevel,
+        data: &XdgSurfaceDataRef,
     ) {
-        match request {
-            xdg_popup::Request::Grab { seat: _, serial: _ } => {
-                state.input.set_popup_grab(popup.clone());
+        let window_id = data
+            .lock()
+            .unwrap()
+            .toplevel
+            .as_ref()
+            .and_then(|tl| tl.lock().unwrap().window_id);
+        if let Some(id) = window_id {
+            state.close_window(id);
+        }
+    }
+}
+
+// ── Dispatch: XdgPopup ───────────────────────────────────────────────────────
+
+impl Dispatch<XdgPopup, XdgSurfaceDataRef> for Axiom {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        popup: &XdgPopup,
+        req: xdg_popup::Request,
+        _: &XdgSurfaceDataRef,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            xdg_popup::Request::Grab { .. } => {
+                // Popup grab: the client wants exclusive input. We acknowledge
+                // by sending a configure immediately.
+                popup.configure(0, 0, 1, 1); // x, y, width, height
+                                             // TODO: implement actual grab/dismiss logic for context menus.
             }
-            xdg_popup::Request::Reposition { positioner, token } => {
-                let new_pos = positioner
-                    .data::<std::sync::Mutex<PositionerData>>()
-                    .and_then(|m| m.lock().ok().map(|d| d.clone()))
-                    .unwrap_or_default();
-                data.lock().unwrap().positioner = new_pos;
+            xdg_popup::Request::Reposition {
+                positioner: _,
+                token,
+            } => {
                 popup.repositioned(token);
             }
-            xdg_popup::Request::Destroy => {
-                state.input.clear_popup_grab();
-            }
+            xdg_popup::Request::Destroy => {}
             _ => {}
         }
     }
 }
 
-// ── xdg_positioner ────────────────────────────────────────────────────────────
+// ── Surface commit handler ────────────────────────────────────────────────────
 
-#[derive(Clone)]
-pub struct PositionerData {
-    pub width: i32,
-    pub height: i32,
-    pub anchor_rect: (i32, i32, i32, i32),
-    pub anchor: xdg_positioner::Anchor,
-    pub gravity: xdg_positioner::Gravity,
-    pub constraint_adjustment: u32,
-    pub offset: (i32, i32),
-    pub reactive: bool,
-}
+/// Called from compositor.rs after every wl_surface.commit.
+pub fn on_surface_commit(state: &mut Axiom, surface: &WlSurface) {
+    let tl_ref = match toplevel_for_surface(surface) {
+        Some(t) => t,
+        None => return,
+    };
 
-impl Default for PositionerData {
-    fn default() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            anchor_rect: (0, 0, 0, 0),
-            anchor: xdg_positioner::Anchor::None,
-            gravity: xdg_positioner::Gravity::None,
-            constraint_adjustment: 0,
-            offset: (0, 0),
-            reactive: false,
+    let (ever_acked, window_id) = {
+        let tl = tl_ref.lock().unwrap();
+        (tl.ever_acked, tl.window_id)
+    };
+
+    if !ever_acked {
+        // Client is still in the initial configure handshake.
+        return;
+    }
+
+    if window_id.is_none() {
+        // First commit after ack — introduce this surface to the WM.
+        let id = state.wm.add_window();
+
+        {
+            let mut tl = tl_ref.lock().unwrap();
+            tl.window_id = Some(id);
+            tl.mapped = true;
+
+            // Apply any title/app_id already received before the first commit.
+            if let Some(ref t) = tl.title.clone() {
+                state.wm.set_title(id, t.clone());
+            }
+            if let Some(ref a) = tl.app_id.clone() {
+                state.wm.set_app_id(id, a.clone());
+            }
         }
+
+        // Focus the new window and fire Lua signals.
+        state.wm.focus_window(id);
+        state.sync_keyboard_focus();
+        state.script.emit_client_open(&state.wm, id);
+
+        // Send a second configure with the WM-assigned size so the client
+        // can resize its content to fit the tile.
+        send_configure(state, id, &tl_ref);
+        state.needs_redraw = true;
+    } else {
+        // Subsequent commits — content has been updated, schedule a redraw.
+        state.needs_redraw = true;
+        // Re-configure if the WM layout changed since the last commit
+        // (e.g. a new window arrived and tiles were reflowed). The client
+        // will see the new size on next ack+commit cycle.
     }
 }
 
-impl Dispatch<XdgPositioner, std::sync::Mutex<PositionerData>> for Axiom {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &XdgPositioner,
-        request: xdg_positioner::Request,
-        data: &std::sync::Mutex<PositionerData>,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-        let Ok(mut d) = data.lock() else { return };
-        match request {
-            xdg_positioner::Request::SetSize { width, height } => {
-                d.width = width;
-                d.height = height;
+// ── Public helpers ────────────────────────────────────────────────────────────
+
+/// Send xdg_toplevel.close to the client owning `id`.
+pub fn close_toplevel(_dh: &DisplayHandle, id: WindowId) {
+    SURFACE_MAP.with(|m| {
+        for tl_ref in m.borrow().values() {
+            let tl = tl_ref.lock().unwrap();
+            if tl.window_id == Some(id) {
+                tl.toplevel.close();
+                return;
             }
-            xdg_positioner::Request::SetAnchorRect {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                d.anchor_rect = (x, y, width, height);
-            }
-            xdg_positioner::Request::SetAnchor { anchor } => {
-                if let Ok(a) = anchor.into_result() {
-                    d.anchor = a;
-                }
-            }
-            xdg_positioner::Request::SetGravity { gravity } => {
-                if let Ok(g) = gravity.into_result() {
-                    d.gravity = g;
-                }
-            }
-            xdg_positioner::Request::SetConstraintAdjustment {
-                constraint_adjustment,
-            } => {
-                d.constraint_adjustment = constraint_adjustment;
-            }
-            xdg_positioner::Request::SetOffset { x, y } => {
-                d.offset = (x, y);
-            }
-            xdg_positioner::Request::SetReactive => {
-                d.reactive = true;
-            }
-            xdg_positioner::Request::Destroy => {}
-            _ => {}
         }
+    });
+}
+
+/// Send a size configure to the toplevel for `id` based on current WM rect.
+pub fn configure_toplevel(state: &mut Axiom, id: WindowId) {
+    let tl_ref = SURFACE_MAP.with(|m| {
+        m.borrow()
+            .values()
+            .find(|t| t.lock().unwrap().window_id == Some(id))
+            .cloned()
+    });
+    if let Some(tl_ref) = tl_ref {
+        send_configure(state, id, &tl_ref);
     }
+}
+
+/// Send configure to all mapped toplevels (e.g. after a layout change).
+pub fn configure_all(state: &mut Axiom) {
+    let entries: Vec<(WindowId, ToplevelDataRef)> = SURFACE_MAP.with(|m| {
+        m.borrow()
+            .values()
+            .filter_map(|t| {
+                let id = t.lock().unwrap().window_id?;
+                Some((id, Arc::clone(t)))
+            })
+            .collect()
+    });
+    for (id, tl_ref) in entries {
+        send_configure(state, id, &tl_ref);
+    }
+}
+
+// ── Internal ──────────────────────────────────────────────────────────────────
+
+fn send_configure(state: &mut Axiom, id: WindowId, tl_ref: &ToplevelDataRef) {
+    use wayland_protocols::xdg::shell::server::xdg_toplevel::State as TlState;
+
+    let rect = state
+        .wm
+        .windows
+        .get(&id)
+        .map(|w| w.rect)
+        .unwrap_or_default();
+    let win = state.wm.windows.get(&id);
+    let is_fs = win.map(|w| w.fullscreen).unwrap_or(false);
+    let is_max = win.map(|w| w.maximized).unwrap_or(false);
+    let is_focused = state.wm.focused_window() == Some(id);
+    let is_floating = win.map(|w| w.floating).unwrap_or(false);
+
+    let mut states: Vec<u8> = Vec::with_capacity(32);
+
+    if is_focused {
+        push_state(&mut states, TlState::Activated);
+    }
+    if is_fs {
+        push_state(&mut states, TlState::Fullscreen);
+    }
+    if is_max {
+        push_state(&mut states, TlState::Maximized);
+    }
+
+    // Send tiled hints for non-floating tiled windows so clients suppress
+    // drop-shadows and CSD rounding. This matches what Hyprland does.
+    if !is_floating && !is_fs {
+        push_state(&mut states, TlState::TiledLeft);
+        push_state(&mut states, TlState::TiledRight);
+        push_state(&mut states, TlState::TiledTop);
+        push_state(&mut states, TlState::TiledBottom);
+    }
+
+    let serial = next_serial();
+    let mut tl = tl_ref.lock().unwrap();
+    tl.configure_serial = serial;
+    tl.toplevel.configure(rect.w, rect.h, states);
+    tl.xdg_surface.configure(serial);
+}
+
+/// Push a TlState value as its u32 native-endian bytes into the states vec.
+fn push_state(buf: &mut Vec<u8>, s: wayland_protocols::xdg::shell::server::xdg_toplevel::State) {
+    let v = s as u32;
+    buf.extend_from_slice(&v.to_ne_bytes());
 }

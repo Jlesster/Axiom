@@ -1,74 +1,80 @@
-// src/backend/mod.rs
-
-pub mod drm;
-pub mod egl;
-pub mod gbm;
+mod drm;
+mod egl;
+mod gbm;
+mod output;
 pub mod session;
 
-pub use drm::DrmDevice;
-pub use gbm::OutputSurface;
-pub use session::Session;
+pub use output::OutputSurface;
 
 use anyhow::{Context, Result};
-use std::os::unix::io::OwnedFd;
-use std::path::Path;
+use std::sync::Arc;
 
-// drm::control types used here — imported from the drm crate directly,
-// not through a re-export that doesn't exist in drm 0.12.
-use ::drm::control::{crtc, framebuffer};
-
-// ── OutputSurface extension methods ──────────────────────────────────────────
-
-impl OutputSurface {
-    pub fn make_current(&self, egl: &egl::EglContext) -> Result<()> {
-        egl.make_current(&egl::EglSurface(self.egl_surface))
-    }
-
-    pub fn present(
-        &mut self,
-        egl: &egl::EglContext,
-        drm: &DrmDevice,
-    ) -> Result<framebuffer::Handle> {
-        egl.swap_buffers(&egl::EglSurface(self.egl_surface))?;
-        self.post_swap(drm)
-    }
-
-    pub fn page_flip(&self, drm: &DrmDevice, fb: framebuffer::Handle) -> Result<()> {
-        drm.page_flip(self.crtc, fb)
-    }
-}
-
-// ── Backend ───────────────────────────────────────────────────────────────────
+use self::drm::DrmDevice;
+use self::egl::EglContext;
+use self::gbm::GbmDevice;
 
 pub struct Backend {
-    pub session: Session,
-    pub drm: DrmDevice,
-    pub gbm_dev: gbm::GbmDev<OwnedFd>,
-    pub egl: egl::EglContext,
+    pub drm: Arc<DrmDevice>,
+    pub gbm: GbmDevice,
+    pub egl: EglContext,
+    pub outputs: Vec<OutputSurface>,
 }
 
 impl Backend {
-    pub fn open(path: &Path, mut session: Session) -> Result<Self> {
-        let drm = DrmDevice::from_session(&mut session, path)?;
-        let gbm_fd = drm.fd().try_clone_to_owned().context("dup DRM fd")?;
-        let gbm_dev = gbm::open_gbm(gbm_fd)?;
-        let egl = egl::EglContext::new(&gbm_dev)?;
+    pub fn init() -> Result<Self> {
+        let drm_path = find_drm_device()?;
+        tracing::info!("Using DRM device: {drm_path}");
+
+        let drm = Arc::new(DrmDevice::open(&drm_path).context("open DRM device")?);
+        let connectors = drm.enumerate_connectors().context("enumerate connectors")?;
+
+        if connectors.is_empty() {
+            anyhow::bail!("No active connectors found");
+        }
+
+        let gbm = GbmDevice::new(Arc::clone(&drm)).context("create GBM device")?;
+        let egl = EglContext::new(&gbm).context("create EGL context")?;
+
+        let mut outputs = vec![];
+        for conn in &connectors {
+            match OutputSurface::new(&drm, &gbm, &egl, conn) {
+                Ok(out) => {
+                    tracing::info!("Output {}x{}", conn.mode_w, conn.mode_h);
+                    outputs.push(out);
+                }
+                Err(e) => tracing::warn!("Output init failed: {e}"),
+            }
+        }
+
+        if outputs.is_empty() {
+            anyhow::bail!("No outputs initialised");
+        }
+
         Ok(Self {
-            session,
             drm,
-            gbm_dev,
+            gbm,
             egl,
+            outputs,
         })
     }
 
-    pub fn create_outputs(&mut self) -> Result<Vec<OutputSurface>> {
-        self.drm.create_outputs(&self.gbm_dev, &self.egl)
+    pub fn output_size(&self) -> (u32, u32) {
+        self.outputs
+            .first()
+            .map(|o| (o.width, o.height))
+            .unwrap_or((1920, 1080))
     }
+}
 
-    pub fn dispatch_drm_events<F>(&mut self, on_flip: F)
-    where
-        F: FnMut(crtc::Handle),
-    {
-        self.drm.handle_events(on_flip);
+fn find_drm_device() -> Result<String> {
+    if let Ok(dev) = std::env::var("DRM_DEVICE") {
+        return Ok(dev);
     }
+    for i in 0..8 {
+        let path = format!("/dev/dri/card{i}");
+        if std::path::Path::new(&path).exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("No DRM device found — set DRM_DEVICE env var")
 }

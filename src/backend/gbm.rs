@@ -1,61 +1,34 @@
-// src/backend/gbm.rs — GBM device and surface.
+use anyhow::{Context, Result};
+use gbm::{BufferObjectFlags, Device as GbmDev, Format};
+use std::os::fd::AsFd; // ← brings AsFd into scope so Arc<DrmDevice>::as_fd() works
+use std::sync::Arc;
 
-use anyhow::Result;
-use drm::control::{crtc, framebuffer, Mode};
-use drm_fourcc::DrmFourcc;
-use gbm::{BufferObject, BufferObjectFlags, Surface as GbmSurface};
-use std::os::unix::io::{AsFd, OwnedFd};
+use super::drm::DrmDevice;
 
-pub use gbm::Device as GbmDev;
-
-pub struct OutputSurface {
-    pub surface: GbmSurface<()>,
-    pub width: u32,
-    pub height: u32,
-    pub format: DrmFourcc,
-    pub egl_surface: khronos_egl::Surface,
-    pub crtc: crtc::Handle,
-    pub mode: Mode,
-    pub front_fb: Option<framebuffer::Handle>,
-    pub pending_fb: Option<framebuffer::Handle>,
-    pub front_bo: Option<BufferObject<()>>,
-    pub pending_bo: Option<BufferObject<()>>,
+pub struct GbmDevice {
+    pub _drm: Arc<DrmDevice>,
+    pub inner: GbmDev<std::os::unix::io::BorrowedFd<'static>>,
 }
 
-impl OutputSurface {
-    pub fn post_swap(&mut self, drm: &impl drm::control::Device) -> Result<framebuffer::Handle> {
-        let bo = unsafe { self.surface.lock_front_buffer() }?;
-        let fb = drm.add_framebuffer(&bo, 24, 32)?;
-        if let Some(old) = self.pending_fb.take() {
-            let _ = drm.destroy_framebuffer(old);
-        }
-        self.pending_bo = self.front_bo.replace(bo);
-        self.pending_fb = self.front_fb.replace(fb);
-        Ok(fb)
+unsafe impl Send for GbmDevice {}
+
+impl GbmDevice {
+    pub fn new(drm: Arc<DrmDevice>) -> Result<Self> {
+        // SAFETY: Arc keeps DrmDevice alive for at least as long as GbmDevice.
+        let borrowed: std::os::unix::io::BorrowedFd<'static> =
+            unsafe { std::mem::transmute(drm.as_fd()) };
+        let inner = GbmDev::new(borrowed).context("gbm::Device::new")?;
+        Ok(Self { _drm: drm, inner })
     }
 
-    pub fn on_flip_complete(&mut self) {
-        self.pending_bo = None;
+    pub fn create_surface(&self, w: u32, h: u32) -> Result<gbm::Surface<()>> {
+        self.inner
+            .create_surface::<()>(
+                w,
+                h,
+                Format::Xrgb8888,
+                BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+            )
+            .context("gbm create_surface")
     }
-    pub fn mode_size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-}
-
-pub fn open_gbm(fd: OwnedFd) -> Result<GbmDev<OwnedFd>> {
-    Ok(GbmDev::new(fd)?)
-}
-
-pub fn create_surface(
-    device: &GbmDev<impl AsFd>,
-    width: u32,
-    height: u32,
-    format: DrmFourcc,
-) -> Result<GbmSurface<()>> {
-    Ok(device.create_surface(
-        width,
-        height,
-        format,
-        BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-    )?)
 }

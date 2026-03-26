@@ -1,335 +1,89 @@
-// src/proto/seat.rs — wl_seat, wl_keyboard, wl_pointer.
-
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
-
+use crate::state::Axiom;
+use crate::wm::WindowId;
 use wayland_server::{
     protocol::{
         wl_keyboard::{self, WlKeyboard},
         wl_pointer::{self, WlPointer},
         wl_seat::{self, Capability, WlSeat},
         wl_surface::WlSurface,
+        wl_touch::{self, WlTouch},
     },
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use xkbcommon::xkb;
 
-use crate::{state::Axiom, wm::WindowId};
+// ── Per-client seat data ──────────────────────────────────────────────────────
 
-// ── SeatState ─────────────────────────────────────────────────────────────────
+#[derive(Default)]
+pub struct SeatData {}
 
-pub struct SeatState {
-    pub xkb_state: xkb::State,
-    pub keymap_str: String,
+// ── Global device lists ───────────────────────────────────────────────────────
 
-    keyboards: Vec<WlKeyboard>,
-    pointers: Vec<WlPointer>,
-
-    keyboard_focus: Option<WlSurface>,
-    keyboard_focused_win: Option<WindowId>,
-    pointer_focus: Option<WlSurface>,
-
-    serial: u32,
+thread_local! {
+    static ALL_KEYBOARDS: std::cell::RefCell<Vec<WlKeyboard>> =
+        std::cell::RefCell::new(Vec::new());
+    static ALL_POINTERS: std::cell::RefCell<Vec<WlPointer>> =
+        std::cell::RefCell::new(Vec::new());
 }
 
-impl SeatState {
-    pub fn new() -> Self {
-        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap =
-            xkb::Keymap::new_from_names(&ctx, "", "", "", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
-                .expect("default xkb keymap");
-        let state = xkb::State::new(&keymap);
-        let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-        Self {
-            xkb_state: state,
-            keymap_str,
-            keyboards: Vec::new(),
-            pointers: Vec::new(),
-            keyboard_focus: None,
-            keyboard_focused_win: None,
-            pointer_focus: None,
-            serial: 0,
-        }
-    }
-
-    pub fn next_serial(&mut self) -> u32 {
-        self.serial = self.serial.wrapping_add(1);
-        self.serial
-    }
-
-    // ── Keyboard focus ────────────────────────────────────────────────────────
-
-    pub fn keyboard_focus_id(&self) -> Option<WindowId> {
-        self.keyboard_focused_win
-    }
-
-    pub fn set_keyboard_focus_win(&mut self, win_id: Option<WindowId>) {
-        self.keyboard_focused_win = win_id;
-    }
-
-    pub fn set_keyboard_focus(&mut self, surface: Option<WlSurface>) {
-        // Send leave to old surface's client only.
-        if let Some(ref old) = self.keyboard_focus.take() {
-            if old.is_alive() {
-                let serial = self.next_serial();
-                let old_client = old.client();
-                for kb in &self.keyboards {
-                    if kb.is_alive() && kb.client() == old_client {
-                        kb.leave(serial, old);
-                    }
-                }
-            }
-        }
-        self.keyboard_focused_win = None;
-
-        if let Some(ref surf) = surface {
-            if surf.is_alive() {
-                let serial = self.next_serial();
-                let surf_client = surf.client();
-                let keys: Vec<u8> = Vec::new();
-                for kb in &self.keyboards {
-                    if kb.is_alive() && kb.client() == surf_client {
-                        kb.enter(serial, surf, keys.clone());
-                        // BUG FIX #1: send current modifier state on enter so
-                        // the client immediately knows which modifiers are held.
-                        self.send_modifiers_to(kb);
-                    }
-                }
-            }
-        }
-        self.keyboard_focus = surface;
-    }
-
-    // ── Key events ────────────────────────────────────────────────────────────
-
-    pub fn send_key(&mut self, time: u32, keycode: u32, state: wl_keyboard::KeyState) {
-        let serial = self.next_serial();
-        let focus_client =
-            self.keyboard_focus
-                .as_ref()
-                .and_then(|s| if s.is_alive() { s.client() } else { None });
-        for kb in &self.keyboards {
-            if !kb.is_alive() {
-                continue;
-            }
-            let client_ok = focus_client
-                .as_ref()
-                .map(|fc| kb.client().as_ref() == Some(fc))
-                .unwrap_or(false); // BUG FIX #2: don't send to all when no focus
-            if client_ok {
-                kb.key(serial, time, keycode, state);
-            }
-        }
-    }
-
-    fn send_modifiers_to(&self, kb: &WlKeyboard) {
-        let s = &self.xkb_state;
-        kb.modifiers(
-            self.serial,
-            s.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            s.serialize_mods(xkb::STATE_MODS_LATCHED),
-            s.serialize_mods(xkb::STATE_MODS_LOCKED),
-            s.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
-        );
-    }
-
-    /// Send current modifier state to all keyboards belonging to the focused
-    /// client. Call this after every key event that changes modifier state.
-    pub fn send_modifiers(&self) {
-        let focus_client =
-            self.keyboard_focus
-                .as_ref()
-                .and_then(|s| if s.is_alive() { s.client() } else { None });
-        for kb in &self.keyboards {
-            if !kb.is_alive() {
-                continue;
-            }
-            // BUG FIX #3: only send modifiers to the focused client, not all.
-            let client_ok = focus_client
-                .as_ref()
-                .map(|fc| kb.client().as_ref() == Some(fc))
-                .unwrap_or(false);
-            if client_ok {
-                self.send_modifiers_to(kb);
-            }
-        }
-    }
-
-    // ── Pointer focus ─────────────────────────────────────────────────────────
-
-    pub fn set_pointer_focus(&mut self, surface: Option<WlSurface>, sx: f64, sy: f64) {
-        // Avoid redundant enter/leave for the same surface.
-        let new_id = surface.as_ref().map(|s| s.id());
-        let old_id = self.pointer_focus.as_ref().map(|s| s.id());
-        if new_id == old_id {
-            return;
-        }
-
-        // Leave old surface.
-        if let Some(ref old_surf) = self.pointer_focus.take() {
-            if old_surf.is_alive() {
-                let serial = self.next_serial();
-                let old_client = old_surf.client();
-                for ptr in &self.pointers {
-                    if ptr.is_alive() && ptr.client() == old_client {
-                        ptr.leave(serial, old_surf);
-                        ptr.frame(); // BUG FIX #4: frame after leave
-                    }
-                }
-            }
-        }
-
-        if let Some(ref surf) = surface {
-            if surf.is_alive() {
-                let serial = self.next_serial();
-                let surf_client = surf.client();
-                for ptr in &self.pointers {
-                    if ptr.is_alive() && ptr.client() == surf_client {
-                        ptr.enter(serial, surf, sx, sy);
-                        ptr.frame(); // frame after enter
-                    }
-                }
-                self.pointer_focus = Some(surf.clone());
-            }
-        }
-    }
-
-    pub fn send_pointer_motion(&self, time: u32, sx: f64, sy: f64) {
-        // BUG FIX #5: only send motion to the focused surface's client.
-        let focus_client =
-            self.pointer_focus
-                .as_ref()
-                .and_then(|s| if s.is_alive() { s.client() } else { None });
-        for ptr in &self.pointers {
-            if !ptr.is_alive() {
-                continue;
-            }
-            let client_ok = focus_client
-                .as_ref()
-                .map(|fc| ptr.client().as_ref() == Some(fc))
-                .unwrap_or(false);
-            if client_ok {
-                ptr.motion(time, sx, sy);
-                ptr.frame(); // BUG FIX #6: frame after motion (required wl_seat >= v5)
-            }
-        }
-    }
-
-    pub fn send_pointer_button(&mut self, time: u32, button: u32, state: wl_pointer::ButtonState) {
-        let serial = self.next_serial();
-        let focus_client =
-            self.pointer_focus
-                .as_ref()
-                .and_then(|s| if s.is_alive() { s.client() } else { None });
-        for ptr in &self.pointers {
-            if !ptr.is_alive() {
-                continue;
-            }
-            let client_ok = focus_client
-                .as_ref()
-                .map(|fc| ptr.client().as_ref() == Some(fc))
-                .unwrap_or(false);
-            if client_ok {
-                ptr.button(serial, time, button, state);
-                ptr.frame();
-            }
-        }
-    }
-
-    pub fn send_pointer_axis(&self, time: u32, axis: wl_pointer::Axis, value: f64) {
-        let focus_client =
-            self.pointer_focus
-                .as_ref()
-                .and_then(|s| if s.is_alive() { s.client() } else { None });
-        for ptr in &self.pointers {
-            if !ptr.is_alive() {
-                continue;
-            }
-            let client_ok = focus_client
-                .as_ref()
-                .map(|fc| ptr.client().as_ref() == Some(fc))
-                .unwrap_or(false);
-            if client_ok {
-                ptr.axis(time, axis, value);
-                ptr.frame();
-            }
-        }
-    }
-
-    /// True if `surface` currently holds keyboard focus.
-    pub fn has_keyboard_focus(&self, surface: &WlSurface) -> bool {
-        self.keyboard_focus
-            .as_ref()
-            .map(|s| s.id() == surface.id())
-            .unwrap_or(false)
-    }
-
-    /// Current pointer focus surface (if any).
-    pub fn pointer_focus_surface(&self) -> Option<&WlSurface> {
-        self.pointer_focus.as_ref().filter(|s| s.is_alive())
-    }
-}
-
-// ── Global dispatch ───────────────────────────────────────────────────────────
+// ── GlobalDispatch / Dispatch ─────────────────────────────────────────────────
 
 impl GlobalDispatch<WlSeat, ()> for Axiom {
     fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<WlSeat>,
-        _global_data: &(),
-        init: &mut DataInit<'_, Self>,
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        res: New<WlSeat>,
+        _: &(),
+        di: &mut DataInit<'_, Self>,
     ) {
-        let seat = init.init(resource, ());
+        let seat = di.init(res, SeatData::default());
         seat.capabilities(Capability::Keyboard | Capability::Pointer);
         if seat.version() >= 2 {
-            seat.name("seat0".into());
+            seat.name("seat0".to_string());
         }
     }
 }
 
-impl Dispatch<WlSeat, ()> for Axiom {
+impl Dispatch<WlSeat, SeatData> for Axiom {
     fn request(
         state: &mut Self,
-        _client: &Client,
-        _resource: &WlSeat,
-        request: wl_seat::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        init: &mut DataInit<'_, Self>,
+        _: &Client,
+        _seat: &WlSeat,
+        req: wl_seat::Request,
+        _data: &SeatData,
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
     ) {
-        match request {
+        match req {
             wl_seat::Request::GetKeyboard { id } => {
-                let kb = init.init(id, ());
-                match create_keymap_fd(&state.seat.keymap_str) {
-                    Ok((fd, size)) => {
-                        use std::os::unix::io::AsFd;
-                        kb.keymap(wl_keyboard::KeymapFormat::XkbV1, fd.as_fd(), size);
-                    }
-                    Err(e) => tracing::warn!("keymap fd: {e}"),
+                let kb = di.init(id, ());
+
+                // Send keymap via memfd
+                let keymap_str = state.input.keymap_string();
+                let keymap_bytes = keymap_str.into_bytes();
+                if let Ok(owned_fd) = crate::sys::memfd_create(&keymap_bytes) {
+                    use std::os::fd::AsFd;
+                    kb.keymap(
+                        wl_keyboard::KeymapFormat::XkbV1,
+                        owned_fd.as_fd(),
+                        keymap_bytes.len() as u32,
+                    );
                 }
+
+                // Keyboard repeat: 25 cps, 600ms initial delay
                 if kb.version() >= 4 {
-                    // 25 keys/s repeat rate, 600ms delay before repeat starts.
                     kb.repeat_info(25, 600);
                 }
-                // BUG FIX #7: if a keyboard is created while a surface is
-                // already focused (e.g. a client re-creates its keyboard object)
-                // immediately send enter + modifiers so it isn't left deaf.
-                if let Some(ref surf) = state.seat.keyboard_focus.clone() {
-                    if surf.is_alive() {
-                        if kb.client() == surf.client() {
-                            let serial = state.seat.next_serial();
-                            kb.enter(serial, surf, Vec::new());
-                            state.seat.send_modifiers_to(&kb);
-                        }
-                    }
-                }
-                state.seat.keyboards.push(kb);
+
+                ALL_KEYBOARDS.with(|v| v.borrow_mut().push(kb));
             }
             wl_seat::Request::GetPointer { id } => {
-                state.seat.pointers.push(init.init(id, ()));
+                let ptr = di.init(id, ());
+                ALL_POINTERS.with(|v| v.borrow_mut().push(ptr));
             }
-            wl_seat::Request::GetTouch { id: _ } => {}
+            wl_seat::Request::GetTouch { id } => {
+                di.init(id, ());
+            }
             wl_seat::Request::Release => {}
             _ => {}
         }
@@ -338,113 +92,298 @@ impl Dispatch<WlSeat, ()> for Axiom {
 
 impl Dispatch<WlKeyboard, ()> for Axiom {
     fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlKeyboard,
-        _request: wl_keyboard::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
+        _: &mut Self,
+        _: &Client,
+        _: &WlKeyboard,
+        _: wl_keyboard::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
     ) {
-    }
-
-    fn destroyed(
-        state: &mut Self,
-        _client: wayland_server::backend::ClientId,
-        resource: &WlKeyboard,
-        _data: &(),
-    ) {
-        state.seat.keyboards.retain(|kb| kb.id() != resource.id());
     }
 }
 
 impl Dispatch<WlPointer, ()> for Axiom {
     fn request(
-        state: &mut Self,
-        _client: &Client,
-        resource: &WlPointer,
-        request: wl_pointer::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
+        _: &mut Self,
+        _: &Client,
+        _: &WlPointer,
+        req: wl_pointer::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
     ) {
-        // BUG FIX #8: handle set_cursor so the client's cursor surface is
-        // respected instead of always drawing the white box.
-        if let wl_pointer::Request::SetCursor {
-            serial: _,
-            surface,
-            hotspot_x,
-            hotspot_y,
-        } = request
-        {
-            state.input.cursor_surface = surface.clone();
-            state.input.cursor_hotspot = (hotspot_x, hotspot_y);
-            if let Some(surf) = surface {
-                // Mark role.
-                use crate::proto::compositor::{SurfaceData, SurfaceRole};
-                use std::sync::Arc;
-                if let Some(sd) = surf.data::<Arc<SurfaceData>>() {
-                    *sd.role.lock().unwrap() = SurfaceRole::Cursor;
-                }
+        match req {
+            // Client requests a cursor image — we note this but don't render
+            // a cursor shape yet (that's a future addition with xcursor).
+            wl_pointer::Request::SetCursor { .. } => {}
+            wl_pointer::Request::Release => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlTouch, ()> for Axiom {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlTouch,
+        _: wl_touch::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+// ── Keyboard focus ────────────────────────────────────────────────────────────
+
+/// Send wl_keyboard.enter to all keyboards belonging to the client that owns
+/// window `id`. This is required by the Wayland spec before any key events.
+pub fn send_keyboard_focus(_dh: &DisplayHandle, id: WindowId) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let target_client = surface.client();
+
+    ALL_KEYBOARDS.with(|v| {
+        v.borrow_mut().retain(|kb| kb.is_alive());
+        let serial = next_serial();
+        for kb in v.borrow().iter() {
+            if kb.is_alive() && kb.client() == target_client {
+                // keys: currently-held keycodes as raw u32 array.
+                // Sending empty is correct and safe — the client re-syncs
+                // its key state from subsequent key events.
+                kb.enter(serial, &surface, vec![]);
+                let mod_serial = next_serial();
+                kb.modifiers(mod_serial, 0, 0, 0, 0);
             }
+        }
+    });
+}
+
+/// Send wl_keyboard.leave to all keyboards currently focused on window `id`.
+pub fn send_keyboard_leave(_dh: &DisplayHandle, id: WindowId) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let target_client = surface.client();
+
+    ALL_KEYBOARDS.with(|v| {
+        v.borrow_mut().retain(|kb| kb.is_alive());
+        let serial = next_serial();
+        for kb in v.borrow().iter() {
+            if kb.is_alive() && kb.client() == target_client {
+                kb.leave(serial, &surface);
+            }
+        }
+    });
+}
+
+/// Clear keyboard focus (no window focused). Sends leave to previously focused.
+pub fn clear_keyboard_focus(_dh: &DisplayHandle) {
+    // Nothing to do here without tracking the previous focus surface.
+    // The next send_keyboard_focus call will implicitly replace focus.
+}
+
+/// Forward a key event to the window with `id`.
+pub fn send_key_event(
+    _dh: &DisplayHandle,
+    id: WindowId,
+    key: u32,
+    time_usec: u64,
+    key_state: wl_keyboard::KeyState,
+) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let target_client = surface.client();
+    let time_ms = (time_usec / 1000) as u32;
+
+    ALL_KEYBOARDS.with(|v| {
+        for kb in v.borrow().iter() {
+            if kb.is_alive() && kb.client() == target_client {
+                let key_serial = next_serial();
+                kb.key(key_serial, time_ms, key, key_state);
+                let mod_serial = next_serial();
+                kb.modifiers(mod_serial, 0, 0, 0, 0);
+            }
+        }
+    });
+}
+
+// ── Pointer events ────────────────────────────────────────────────────────────
+
+/// Send pointer leave to `old_id` and pointer enter to `new_id`.
+pub fn send_pointer_enter(
+    _dh: &DisplayHandle,
+    old_id: Option<WindowId>,
+    new_id: WindowId,
+    surface_x: f64,
+    surface_y: f64,
+) {
+    // Leave old
+    if let Some(old) = old_id {
+        if let Some(old_surf) = surface_for_window(old) {
+            let old_client = old_surf.client();
+            let serial = next_serial();
+            ALL_POINTERS.with(|v| {
+                v.borrow_mut().retain(|p| p.is_alive());
+                for ptr in v.borrow().iter() {
+                    if ptr.is_alive() && ptr.client() == old_client {
+                        ptr.leave(serial, &old_surf);
+                        if ptr.version() >= 5 {
+                            ptr.frame();
+                        }
+                    }
+                }
+            });
         }
     }
 
-    fn destroyed(
-        state: &mut Self,
-        _client: wayland_server::backend::ClientId,
-        resource: &WlPointer,
-        _data: &(),
-    ) {
-        state.seat.pointers.retain(|ptr| ptr.id() != resource.id());
-    }
-}
-
-// ── Keymap memfd ──────────────────────────────────────────────────────────────
-
-fn create_keymap_fd(keymap: &str) -> anyhow::Result<(OwnedFd, u32)> {
-    use std::ffi::CString;
-    use std::io::Write;
-
-    let bytes = keymap.as_bytes();
-    let size = bytes.len() + 1;
-
-    let name = CString::new("xkb-keymap").unwrap();
-    let fd: RawFd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        anyhow::bail!("memfd_create failed: errno {}", unsafe {
-            *libc::__errno_location()
+    // Enter new
+    // wayland-server 0.31: ptr.enter() takes f64 for surface coordinates,
+    // NOT wl_fixed (i32). Pass surface_x/surface_y directly.
+    if let Some(new_surf) = surface_for_window(new_id) {
+        let new_client = new_surf.client();
+        let serial = next_serial();
+        ALL_POINTERS.with(|v| {
+            v.borrow_mut().retain(|p| p.is_alive());
+            for ptr in v.borrow().iter() {
+                if ptr.is_alive() && ptr.client() == new_client {
+                    ptr.enter(serial, &new_surf, surface_x, surface_y);
+                    if ptr.version() >= 5 {
+                        ptr.frame();
+                    }
+                }
+            }
         });
     }
-
-    if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
-        unsafe { libc::close(fd) };
-        anyhow::bail!("ftruncate failed");
-    }
-
-    let dup_fd = unsafe { libc::dup(fd) };
-    if dup_fd < 0 {
-        unsafe { libc::close(fd) };
-        anyhow::bail!("dup failed");
-    }
-    {
-        let mut f = unsafe { std::fs::File::from_raw_fd(dup_fd) };
-        f.write_all(bytes)?;
-        f.write_all(&[0u8])?;
-    }
-
-    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, size as u32))
 }
 
-mod libc {
-    extern "C" {
-        pub fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
-        pub fn ftruncate(fd: i32, length: i64) -> i32;
-        pub fn close(fd: i32) -> i32;
-        pub fn dup(oldfd: i32) -> i32;
-        pub fn __errno_location() -> *mut i32;
-    }
-    pub use std::os::raw::c_char;
-    pub const MFD_CLOEXEC: u32 = 0x0001;
-    pub type off_t = i64;
+/// Send pointer leave without a following enter (pointer left the surface).
+pub fn send_pointer_leave(_dh: &DisplayHandle, id: WindowId) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let client = surface.client();
+    let serial = next_serial();
+    ALL_POINTERS.with(|v| {
+        v.borrow_mut().retain(|p| p.is_alive());
+        for ptr in v.borrow().iter() {
+            if ptr.is_alive() && ptr.client() == client {
+                ptr.leave(serial, &surface);
+                if ptr.version() >= 5 {
+                    ptr.frame();
+                }
+            }
+        }
+    });
+}
+
+/// Send wl_pointer.motion to the window under the pointer.
+pub fn send_pointer_motion(
+    _dh: &DisplayHandle,
+    id: WindowId,
+    time_usec: u64,
+    surface_x: f64,
+    surface_y: f64,
+) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let client = surface.client();
+    let time_ms = (time_usec / 1000) as u32;
+
+    // wayland-server 0.31: ptr.motion() takes f64 coords, not wl_fixed.
+    ALL_POINTERS.with(|v| {
+        for ptr in v.borrow().iter() {
+            if ptr.is_alive() && ptr.client() == client {
+                ptr.motion(time_ms, surface_x, surface_y);
+                if ptr.version() >= 5 {
+                    ptr.frame();
+                }
+            }
+        }
+    });
+}
+
+/// Send wl_pointer.button to the window under the pointer.
+pub fn send_pointer_button(
+    _dh: &DisplayHandle,
+    id: WindowId,
+    time_usec: u64,
+    button: u32,
+    btn_state: wl_pointer::ButtonState,
+) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let client = surface.client();
+    let time_ms = (time_usec / 1000) as u32;
+    let serial = next_serial();
+
+    ALL_POINTERS.with(|v| {
+        for ptr in v.borrow().iter() {
+            if ptr.is_alive() && ptr.client() == client {
+                ptr.button(serial, time_ms, button, btn_state);
+                if ptr.version() >= 5 {
+                    ptr.frame();
+                }
+            }
+        }
+    });
+}
+
+/// Send wl_pointer.axis (scroll).
+pub fn send_pointer_axis(
+    _dh: &DisplayHandle,
+    id: WindowId,
+    time_usec: u64,
+    axis: wl_pointer::Axis,
+    value: f64,
+) {
+    let surface = match surface_for_window(id) {
+        Some(s) => s,
+        None => return,
+    };
+    let client = surface.client();
+    let time_ms = (time_usec / 1000) as u32;
+
+    // wayland-server 0.31: ptr.axis() takes f64, not wl_fixed.
+    ALL_POINTERS.with(|v| {
+        for ptr in v.borrow().iter() {
+            if ptr.is_alive() && ptr.client() == client {
+                ptr.axis(time_ms, axis, value);
+                if ptr.version() >= 5 {
+                    ptr.frame();
+                }
+            }
+        }
+    });
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn surface_for_window(id: WindowId) -> Option<WlSurface> {
+    crate::proto::xdg_shell::SURFACE_MAP.with(|m| {
+        for tl_ref in m.borrow().values() {
+            let tl = tl_ref.lock().unwrap();
+            if tl.window_id == Some(id) {
+                return Some(tl.wl_surface.clone());
+            }
+        }
+        None
+    })
+}
+
+fn next_serial() -> u32 {
+    static S: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    S.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

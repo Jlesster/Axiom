@@ -1,324 +1,231 @@
-// src/ipc/mod.rs — Unix-socket IPC server.
-//
-// Listens on $XDG_RUNTIME_DIR/axiom-<display>.sock.
-// Wire format: one newline-terminated JSON IpcRequest in, one IpcResponse out.
-// Drained in the main loop via drain_ipc() — no calloop source needed.
-
-pub mod commands;
-
-use std::{
-    io::{BufRead, BufReader, Write},
-    os::unix::{
-        io::{AsRawFd, RawFd},
-        net::{UnixListener, UnixStream},
-    },
-    path::PathBuf,
-};
-
 use anyhow::{Context, Result};
+use calloop::LoopHandle;
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use wayland_server::DisplayHandle;
 
 use crate::state::Axiom;
-use commands::*;
-
-// ── Socket path ───────────────────────────────────────────────────────────────
-
-pub fn socket_path(display: &str) -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(base).join(format!("axiom-{}.sock", display.trim_start_matches(':')))
-}
-
-// ── Server ────────────────────────────────────────────────────────────────────
+use crate::wm::WindowId;
 
 pub struct IpcServer {
-    pub listener: UnixListener,
-    pub path: PathBuf,
+    listener: UnixListener,
+    pub socket_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum IpcRequest {
+    Clients,
+    Workspaces,
+    Monitors,
+    ActiveWindow,
+    Version,
+    CloseWindow { id: Option<WindowId> },
+    FocusWindow { id: Option<WindowId> },
+    MoveToWorkspace { workspace: usize },
+    ToggleFloat,
+    ToggleFullscreen,
+    SwitchWorkspace { workspace: usize },
+    SetLayout { layout: String },
+    Reload,
+    Exec { command: String },
+    Exit,
+    Lua { code: String },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum IpcResponse {
+    Ok,
+    Error { error: String },
+    Data(serde_json::Value),
 }
 
 impl IpcServer {
-    pub fn bind(display: &str) -> Result<Self> {
-        let path = socket_path(display);
+    pub fn new(_dh: &DisplayHandle) -> Result<Self> {
+        let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
+        let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let path = format!("{runtime}/axiom-{display}.sock");
         let _ = std::fs::remove_file(&path);
         let listener =
-            UnixListener::bind(&path).with_context(|| format!("bind IPC socket {:?}", path))?;
+            UnixListener::bind(&path).with_context(|| format!("bind IPC socket {path}"))?;
         listener.set_nonblocking(true)?;
-        tracing::info!("IPC socket: {:?}", path);
-        Ok(Self { listener, path })
+        tracing::info!("IPC socket: {path}");
+        Ok(Self {
+            listener,
+            socket_path: path,
+        })
     }
 
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.listener.as_raw_fd()
+    pub fn register(&self, loop_handle: &LoopHandle<'static, Axiom>) -> Result<()> {
+        use calloop::generic::Generic;
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+        // Clone the listener so we can own an fd for calloop
+        let cloned = self.listener.try_clone()?;
+        let raw = {
+            use std::os::unix::io::IntoRawFd;
+            cloned.into_raw_fd()
+        };
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        loop_handle
+            .insert_source(
+                Generic::new(owned, calloop::Interest::READ, calloop::Mode::Level),
+                |_, _, state: &mut Axiom| {
+                    let path = state.ipc.socket_path.clone();
+                    accept_all(&path, state);
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("register IPC: {e}"))?;
+        Ok(())
     }
 }
 
-impl Drop for IpcServer {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-// ── Drain all pending connections (called from main loop) ─────────────────────
-
-pub fn drain_ipc(state: &mut Axiom) {
+/// Accept all pending connections on the named socket, processing each one.
+/// We open a new UnixListener reference from the path each time to avoid
+/// borrowing IpcServer alongside Axiom.
+fn accept_all(socket_path: &str, state: &mut Axiom) {
+    // Re-open the socket in nonblocking mode to accept pending connections
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        // Already bound — this is the normal case; use a raw dup instead
+        Err(_) => {
+            // Dup the fd from the stored listener
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let raw = state.ipc.listener.as_raw_fd();
+            let dup = unsafe { libc::dup(raw) };
+            if dup < 0 {
+                return;
+            }
+            unsafe { UnixListener::from_raw_fd(dup) }
+        }
+    };
+    listener.set_nonblocking(true).ok();
     loop {
-        match state.ipc.listener.accept() {
-            Ok((stream, _)) => handle_connection(stream, state),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = handle_client(&mut stream, state);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
-                tracing::warn!("IPC accept: {e}");
+                tracing::warn!("IPC accept error: {e}");
                 break;
             }
         }
     }
 }
 
-// ── Per-connection handler ────────────────────────────────────────────────────
-
-fn handle_connection(stream: UnixStream, state: &mut Axiom) {
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || line.is_empty() {
-        return;
-    }
-    let resp = match decode_request(line.as_bytes()) {
-        Ok(req) => dispatch(req, state),
-        Err(e) => IpcResponse::err(format!("parse error: {e}")),
+fn handle_client(stream: &mut UnixStream, state: &mut Axiom) -> Result<()> {
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf)?;
+    let resp = match serde_json::from_str::<IpcRequest>(buf.trim()) {
+        Ok(req) => process_request(req, state),
+        Err(e) => IpcResponse::Error {
+            error: format!("parse: {e}"),
+        },
     };
-    let bytes = encode_response(&resp);
-    let _ = (&stream).write_all(&bytes);
+    let out = serde_json::to_string(&resp)?;
+    stream.write_all(out.as_bytes())?;
+    stream.write_all(b"\n")?;
+    Ok(())
 }
 
-// ── Dispatcher ────────────────────────────────────────────────────────────────
-
-fn dispatch(req: IpcRequest, state: &mut Axiom) -> IpcResponse {
+fn process_request(req: IpcRequest, state: &mut Axiom) -> IpcResponse {
     match req {
-        // ── Queries ───────────────────────────────────────────────────────────
+        IpcRequest::Version => {
+            IpcResponse::Data(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+        }
         IpcRequest::Clients => {
-            let clients: Vec<ClientInfo> = state
+            let v: Vec<_> = state.wm.windows.values().map(|w| serde_json::json!({
+                "id": w.id, "app_id": w.app_id, "title": w.title,
+                "workspace": w.workspace+1, "x": w.rect.x, "y": w.rect.y,
+                "w": w.rect.w, "h": w.rect.h, "floating": w.floating, "fullscreen": w.fullscreen,
+            })).collect();
+            IpcResponse::Data(serde_json::json!(v))
+        }
+        IpcRequest::Workspaces => {
+            let v: Vec<_> = state
                 .wm
                 .workspaces
                 .iter()
-                .flat_map(|ws| {
-                    ws.windows.iter().filter_map(|&id| {
-                        let w = state.wm.windows.get(&id)?;
-                        Some(ClientInfo {
-                            id: w.id,
-                            app_id: w.app_id.clone(),
-                            title: w.title.clone(),
-                            workspace: ws.index + 1,
-                            floating: w.floating,
-                            fullscreen: w.fullscreen,
-                            maximized: w.maximized,
-                            x: w.rect.x,
-                            y: w.rect.y,
-                            w: w.rect.w,
-                            h: w.rect.h,
-                            xwayland: state.xwayland.is_xwayland_window(id),
-                        })
+                .enumerate()
+                .map(|(i, ws)| {
+                    serde_json::json!({
+                        "index": i+1, "focused": ws.focused, "window_count": ws.windows.len(),
+                        "active": i == state.wm.active_ws(),
                     })
                 })
                 .collect();
-            IpcResponse::ok(clients)
+            IpcResponse::Data(serde_json::json!(v))
         }
-
-        IpcRequest::Workspaces => {
-            let aws = state.wm.active_ws();
-            let infos: Vec<WorkspaceInfo> = state
-                .wm
-                .workspaces
-                .iter()
-                .map(|ws| WorkspaceInfo {
-                    index: ws.index + 1,
-                    name: format!("{}", ws.index + 1),
-                    active: ws.index == aws,
-                    window_count: ws.windows.len(),
-                    focused_id: ws.focused,
-                })
-                .collect();
-            IpcResponse::ok(infos)
-        }
-
-        IpcRequest::Monitors => {
-            let infos: Vec<MonitorInfo> = state
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(i, out)| MonitorInfo {
-                    index: i,
-                    name: out.name.clone(),
-                    x: state.wm.monitors.get(i).map(|m| m.x).unwrap_or(0),
-                    y: state.wm.monitors.get(i).map(|m| m.y).unwrap_or(0),
-                    width: out.width as i32,
-                    height: out.height as i32,
-                    scale: out.scale,
-                    active_workspace: state
-                        .wm
-                        .monitors
-                        .get(i)
-                        .map(|m| m.active_ws + 1)
-                        .unwrap_or(1),
-                })
-                .collect();
-            IpcResponse::ok(infos)
-        }
-
         IpcRequest::ActiveWindow => {
-            match state
-                .wm
-                .focused_window()
-                .and_then(|id| state.wm.windows.get(&id))
-            {
-                Some(w) => IpcResponse::ok(ClientInfo {
-                    id: w.id,
-                    app_id: w.app_id.clone(),
-                    title: w.title.clone(),
-                    workspace: state.wm.active_ws() + 1,
-                    floating: w.floating,
-                    fullscreen: w.fullscreen,
-                    maximized: w.maximized,
-                    x: w.rect.x,
-                    y: w.rect.y,
-                    w: w.rect.w,
-                    h: w.rect.h,
-                    xwayland: state.xwayland.is_xwayland_window(w.id),
-                }),
-                None => IpcResponse::ok(serde_json::Value::Null),
-            }
-        }
-
-        IpcRequest::Version => IpcResponse::ok(VersionInfo {
-            compositor: "axiom",
-            version: env!("CARGO_PKG_VERSION"),
-            wayland_display: state.socket_name.clone(),
-        }),
-
-        // ── Window actions ────────────────────────────────────────────────────
-        IpcRequest::CloseWindow { id } => {
-            let target = id.or_else(|| state.wm.focused_window());
-            match target {
-                Some(id) => {
-                    state.close_window(id);
-                    IpcResponse::ok_empty()
-                }
-                None => IpcResponse::err("no focused window"),
-            }
-        }
-
-        IpcRequest::FocusWindow { id } => {
-            state.wm.focus_window(id);
-            state.sync_keyboard_focus();
-            state.needs_redraw = true;
-            IpcResponse::ok_empty()
-        }
-
-        IpcRequest::MoveToWorkspace { workspace } => {
             if let Some(id) = state.wm.focused_window() {
-                state.wm.move_to_workspace(id, workspace.saturating_sub(1));
-                state.needs_redraw = true;
+                if let Some(w) = state.wm.windows.get(&id) {
+                    return IpcResponse::Data(
+                        serde_json::json!({ "id": w.id, "app_id": w.app_id, "title": w.title }),
+                    );
+                }
             }
-            IpcResponse::ok_empty()
+            IpcResponse::Data(serde_json::Value::Null)
         }
-
+        IpcRequest::SwitchWorkspace { workspace } => {
+            state.wm.switch_workspace(workspace.saturating_sub(1));
+            state.needs_redraw = true;
+            IpcResponse::Ok
+        }
+        IpcRequest::CloseWindow { id } => {
+            if let Some(id) = id.or_else(|| state.wm.focused_window()) {
+                state.close_window(id);
+            }
+            IpcResponse::Ok
+        }
         IpcRequest::ToggleFloat => {
             if let Some(id) = state.wm.focused_window() {
                 state.wm.toggle_float(id);
                 state.needs_redraw = true;
             }
-            IpcResponse::ok_empty()
+            IpcResponse::Ok
         }
-
         IpcRequest::ToggleFullscreen => {
             if let Some(id) = state.wm.focused_window() {
-                state.wm.toggle_fullscreen(id);
-                state.send_configure_focused();
+                let on = !state.wm.windows[&id].fullscreen;
+                state.wm.fullscreen_window(id, on);
                 state.needs_redraw = true;
             }
-            IpcResponse::ok_empty()
+            IpcResponse::Ok
         }
-
-        IpcRequest::ToggleMaximize => {
-            if let Some(id) = state.wm.focused_window() {
-                let cur = state
-                    .wm
-                    .windows
-                    .get(&id)
-                    .map(|w| w.maximized)
-                    .unwrap_or(false);
-                state.wm.maximize_window(id, !cur);
-                state.send_configure_focused();
-                state.needs_redraw = true;
-            }
-            IpcResponse::ok_empty()
-        }
-
-        IpcRequest::SetWindowGeometry { id, x, y, w, h } => {
-            if let Some(win) = state.wm.windows.get_mut(&id) {
-                if win.floating {
-                    win.rect = crate::wm::Rect::new(x, y, w, h);
-                    win.float_rect = win.rect;
-                    state.needs_redraw = true;
-                    IpcResponse::ok_empty()
-                } else {
-                    IpcResponse::err("window is not floating")
-                }
-            } else {
-                IpcResponse::err("window not found")
-            }
-        }
-
-        // ── Workspace actions ─────────────────────────────────────────────────
-        IpcRequest::SwitchWorkspace { workspace } => {
-            state.wm.switch_workspace(workspace.saturating_sub(1));
-            state.needs_redraw = true;
-            IpcResponse::ok_empty()
-        }
-
         IpcRequest::SetLayout { layout } => {
-            use crate::wm::Layout;
-            let l = match layout.as_str() {
-                "tile" | "master_stack" => Layout::MasterStack,
-                "bsp" => Layout::Bsp,
-                "monocle" | "max" => Layout::Monocle,
-                "float" => Layout::Float,
-                other => return IpcResponse::err(format!("unknown layout '{other}'")),
-            };
-            let aws = state.wm.active_ws();
-            state.wm.workspaces[aws].layout = l;
+            let ws = state.wm.active_ws();
+            if let Some(w) = state.wm.workspaces.get_mut(ws) {
+                w.layout = crate::wm::Layout::from_str(&layout);
+            }
             state.wm.reflow();
             state.needs_redraw = true;
-            IpcResponse::ok_empty()
+            IpcResponse::Ok
         }
-
-        // ── Compositor ────────────────────────────────────────────────────────
-        IpcRequest::Reload => {
-            state.reload_config();
-            IpcResponse::ok_empty()
-        }
-
         IpcRequest::Exec { command } => {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .spawn()
-                .ok();
-            IpcResponse::ok_empty()
+            crate::scripting::spawn(&command);
+            IpcResponse::Ok
         }
-
+        IpcRequest::Reload => {
+            let _ = state.reload_config();
+            IpcResponse::Ok
+        }
         IpcRequest::Exit => {
-            state
-                .running
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            IpcResponse::ok_empty()
+            state.loop_signal.stop();
+            IpcResponse::Ok
         }
-
-        IpcRequest::Lua { code } => match state.script.lua.load(&code).eval::<mlua::Value>() {
-            Ok(v) => IpcResponse::ok(serde_json::Value::String(format!("{v:?}"))),
-            Err(e) => IpcResponse::err(format!("{e}")),
+        IpcRequest::Lua { code } => match state.script.lua.load(&code).exec() {
+            Ok(_) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error {
+                error: e.to_string(),
+            },
         },
-
-        IpcRequest::Bind { key } => match state.script.fire_keybind(&key) {
-            Ok(true) => IpcResponse::ok_empty(),
-            Ok(false) => IpcResponse::err(format!("no bind registered for '{key}'")),
-            Err(e) => IpcResponse::err(format!("{e}")),
+        _ => IpcResponse::Error {
+            error: "not implemented".to_string(),
         },
     }
 }

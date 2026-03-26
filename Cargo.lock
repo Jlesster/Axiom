@@ -31,9 +31,9 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
+ "cc",
  "drm",
  "drm-fourcc",
- "fcntl",
  "gbm",
  "gl",
  "input",
@@ -43,7 +43,6 @@ dependencies = [
  "log",
  "mlua",
  "nix 0.31.2",
- "pkg-config",
  "serde",
  "serde_json",
  "tracing",
@@ -52,6 +51,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-server",
  "x11rb",
+ "xcursor",
  "xkbcommon",
 ]
 
@@ -235,15 +235,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "fcntl"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "886f6e92eeda007d866edc0c2ffae6670315810b232b9305fce66b2646fd3686"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -1131,6 +1122,12 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xcursor"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 
 [[package]]
 name = "xkbcommon"

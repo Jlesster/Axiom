@@ -1,706 +1,401 @@
-// src/render/mod.rs — OpenGL render pipeline.
-
-pub mod bar;
-pub mod chrome;
-pub mod cursor;
-pub mod font;
-pub mod glyph_vao;
-pub mod programs;
-
+use crate::backend::Backend;
+use crate::wm::{Layout, Rect, WindowId, WmState};
 use anyhow::Result;
 use std::collections::HashMap;
 
-pub use chrome::ChromeConfig;
-pub use cursor::HwCursor;
-pub use programs::{GlProgram, GlTexture, QuadVao};
+// ── Per-window GL texture ─────────────────────────────────────────────────────
 
-use crate::{
-    backend::{egl::EglContext, OutputSurface},
-    input::InputState,
-    proto::layer_shell::{Layer, LayerSurfaceRef},
-    state::OutputState,
-    wm::{anim::AnimSet, Rect, WindowId, WmState},
-};
-
-// ── Shaders ───────────────────────────────────────────────────────────────────
-
-const QUAD_VERT: &str = r#"
-#version 330 core
-layout(location = 0) in vec2 a_pos;
-layout(location = 1) in vec2 a_uv;
-out vec2 v_uv;
-out vec2 v_pos;
-uniform mat3 u_proj;
-uniform vec4 u_rect;
-void main() {
-    v_uv  = a_uv;
-    v_pos = a_pos * u_rect.zw;
-    vec2 world  = a_pos * u_rect.zw + u_rect.xy;
-    vec3 ndc    = u_proj * vec3(world, 1.0);
-    gl_Position = vec4(ndc.xy, 0.0, 1.0);
-}
-"#;
-
-const TEX_FRAG: &str = r#"
-#version 330 core
-in  vec2 v_uv;
-in  vec2 v_pos;
-out vec4 frag;
-uniform sampler2D u_tex;
-uniform float     u_alpha;
-uniform vec2      u_size;
-uniform float     u_radius;
-
-float rounded_alpha(vec2 pos, vec2 sz, float r) {
-    if (r < 0.5) return 1.0;
-    vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
-    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-    return clamp(-d + 0.5, 0.0, 1.0);
+struct WindowTexture {
+    tex_id: gl::types::GLuint,
+    width: i32,
+    height: i32,
 }
 
-void main() {
-    float mask = rounded_alpha(v_pos, u_size, u_radius);
-    // Wayland SHM buffers are uploaded row-0=top; GL TexImage2D with a
-    // top-left pointer stores row-0 at the bottom of the texture coordinate
-    // space. Flip V so the image is not upside-down.
-    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
-    vec4 c = texture(u_tex, uv);
-    // c is straight alpha (BGRA UNSIGNED_BYTE upload). Premultiply here for
-    // the ONE/ONE_MINUS_SRC_ALPHA blend equation used globally.
-    float a = c.a * u_alpha * mask;
-    frag = vec4(c.rgb * a, a);
-}
-"#;
-
-const SOLID_FRAG: &str = r#"
-#version 330 core
-in  vec2 v_pos;
-out vec4 frag;
-uniform vec4  u_color;
-uniform vec2  u_size;
-uniform float u_radius;
-
-float rounded_alpha(vec2 pos, vec2 sz, float r) {
-    if (r < 0.5) return 1.0;
-    vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
-    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-    return clamp(-d + 0.5, 0.0, 1.0);
-}
-
-void main() {
-    float mask = rounded_alpha(v_pos, u_size, u_radius);
-    frag = u_color * vec4(1.0, 1.0, 1.0, mask);
-}
-"#;
-
-const BORDER_FRAG: &str = r#"
-#version 330 core
-in  vec2 v_pos;
-out vec4 frag;
-
-uniform vec2  u_size;
-uniform float u_radius;
-uniform float u_thickness;
-uniform vec4  u_col_a;
-uniform vec4  u_col_b;
-uniform float u_focused;
-
-float rounded_sdf(vec2 pos, vec2 sz, float r) {
-    vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-}
-
-void main() {
-    float outer = rounded_sdf(v_pos, u_size, u_radius);
-    float inner_r = max(u_radius - u_thickness, 0.0);
-    // v_pos is in the outer quad's local space (0 .. u_size.xy).
-    // The inner rect is inset by u_thickness on all sides, so its own
-    // local-space origin is shifted by (u_thickness, u_thickness).
-    // We must re-centre v_pos for the inner SDF call; otherwise the inner
-    // mask is off-centre and only one half of the ring is drawn.
-    vec2 inner_pos = v_pos - vec2(u_thickness);
-    vec2 inner_sz  = u_size - vec2(u_thickness * 2.0);
-    float inner = rounded_sdf(inner_pos, inner_sz, inner_r);
-
-    float outer_mask = clamp(-outer + 0.5, 0.0, 1.0);
-    float inner_mask = clamp( inner + 0.5, 0.0, 1.0);
-    float ring = outer_mask * inner_mask;
-
-    if (ring < 0.001) discard;
-
-    vec2 c = v_pos - u_size * 0.5;
-    float t = (atan(c.y, c.x) / 3.14159265 + 1.0) * 0.5;
-
-    vec4 col = mix(u_col_a, u_col_b, t);
-    if (u_focused < 0.5) {
-        col = mix(col, vec4(0.0), 0.45);
+impl Drop for WindowTexture {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteTextures(1, &self.tex_id);
+        }
     }
-    frag = vec4(col.rgb * col.a, col.a) * ring;
-}
-"#;
-
-const SHADOW_FRAG: &str = r#"
-#version 330 core
-in  vec2 v_pos;
-out vec4 frag;
-uniform vec4  u_color;
-uniform vec2  u_size;
-uniform float u_radius;
-uniform float u_blur;
-
-float rounded_sdf(vec2 pos, vec2 sz, float r) {
-    vec2 q = abs(pos - sz * 0.5) - sz * 0.5 + r;
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
 
-void main() {
-    float d    = rounded_sdf(v_pos, u_size, u_radius);
-    float blur = max(u_blur, 0.001);
-    float a    = smoothstep(blur, 0.0, d) * u_color.a;
-    frag = vec4(u_color.rgb * a, a);
-}
-"#;
+// ── Pending buffer release queue ──────────────────────────────────────────────
+//
+// wl_shm buffers must NOT be released until the GPU has finished reading them.
+// We queue them here and flush after the page flip completes (i.e. on the
+// next render cycle, which is safe because we wait for vsync via DRM).
 
-const GLYPH_GRAY_FRAG: &str = r#"
-#version 330 core
-in  vec2 v_uv;
-in  vec2 v_pos;
-out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec4 u_color;
-void main() {
-    float cov = texture(u_tex, v_uv).r;
-    float a   = u_color.a * cov;
-    frag = vec4(u_color.rgb * a, a);  // premultiplied
+pub struct PendingRelease {
+    pub buffer: wayland_server::protocol::wl_buffer::WlBuffer,
 }
-"#;
-
-const GLYPH_LCD_FRAG: &str = r#"
-#version 330 core
-in  vec2 v_uv;
-in  vec2 v_pos;
-out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec4 u_color;
-uniform vec4 u_bg;
-void main() {
-    vec3 cov = texture(u_tex, v_uv).rgb * u_color.a;
-    // Blend fg into bg per-channel. Output fully opaque premul (a=1 * rgb).
-    // This bakes the background in so no blending equation issues.
-    vec3 rgb = u_color.rgb * cov + u_bg.rgb * (1.0 - cov);
-    frag = vec4(rgb, 1.0);  // fully opaque — bg already composited in
-}
-"#;
 
 // ── RenderState ───────────────────────────────────────────────────────────────
 
 pub struct RenderState {
-    pub prog_tex: GlProgram,
-    pub prog_solid: GlProgram,
-    pub prog_border: GlProgram,
-    pub prog_shadow: GlProgram,
-    pub prog_glyph_gray: GlProgram,
-    pub prog_glyph_lcd: GlProgram,
-    pub quad_vao: QuadVao,
-    pub glyph_vao: glyph_vao::GlyphVao,
-    pub textures: HashMap<WindowId, GlTexture>,
-    pub layer_textures: HashMap<u32, GlTexture>,
-    pub hw_cursor: Option<HwCursor>,
-    pub font: Option<font::FontAtlas>,
-    pub bar: bar::BarState,
-    pub chrome: ChromeConfig,
+    gl_ready: bool,
+    textures: HashMap<WindowId, WindowTexture>,
+    /// Buffers uploaded last frame, waiting to be released after page flip.
+    pending_release: Vec<wayland_server::protocol::wl_buffer::WlBuffer>,
 }
 
 impl RenderState {
-    pub fn new() -> Result<Self> {
-        let prog_tex = GlProgram::compile(QUAD_VERT, TEX_FRAG)?;
-        let prog_solid = GlProgram::compile(QUAD_VERT, SOLID_FRAG)?;
-        let prog_border = GlProgram::compile(QUAD_VERT, BORDER_FRAG)?;
-        let prog_shadow = GlProgram::compile(QUAD_VERT, SHADOW_FRAG)?;
-        let prog_glyph_gray = GlProgram::compile(QUAD_VERT, GLYPH_GRAY_FRAG)?;
-        let prog_glyph_lcd = GlProgram::compile(QUAD_VERT, GLYPH_LCD_FRAG)?;
-        let quad_vao = QuadVao::new();
-        let glyph_vao = glyph_vao::GlyphVao::new();
-
-        unsafe {
-            gl::Enable(gl::BLEND);
-            gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA); // premul alpha
-            gl::Disable(gl::DEPTH_TEST);
-            gl::Disable(gl::STENCIL_TEST);
-        }
-
-        let font = find_font().and_then(|p| {
-            font::FontAtlas::new(&p)
-                .map_err(|e| {
-                    tracing::warn!("font {p}: {e}");
-                    e
-                })
-                .ok()
-        });
-        if font.is_none() {
-            tracing::warn!("no font — bar text disabled");
-        }
-
+    pub fn new(backend: &Backend) -> Result<Self> {
         Ok(Self {
-            prog_tex,
-            prog_solid,
-            prog_border,
-            prog_shadow,
-            prog_glyph_gray,
-            prog_glyph_lcd,
-            quad_vao,
-            glyph_vao,
+            gl_ready: !backend.outputs.is_empty(),
             textures: HashMap::new(),
-            layer_textures: HashMap::new(),
-            hw_cursor: None,
-            font,
-            bar: bar::BarState::new(bar::BarConfig::default()),
-            chrome: ChromeConfig::default(),
+            pending_release: Vec::new(),
         })
     }
 
-    pub fn chrome_renderer(&self) -> chrome::ChromeRenderer<'_> {
-        chrome::ChromeRenderer {
-            cfg: &self.chrome,
-            prog_tex: &self.prog_tex,
-            prog_solid: &self.prog_solid,
-            prog_border: &self.prog_border,
-            prog_shadow: &self.prog_shadow,
-            quad_vao: &self.quad_vao,
+    /// Release buffers from the previous frame. Call this at the start of
+    /// each new frame, after the page flip has completed (i.e. after present()).
+    /// This is safe because DRM page flip is synchronous in our render loop.
+    pub fn release_old_buffers(&mut self) {
+        for buf in self.pending_release.drain(..) {
+            buf.release();
         }
     }
 
-    // ── Per-frame render ──────────────────────────────────────────────────────
-
-    pub fn render_output(
+    /// Upload a wl_shm buffer for a window. The old buffer is queued for
+    /// deferred release rather than released immediately.
+    pub fn upload_shm_buffer(
         &mut self,
-        wm: &WmState,
-        anim: &AnimSet,
-        input: &InputState,
-        outputs: &[OutputState],
-        layer_surfaces: &[(
-            LayerSurfaceRef,
-            wayland_server::protocol::wl_surface::WlSurface,
-        )],
-        _surf: &OutputSurface,
-        out_idx: usize,
+        id: WindowId,
+        data: &[u8],
+        width: i32,
+        height: i32,
+        stride: i32,
+        _format: wayland_server::protocol::wl_shm::Format,
     ) {
-        let out = &outputs[out_idx];
-        let (w, h) = (out.width, out.height);
+        if !self.gl_ready {
+            return;
+        }
+
+        // Convert ARGB8888/XRGB8888 → RGBA for GL.
+        // wl_shm ARGB8888 is stored as [B, G, R, A] in memory (little-endian).
+        let pixel_count = (width * height) as usize;
+        let mut rgba = vec![0u8; pixel_count * 4];
+        for i in 0..pixel_count {
+            let row = i / width as usize;
+            let col = i % width as usize;
+            let src = row * stride as usize + col * 4;
+            if src + 3 >= data.len() {
+                break;
+            }
+            rgba[i * 4] = data[src + 2]; // R ← B channel
+            rgba[i * 4 + 1] = data[src + 1]; // G
+            rgba[i * 4 + 2] = data[src]; // B ← R channel
+            rgba[i * 4 + 3] = data[src + 3]; // A
+        }
 
         unsafe {
-            gl::Viewport(0, 0, w as i32, h as i32);
-            gl::ClearColor(bar::col::BASE[0], bar::col::BASE[1], bar::col::BASE[2], 1.0);
+            let entry = self.textures.entry(id).or_insert_with(|| {
+                let mut tex = 0;
+                gl::GenTextures(1, &mut tex);
+                WindowTexture {
+                    tex_id: tex,
+                    width: 0,
+                    height: 0,
+                }
+            });
+
+            gl::BindTexture(gl::TEXTURE_2D, entry.tex_id);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+
+            if entry.width != width || entry.height != height {
+                gl::TexImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    gl::RGBA as i32,
+                    width,
+                    height,
+                    0,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    rgba.as_ptr() as *const _,
+                );
+                entry.width = width;
+                entry.height = height;
+            } else {
+                gl::TexSubImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    width,
+                    height,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    rgba.as_ptr() as *const _,
+                );
+            }
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
+    }
+
+    /// Queue a buffer for release after the current frame's page flip.
+    pub fn queue_buffer_release(&mut self, buf: wayland_server::protocol::wl_buffer::WlBuffer) {
+        self.pending_release.push(buf);
+    }
+
+    /// Free GL texture when a window closes.
+    pub fn remove_window(&mut self, id: WindowId) {
+        self.textures.remove(&id);
+    }
+
+    pub fn render_frame(
+        &mut self,
+        backend: &mut Backend,
+        wm: &WmState,
+        cursor_x: f64,
+        cursor_y: f64,
+    ) -> Result<()> {
+        if !self.gl_ready {
+            return Ok(());
+        }
+
+        // Release buffers from the previous frame — safe now that the
+        // page flip has completed (DRM waits for vsync before returning).
+        self.release_old_buffers();
+
+        let output_count = backend.outputs.len();
+        for i in 0..output_count {
+            let (w, h) = (backend.outputs[i].width, backend.outputs[i].height);
+            backend.outputs[i].make_current(&backend.egl)?;
+            unsafe {
+                gl::Viewport(0, 0, w as i32, h as i32);
+            }
+
+            let mon = wm.monitors.get(i);
+            let ws_idx = mon.map(|m| m.active_ws).unwrap_or(0);
+            let bar_h = wm.config.bar_height as i32;
+            let bar_bot = wm.config.bar_at_bottom;
+
+            self.render_workspace(wm, ws_idx, w as i32, h as i32, bar_h, bar_bot);
+
+            // Draw software cursor on top of everything
+            draw_cursor(cursor_x as i32, cursor_y as i32, w as i32, h as i32);
+
+            backend.outputs[i].present(&backend.drm, &backend.egl)?;
+        }
+        Ok(())
+    }
+
+    fn render_workspace(
+        &self,
+        wm: &WmState,
+        ws_idx: usize,
+        vp_w: i32,
+        vp_h: i32,
+        bar_h: i32,
+        bar_bottom: bool,
+    ) {
+        let cfg = &wm.config;
+        let ws = match wm.workspaces.get(ws_idx) {
+            Some(w) => w,
+            None => return,
+        };
+        let focused_id = ws.focused;
+
+        unsafe {
+            gl::ClearColor(0.07, 0.07, 0.10, 1.0);
             gl::Clear(gl::COLOR_BUFFER_BIT);
         }
 
-        let proj = ortho(w as f32, h as f32);
-
-        self.draw_layers(&proj, layer_surfaces, w as i32, h as i32, Layer::Background);
-        self.draw_layers(&proj, layer_surfaces, w as i32, h as i32, Layer::Bottom);
-
-        let aws = wm
-            .monitors
-            .iter()
-            .find(|m| m.output_id == out.wl_id)
-            .map(|m| m.active_ws)
-            .unwrap_or_else(|| wm.active_ws());
-
-        let focused_id = wm.focused_window();
-        let draw_order = build_draw_order(wm, aws, focused_id);
-        let border_w = self.chrome.border_width as i32;
-
-        // ── Pass 1: shadows (floating/focused windows only, back-to-front) ────
-        //
-        // The shadow quad is anchored to the *content* rect, then expanded
-        // internally by draw_shadow (by shadow_offset + border_width).
-        // We must NOT pre-expand the rect here — draw_shadow does it once.
-        // Previously the code expanded with chrome_rect() AND draw_shadow
-        // expanded again, producing a double-offset shadow.
-        {
-            let cr = self.chrome_renderer();
-            for &id in &draw_order {
-                let Some(win) = wm.windows.get(&id) else {
-                    continue;
-                };
-                if !self.textures.contains_key(&id) {
-                    continue;
-                }
-
-                // Only draw shadows for floating/fullscreen windows. Tiled
-                // window shadows bleed into adjacent tiles and look wrong.
-                if !win.floating && !win.fullscreen {
-                    continue;
-                }
-
-                let opacity = anim.get_opacity(id);
-                if opacity < 0.01 {
-                    continue;
-                }
-
-                let content_rect = anim.get_rect(id, win.rect);
-                let focused = focused_id == Some(id);
-                // Pass content_rect directly — draw_shadow expands it.
-                cr.draw_shadow(&proj, content_rect, focused, opacity);
-            }
-        }
-
-        // ── Pass 2: border ring + content blit (back-to-front) ────────────────
-        {
-            let cr = self.chrome_renderer();
-            for &id in &draw_order {
-                let Some(win) = wm.windows.get(&id) else {
-                    continue;
-                };
-
-                let content_rect = anim.get_rect(id, win.rect);
-                let opacity = anim.get_opacity(id);
-                if opacity < 0.01 {
-                    continue;
-                }
-
-                let focused = focused_id == Some(id);
-                let is_floating = win.floating || win.fullscreen;
-
-                // Draw the border ring regardless of whether we have a texture.
-                // This makes the tile border visible even before the first
-                // buffer arrives, preventing the "invisible tile" flash.
-                if let Some(tex) = self.textures.get(&id) {
-                    cr.draw_window(&proj, content_rect, tex, focused, opacity, is_floating);
-                } else {
-                    // No texture yet — draw just the border ring so the tile
-                    // is visually present (filled with background colour
-                    // underneath from the clear).
-                    cr.draw_border_only(&proj, content_rect, focused, opacity, is_floating);
-                }
-            }
-        }
-
-        self.draw_layers(&proj, layer_surfaces, w as i32, h as i32, Layer::Top);
-        self.draw_layers(&proj, layer_surfaces, w as i32, h as i32, Layer::Overlay);
-
-        if self.bar.cfg.height > 0 {
-            self.bar.tick();
-            let mon_idx = wm
-                .monitors
-                .iter()
-                .position(|m| m.output_id == out.wl_id)
-                .unwrap_or(0);
-            self.draw_bar(&proj, wm, w as f32, mon_idx);
-        }
-
-        // ── Software cursor fallback ──────────────────────────────────────────
-        if self.hw_cursor.is_none() && !input.hw_cursor_active {
-            let (cx, cy) = (input.pointer_x as f32, input.pointer_y as f32);
-            let (hx, hy) = (input.cursor_hotspot.0 as f32, input.cursor_hotspot.1 as f32);
-            let cr = self.chrome_renderer();
-
-            let cursor_rendered = input
-                .cursor_surface
-                .as_ref()
-                .and_then(|surf| {
-                    use wayland_server::Resource as _;
-                    let sid = surf.id().protocol_id();
-                    self.layer_textures.get(&sid)
-                })
-                .map(|tex| {
-                    cr.blit(&proj, cx - hx, cy - hy, 24.0, 24.0, tex, 1.0);
-                    true
-                })
-                .unwrap_or(false);
-
-            if !cursor_rendered {
-                cr.fill_rounded(
-                    &proj,
-                    cx - 4.0,
-                    cy - 4.0,
-                    8.0,
-                    12.0,
-                    3.0,
-                    [1.0, 1.0, 1.0, 0.9],
-                );
-            }
-        }
-    }
-
-    // ── Bar ───────────────────────────────────────────────────────────────────
-
-    fn draw_bar(&mut self, proj: &[f32; 9], wm: &WmState, out_w: f32, mon_idx: usize) {
-        let Some(font) = self.font.as_mut() else {
-            return;
-        };
-
-        let ps = &self.prog_solid as *const GlProgram;
-        let pg = &self.prog_glyph_gray as *const GlProgram;
-        let pl = &self.prog_glyph_lcd as *const GlProgram;
-        let qv = &self.quad_vao as *const QuadVao;
-        let gv = &self.glyph_vao as *const glyph_vao::GlyphVao;
-        let bg = bar::col::MANTLE;
-
-        let fill_fn = |proj: [f32; 9], x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| unsafe {
-            let p = &*ps;
-            p.bind();
-            gl::UniformMatrix3fv(p.loc("u_proj"), 1, gl::FALSE, proj.as_ptr());
-            gl::Uniform4f(p.loc("u_rect"), x, y, w, h);
-            gl::Uniform4f(p.loc("u_color"), c[0], c[1], c[2], c[3]);
-            gl::Uniform2f(p.loc("u_size"), w, h);
-            gl::Uniform1f(p.loc("u_radius"), 0.0);
-            (*qv).draw();
-        };
-
-        let glyph_fn = |proj: [f32; 9],
-                        x: f32,
-                        y: f32,
-                        w: f32,
-                        h: f32,
-                        tex: u32,
-                        c: [f32; 4],
-                        uv: [f32; 4],
-                        lcd: bool| unsafe {
-            let p = if lcd { &*pl } else { &*pg };
-            p.bind();
-            gl::UniformMatrix3fv(p.loc("u_proj"), 1, gl::FALSE, proj.as_ptr());
-            gl::Uniform4f(p.loc("u_rect"), x, y, w, h);
-            gl::Uniform1i(p.loc("u_tex"), 0);
-            gl::Uniform4f(p.loc("u_color"), c[0], c[1], c[2], c[3]);
-            gl::Uniform4f(p.loc("u_bg"), bg[0], bg[1], bg[2], bg[3]);
-            gl::ActiveTexture(gl::TEXTURE0);
-            gl::BindTexture(gl::TEXTURE_2D, tex);
-            (*gv).draw(uv);
-        };
-
-        let mut ctx = bar::DrawCtx {
-            proj,
-            font,
-            fill: &fill_fn,
-            glyph: &glyph_fn,
-        };
-        self.bar.draw(&mut ctx, wm, out_w, mon_idx);
-    }
-
-    // ── Layer surfaces ────────────────────────────────────────────────────────
-
-    fn draw_layers(
-        &self,
-        proj: &[f32; 9],
-        surfaces: &[(
-            LayerSurfaceRef,
-            wayland_server::protocol::wl_surface::WlSurface,
-        )],
-        ow: i32,
-        oh: i32,
-        target: Layer,
-    ) {
-        use wayland_server::Resource as _;
-        let cr = self.chrome_renderer();
-        for (ls_ref, surf) in surfaces {
-            let ls = ls_ref.lock().unwrap();
-            if ls.layer != target || !ls.mapped {
+        for &id in &ws.windows {
+            let Some(win) = wm.windows.get(&id) else {
+                continue;
+            };
+            if ws.layout == Layout::Monocle && focused_id != Some(id) {
                 continue;
             }
-            let sid = surf.id().protocol_id();
-            let (x, y, lw, lh) = layer_geom(&ls, ow, oh);
-            drop(ls);
-            if let Some(tex) = self.layer_textures.get(&sid) {
-                cr.blit(proj, x as f32, y as f32, lw as f32, lh as f32, tex, 1.0);
+
+            let is_focused = focused_id == Some(id);
+            let border_color = if is_focused {
+                cfg.active_border_f32()
+            } else {
+                cfg.inactive_border_f32()
+            };
+
+            if cfg.border_w > 0 && !win.fullscreen {
+                fill_rect(win.rect, border_color, vp_w, vp_h);
+            }
+
+            let inner = win.rect.inset(cfg.border_w as i32);
+
+            if let Some(tex) = self.textures.get(&id) {
+                draw_texture(tex.tex_id, inner, vp_w, vp_h);
+            } else {
+                fill_rect(inner, [0.15, 0.15, 0.22, 1.0], vp_w, vp_h);
             }
         }
-    }
 
-    // ── Texture management ────────────────────────────────────────────────────
-
-    pub fn upload_surface_texture(
-        &mut self,
-        id: WindowId,
-        s: &wayland_server::protocol::wl_surface::WlSurface,
-        egl: &EglContext,
-    ) {
-        upload_surface(&mut self.textures, id, s, egl);
+        // Status bar
+        let bar_rect = if bar_bottom {
+            Rect::new(0, vp_h - bar_h, vp_w, bar_h)
+        } else {
+            Rect::new(0, 0, vp_w, bar_h)
+        };
+        fill_rect(bar_rect, cfg.bar_bg_f32(), vp_w, vp_h);
+        draw_workspace_indicators(wm, ws_idx, bar_rect, vp_w, vp_h);
     }
-
-    pub fn upload_layer_texture(
-        &mut self,
-        id: u32,
-        s: &wayland_server::protocol::wl_surface::WlSurface,
-        egl: &EglContext,
-    ) {
-        upload_surface(&mut self.layer_textures, id, s, egl);
-    }
-
-    pub fn remove_window_texture(&mut self, id: WindowId) {
-        self.textures.remove(&id);
-    }
-    pub fn remove_layer_texture(&mut self, id: u32) {
-        self.layer_textures.remove(&id);
-    }
-    pub fn release_buffer(&mut self, _buf: &wayland_server::protocol::wl_buffer::WlBuffer) {}
 }
 
-// ── Draw order ────────────────────────────────────────────────────────────────
+// ── Software cursor ───────────────────────────────────────────────────────────
 //
-// Tiled back → floating → focused on top. Windows with no texture are still
-// included so the border ring renders while the client is loading.
-fn build_draw_order(wm: &WmState, aws: usize, focused_id: Option<WindowId>) -> Vec<WindowId> {
-    let ws = &wm.workspaces[aws];
-    let (mut tiled, mut floating): (Vec<WindowId>, Vec<WindowId>) = ws
-        .windows
-        .iter()
-        .copied()
-        .filter(|&id| focused_id != Some(id))
-        .partition(|&id| wm.windows.get(&id).map(|w| !w.floating).unwrap_or(true));
+// A simple 12×20 arrow cursor drawn with GL primitives. Replaced by xcursor
+// theme loading in a future iteration.
 
-    let mut order = Vec::with_capacity(ws.windows.len());
-    order.append(&mut tiled);
-    order.append(&mut floating);
-    if let Some(fid) = focused_id {
-        if ws.windows.contains(&fid) {
-            order.push(fid);
-        }
-    }
-    order
+fn draw_cursor(cx: i32, cy: i32, vp_w: i32, vp_h: i32) {
+    // Arrow shape: filled white quad + black outline approximation
+    // We draw a small filled rectangle as a placeholder cursor.
+    // Real xcursor support is a future TODO.
+    let cursor_w = 12i32;
+    let cursor_h = 20i32;
+
+    // White fill
+    fill_rect(
+        Rect::new(cx, cy, cursor_w, cursor_h),
+        [1.0, 1.0, 1.0, 0.9],
+        vp_w,
+        vp_h,
+    );
+    // Black border (1px inset)
+    fill_rect(
+        Rect::new(cx + 1, cy + 1, cursor_w - 2, cursor_h - 2),
+        [0.85, 0.85, 0.85, 1.0],
+        vp_w,
+        vp_h,
+    );
+    // Top-left corner pixel in black for directional hint
+    fill_rect(Rect::new(cx, cy, 2, 2), [0.0, 0.0, 0.0, 1.0], vp_w, vp_h);
 }
 
-// ── Surface texture upload ────────────────────────────────────────────────────
+// ── Texture drawing ───────────────────────────────────────────────────────────
 
-fn upload_surface<K: std::hash::Hash + Eq + Copy>(
-    map: &mut HashMap<K, GlTexture>,
-    key: K,
-    surf: &wayland_server::protocol::wl_surface::WlSurface,
-    egl: &EglContext,
-) {
-    use crate::proto::{compositor::SurfaceData, dmabuf::DmaBufBuffer, shm::ShmBuffer};
-    use std::os::unix::io::AsRawFd;
-    use std::sync::Arc;
-    use wayland_server::Resource as _;
+static TEXTURE_SHADER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
-    let sd = match surf.data::<Arc<SurfaceData>>() {
-        Some(d) => d.clone(),
-        None => return,
-    };
+fn get_texture_shader() -> u32 {
+    *TEXTURE_SHADER.get_or_init(|| unsafe {
+        let vs_src = b"attribute vec2 pos; attribute vec2 uv; varying vec2 v_uv;
+            void main() { gl_Position = vec4(pos, 0.0, 1.0); v_uv = uv; }\0";
+        let fs_src = b"precision mediump float; uniform sampler2D tex; varying vec2 v_uv;
+            void main() { gl_FragColor = texture2D(tex, v_uv); }\0";
 
-    // Only perform the GL upload when a new buffer was committed. The render
-    // path calls upload_surface_texture unconditionally each frame; without
-    // this guard every frame re-uploads even when nothing changed.
-    {
-        let mut current = sd.current.lock().unwrap();
-        if !current.needs_upload {
-            return;
-        }
-        // Clear eagerly so a failed upload below doesn't retry every frame.
-        current.needs_upload = false;
-    }
+        let vs = gl::CreateShader(gl::VERTEX_SHADER);
+        gl::ShaderSource(vs, 1, &(vs_src.as_ptr() as *const _), std::ptr::null());
+        gl::CompileShader(vs);
 
-    let buf = match sd.current.lock().unwrap().buffer.clone() {
-        Some(b) => b,
-        None => {
-            tracing::trace!("upload_surface: no committed buffer");
-            return;
-        }
-    };
+        let fs = gl::CreateShader(gl::FRAGMENT_SHADER);
+        gl::ShaderSource(fs, 1, &(fs_src.as_ptr() as *const _), std::ptr::null());
+        gl::CompileShader(fs);
 
-    if let Some(dmabuf) = buf.data::<DmaBufBuffer>() {
-        let tex = map.entry(key).or_insert_with(GlTexture::new_empty);
-        let active: Vec<&crate::proto::dmabuf::DmaBufPlane> =
-            dmabuf.planes.iter().filter(|p| p.fd.is_some()).collect();
-        if active.is_empty() {
-            tracing::warn!("upload_surface: DmaBufBuffer has no active planes");
-            return;
-        }
-        let fds: Vec<i32> = active
-            .iter()
-            .map(|p| p.fd.as_ref().unwrap().as_raw_fd())
-            .collect();
-        let offsets: Vec<u32> = active.iter().map(|p| p.offset).collect();
-        let strides: Vec<u32> = active.iter().map(|p| p.stride).collect();
-        let first = active[0];
-        let modifier = ((first.modifier_hi as u64) << 32) | (first.modifier_lo as u64);
-        let raw = crate::state::RawBuffer::Dmabuf {
-            fds,
-            offsets,
-            strides,
-            modifier,
-            width: dmabuf.width,
-            height: dmabuf.height,
-            format: dmabuf.format,
-        };
-        tex.upload_buffer(&raw, egl);
+        let prog = gl::CreateProgram();
+        gl::AttachShader(prog, vs);
+        gl::AttachShader(prog, fs);
+        gl::LinkProgram(prog);
+        gl::DeleteShader(vs);
+        gl::DeleteShader(fs);
+        prog
+    })
+}
+
+fn draw_texture(tex_id: u32, rect: Rect, vp_w: i32, vp_h: i32) {
+    if rect.w <= 0 || rect.h <= 0 {
         return;
     }
 
-    if let Some(shm) = buf.data::<ShmBuffer>() {
-        let tex = map.entry(key).or_insert_with(GlTexture::new_empty);
-        let raw = crate::state::RawBuffer::Shm {
-            pool_fd: shm.pool_fd_raw(),
-            offset: shm.offset,
-            width: shm.width,
-            height: shm.height,
-            stride: shm.stride,
-            format: shm.format as u32,
-        };
-        tex.upload_buffer(&raw, egl);
+    let x0 = 2.0 * rect.x as f32 / vp_w as f32 - 1.0;
+    let x1 = 2.0 * (rect.x + rect.w) as f32 / vp_w as f32 - 1.0;
+    let y1 = -2.0 * rect.y as f32 / vp_h as f32 + 1.0;
+    let y0 = -2.0 * (rect.y + rect.h) as f32 / vp_h as f32 + 1.0;
+
+    #[rustfmt::skip]
+    let verts: [f32; 24] = [
+        x0, y0, 0.0, 1.0,
+        x1, y0, 1.0, 1.0,
+        x0, y1, 0.0, 0.0,
+        x1, y0, 1.0, 1.0,
+        x1, y1, 1.0, 0.0,
+        x0, y1, 0.0, 0.0,
+    ];
+
+    unsafe {
+        let prog = get_texture_shader();
+        gl::UseProgram(prog);
+        gl::BindTexture(gl::TEXTURE_2D, tex_id);
+        gl::Uniform1i(
+            gl::GetUniformLocation(prog, b"tex\0".as_ptr() as *const _),
+            0,
+        );
+
+        let pos_loc = gl::GetAttribLocation(prog, b"pos\0".as_ptr() as *const _) as u32;
+        let uv_loc = gl::GetAttribLocation(prog, b"uv\0".as_ptr() as *const _) as u32;
+
+        gl::EnableVertexAttribArray(pos_loc);
+        gl::EnableVertexAttribArray(uv_loc);
+
+        let stride = (4 * std::mem::size_of::<f32>()) as i32;
+        let base = verts.as_ptr();
+        gl::VertexAttribPointer(pos_loc, 2, gl::FLOAT, gl::FALSE, stride, base as *const _);
+        gl::VertexAttribPointer(
+            uv_loc,
+            2,
+            gl::FLOAT,
+            gl::FALSE,
+            stride,
+            base.add(2) as *const _,
+        );
+
+        gl::DrawArrays(gl::TRIANGLES, 0, 6);
+
+        gl::DisableVertexAttribArray(pos_loc);
+        gl::DisableVertexAttribArray(uv_loc);
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        gl::UseProgram(0);
+    }
+}
+
+// ── Solid rect ────────────────────────────────────────────────────────────────
+
+pub fn fill_rect(rect: Rect, color: [f32; 4], _vp_w: i32, vp_h: i32) {
+    if rect.w <= 0 || rect.h <= 0 {
         return;
     }
-
-    tracing::warn!("upload_surface: buffer carries neither DmaBufBuffer nor ShmBuffer");
+    let scissor_y = vp_h - rect.y - rect.h;
+    unsafe {
+        gl::Enable(gl::SCISSOR_TEST);
+        gl::Scissor(rect.x, scissor_y, rect.w, rect.h);
+        gl::ClearColor(color[0], color[1], color[2], color[3]);
+        gl::Clear(gl::COLOR_BUFFER_BIT);
+        gl::Disable(gl::SCISSOR_TEST);
+    }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Workspace indicators ──────────────────────────────────────────────────────
 
-pub fn ortho(w: f32, h: f32) -> [f32; 9] {
-    [2.0 / w, 0.0, 0.0, 0.0, -2.0 / h, 0.0, -1.0, 1.0, 1.0]
-}
-
-fn layer_geom(
-    ls: &crate::proto::layer_shell::LayerSurfaceState,
-    ow: i32,
-    oh: i32,
-) -> (i32, i32, i32, i32) {
-    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::Anchor;
-    let (rw, rh) = (ls.size.0 as i32, ls.size.1 as i32);
-    let [mt, mr, mb, ml] = ls.margin;
-    let a = ls.anchor;
-    let lw = if rw > 0 {
-        rw
-    } else if a.contains(Anchor::Left) && a.contains(Anchor::Right) {
-        ow - ml - mr
-    } else {
-        ow / 2
-    };
-    let lh = if rh > 0 {
-        rh
-    } else if a.contains(Anchor::Top) && a.contains(Anchor::Bottom) {
-        oh - mt - mb
-    } else {
-        oh / 8
-    };
-    let x = if a.contains(Anchor::Left) {
-        ml
-    } else if a.contains(Anchor::Right) {
-        ow - lw - mr
-    } else {
-        (ow - lw) / 2
-    };
-    let y = if a.contains(Anchor::Top) {
-        mt
-    } else if a.contains(Anchor::Bottom) {
-        oh - lh - mb
-    } else {
-        (oh - lh) / 2
-    };
-    (x, y, lw, lh)
-}
-
-fn find_font() -> Option<String> {
-    [
-        "/usr/share/fonts/TTF/IosevkaJlessBrainsNerdFont-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-    ]
-    .iter()
-    .find(|p| std::path::Path::new(p).exists())
-    .map(|s| s.to_string())
+fn draw_workspace_indicators(wm: &WmState, active_ws: usize, bar: Rect, vp_w: i32, vp_h: i32) {
+    let cell_w = 20i32;
+    let pad = 4i32;
+    for i in 0..wm.workspaces.len() {
+        let has_windows = !wm.workspaces[i].windows.is_empty();
+        let is_active = i == active_ws;
+        let color = if is_active {
+            [0.7, 0.85, 1.0, 1.0f32]
+        } else if has_windows {
+            [0.5, 0.5, 0.7, 1.0]
+        } else {
+            [0.3, 0.3, 0.4, 1.0]
+        };
+        let r = Rect::new(
+            bar.x + i as i32 * (cell_w + pad) + pad,
+            bar.y + pad,
+            cell_w,
+            bar.h - 2 * pad,
+        );
+        fill_rect(r, color, vp_w, vp_h);
+    }
 }
